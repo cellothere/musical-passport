@@ -8,6 +8,7 @@ const querystring = require("querystring");
 const { createSign } = require("crypto");
 
 const app = express();
+app.set('trust proxy', 1); // Required for Railway/Heroku reverse proxy
 const PORT = process.env.PORT || 3000;
 
 // Spotify OAuth config
