@@ -1,0 +1,471 @@
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const fetch = require("node-fetch");
+const path = require("path");
+const session = require("express-session");
+const querystring = require("querystring");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Spotify OAuth config
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
+
+// Cache for client credentials token
+let clientAccessToken = null;
+let tokenExpiry = null;
+
+// Get client credentials access token for public API access
+async function getClientAccessToken() {
+  // Return cached token if still valid
+  if (clientAccessToken && tokenExpiry && Date.now() < tokenExpiry) {
+    return clientAccessToken;
+  }
+
+  try {
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization:
+          "Basic " +
+          Buffer.from(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET).toString("base64"),
+      },
+      body: "grant_type=client_credentials",
+    });
+
+    const data = await response.json();
+
+    if (data.access_token) {
+      clientAccessToken = data.access_token;
+      tokenExpiry = Date.now() + (data.expires_in - 60) * 1000; // Refresh 1 min before expiry
+      console.log("Got new client credentials token");
+      return clientAccessToken;
+    }
+
+    throw new Error("Failed to get client credentials token");
+  } catch (err) {
+    console.error("Error getting client access token:", err);
+    return null;
+  }
+}
+
+// CORS must be configured to allow credentials
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+// Session middleware for storing OAuth tokens
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "musical-passport-secret",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: false,
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 3600000
+    },
+  })
+);
+
+// Proxy endpoint for Anthropic API (with personalization)
+app.post("/api/recommend", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+
+  if (!apiKey) {
+    return res.status(500).json({
+      error: "ANTHROPIC_API_KEY is not set. Add it to your .env file.",
+    });
+  }
+
+  const { country } = req.body;
+  if (!country) {
+    return res.status(400).json({ error: "Missing country in request body." });
+  }
+
+  // Get user's top artists if authenticated
+  let topArtists = [];
+  const accessToken = req.session.accessToken;
+
+  if (accessToken) {
+    try {
+      const topArtistsResponse = await fetch(
+        "https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term",
+        {
+          headers: { Authorization: "Bearer " + accessToken },
+        }
+      );
+
+      if (topArtistsResponse.ok) {
+        const topArtistsData = await topArtistsResponse.json();
+        topArtists = topArtistsData.items
+          ? topArtistsData.items.map((a) => a.name)
+          : [];
+      }
+    } catch (err) {
+      console.error("Error fetching top artists:", err);
+      // Continue without personalization
+    }
+  }
+
+  // Build personalization context
+  const personalizationNote = topArtists.length > 0
+    ? `\n\nThe user enjoys these artists: ${topArtists.slice(0, 5).join(", ")}. Use this to personalize the "similarTo" comparisons to artists they might actually know.`
+    : "";
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        system:
+          "You are a world music curator. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [
+          {
+            role: "user",
+            content: `Music recommendations for ${country}. Return exactly this JSON:
+{
+  "musicalHeritage": "2-3 sentences on the country's musical identity and what makes it globally distinct",
+  "genres": ["genre1","genre2","genre3"],
+  "artists": [
+    {
+      "name": "Name",
+      "genre": "specific genre",
+      "era": "Contemporary",
+      "similarTo": "A well-known Western artist"
+    }
+  ],
+  "didYouKnow": "One surprising musical fact about ${country}"
+}
+era must be exactly one of: Contemporary, Classic, Legendary. Include exactly 4 artists mixing eras.${personalizationNote}`,
+          },
+        ],
+      }),
+    });
+
+    const data = await response.json();
+
+    if (data.error) {
+      return res.status(500).json({ error: data.error.message });
+    }
+
+    const raw = (data.content[0].text || "")
+      .replace(/```json|```/g, "")
+      .trim();
+    const rec = JSON.parse(raw);
+
+    res.json(rec);
+  } catch (err) {
+    console.error("Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Time Machine endpoint ────────────────────────────────
+app.post("/api/time-machine", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
+  }
+
+  const { country, decade } = req.body;
+  if (!country || !decade) {
+    return res.status(400).json({ error: "Missing country or decade." });
+  }
+
+  try {
+    // Ask Claude for a genre spotlight + 5 track recommendations
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1500,
+        system: "You are a world music historian. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [{
+          role: "user",
+          content: `Spotlight an important or influential music genre from ${country} in the ${decade}. It can be either a popular genre or a niche one. Return exactly this JSON:
+{
+  "genre": "genre name",
+  "description": "2 sentences about why this genre was important in ${country} in the ${decade} and what made it distinctive",
+  "tracks": [
+    { "title": "track title", "artist": "artist name" }
+  ]
+}
+Include exactly 8 tracks that were/are emblematic of this genre in ${country} during the ${decade}. Pick real, historically significant tracks that are very likely to be on Spotify. Use the exact original track title and artist name as they would appear on Spotify. Please make sure the track is correctly related to the genre and era, not just a random track by an artist associated with that genre.`,
+        }],
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ error: data.error.message });
+
+    const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
+    const spotlight = JSON.parse(raw);
+
+    // Fetch Spotify IDs for each track, using two-pass search for reliability
+    const accessToken = await getClientAccessToken();
+    const tracksWithIds = await Promise.all(
+      (spotlight.tracks || []).map(async (track) => {
+        if (!accessToken) return { ...track, spotifyId: null };
+        try {
+          // Pass 1: filtered search (most accurate)
+          const q1 = `track:${track.title} artist:${track.artist}`;
+          const r1 = await fetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(q1)}&type=track&limit=1&market=US`,
+            { headers: { Authorization: "Bearer " + accessToken } }
+          );
+          const d1 = await r1.json();
+          const found1 = d1.tracks?.items?.[0];
+          if (found1) return { ...track, spotifyId: found1.id };
+
+          // Pass 2: free-text fallback
+          const q2 = `${track.title} ${track.artist}`;
+          const r2 = await fetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(q2)}&type=track&limit=1&market=US`,
+            { headers: { Authorization: "Bearer " + accessToken } }
+          );
+          const d2 = await r2.json();
+          const found2 = d2.tracks?.items?.[0];
+          return { ...track, spotifyId: found2 ? found2.id : null };
+        } catch {
+          return { ...track, spotifyId: null };
+        }
+      })
+    );
+
+    // Keep only tracks with valid Spotify IDs, return first 5
+    const validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
+
+    res.json({ genre: spotlight.genre, description: spotlight.description, tracks: validTracks });
+  } catch (err) {
+    console.error("Time machine error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Helper function to fetch artist tracks ──────────────
+async function fetchArtistTracks(artistName) {
+  try {
+    console.log(`  Searching Spotify for: "${artistName}"`);
+
+    // Get client access token
+    const accessToken = await getClientAccessToken();
+    if (!accessToken) {
+      console.error(`  Failed to get access token`);
+      return [];
+    }
+
+    // Search for the artist
+    const searchResponse = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`,
+      {
+        headers: { Authorization: "Bearer " + accessToken },
+      }
+    );
+
+    const searchData = await searchResponse.json();
+
+    console.log(`  Search response status: ${searchResponse.status}`);
+
+    if (searchData.error) {
+      console.error(`  Spotify API error:`, searchData.error);
+      return [];
+    }
+
+    if (!searchData.artists || !searchData.artists.items || searchData.artists.items.length === 0) {
+      console.log(`  No artists found for "${artistName}"`);
+      return [];
+    }
+
+    const artistId = searchData.artists.items[0].id;
+    const foundName = searchData.artists.items[0].name;
+    console.log(`  Found artist: "${foundName}" (ID: ${artistId})`);
+
+    // Search for tracks by this artist instead of using top-tracks endpoint
+    const tracksSearchResponse = await fetch(
+      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(foundName)}&type=track&limit=10&market=US`,
+      {
+        headers: { Authorization: "Bearer " + accessToken },
+      }
+    );
+
+    const tracksSearchData = await tracksSearchResponse.json();
+
+    if (tracksSearchData.error) {
+      console.error(`  Track search API error:`, tracksSearchData.error);
+      return [];
+    }
+
+    if (!tracksSearchData.tracks || !tracksSearchData.tracks.items || tracksSearchData.tracks.items.length === 0) {
+      console.log(`  No tracks found via search for "${foundName}"`);
+      return [];
+    }
+
+    console.log(`  Found ${tracksSearchData.tracks.items.length} tracks via search`);
+
+    // Return top 3 tracks
+    return tracksSearchData.tracks.items.slice(0, 3).map(track => ({
+      title: track.name,
+      spotifyId: track.id,
+    }));
+  } catch (err) {
+    console.error(`  Error fetching tracks for ${artistName}:`, err);
+    return [];
+  }
+}
+
+// ── Spotify OAuth endpoints ──────────────────────────────
+
+// Initiate Spotify OAuth flow
+app.get("/auth/login", (req, res) => {
+  const scope = "user-top-read user-read-private user-read-email";
+  const authUrl =
+    "https://accounts.spotify.com/authorize?" +
+    querystring.stringify({
+      response_type: "code",
+      client_id: SPOTIFY_CLIENT_ID,
+      scope: scope,
+      redirect_uri: SPOTIFY_REDIRECT_URI,
+    });
+  res.redirect(authUrl);
+});
+
+// Handle OAuth callback
+app.get("/auth/callback", async (req, res) => {
+  const code = req.query.code || null;
+
+  if (!code) {
+    return res.redirect("/?error=no_code");
+  }
+
+  try {
+    // Exchange code for access token
+    const tokenResponse = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization:
+          "Basic " +
+          Buffer.from(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET).toString("base64"),
+      },
+      body: querystring.stringify({
+        code: code,
+        redirect_uri: SPOTIFY_REDIRECT_URI,
+        grant_type: "authorization_code",
+      }),
+    });
+
+    const tokenData = await tokenResponse.json();
+
+    if (tokenData.error) {
+      return res.redirect("/?error=token_error");
+    }
+
+    // Store tokens in session
+    req.session.accessToken = tokenData.access_token;
+    req.session.refreshToken = tokenData.refresh_token;
+
+    res.redirect("/");
+  } catch (err) {
+    console.error("OAuth error:", err);
+    res.redirect("/?error=auth_failed");
+  }
+});
+
+// Logout endpoint
+app.get("/auth/logout", (req, res) => {
+  req.session.destroy();
+  res.redirect("/");
+});
+
+// Get tracks for a specific artist
+app.get("/api/artist-tracks/:artistName", async (req, res) => {
+  const { artistName } = req.params;
+
+  if (!artistName) {
+    return res.status(400).json({ error: "Missing artist name" });
+  }
+
+  try {
+    const tracks = await fetchArtistTracks(artistName);
+    res.json({ artist: artistName, tracks });
+  } catch (err) {
+    console.error("Error fetching artist tracks:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get current user info and top artists
+app.get("/api/me", async (req, res) => {
+  const accessToken = req.session.accessToken;
+
+  if (!accessToken) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  try {
+    // Fetch user profile
+    const userResponse = await fetch("https://api.spotify.com/v1/me", {
+      headers: { Authorization: "Bearer " + accessToken },
+    });
+
+    if (!userResponse.ok) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const userData = await userResponse.json();
+
+    // Fetch top artists
+    const topArtistsResponse = await fetch(
+      "https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term",
+      {
+        headers: { Authorization: "Bearer " + accessToken },
+      }
+    );
+
+    const topArtistsData = await topArtistsResponse.json();
+
+    res.json({
+      user: {
+        id: userData.id,
+        displayName: userData.display_name,
+        email: userData.email,
+      },
+      topArtists: topArtistsData.items
+        ? topArtistsData.items.map((a) => ({
+            name: a.name,
+            genres: a.genres,
+          }))
+        : [],
+    });
+  } catch (err) {
+    console.error("Error fetching user data:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`\n🎵 Musical Passport running at http://localhost:${PORT}\n`);
+});

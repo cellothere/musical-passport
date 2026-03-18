@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Musical Passport</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Playfair+Display:ital,wght@0,600;1,500&display=swap" rel="stylesheet" />
+  <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" async></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0e0e0e;
+      --surface: #161616;
+      --surface2: #1e1e1e;
+      --border: #2a2a2a;
+      --border2: #383838;
+      --text: #e8e6e0;
+      --text2: #8a8a8a;
+      --text3: #555;
+      --gold: #c9a84c;
+      --gold-bg: #c9a84c18;
+      --gold-border: #c9a84c44;
+      --green: #1db954;
+      --green-bg: #1db95418;
+      --green-border: #1db95440;
+      --blue: #4a9eff;
+      --blue-bg: #4a9eff18;
+      --blue-border: #4a9eff44;
+      --red: #e05252;
+      --radius: 8px;
+      --radius-lg: 12px;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    /* ── Layout ─────────────────────────────── */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    #header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 20px 0 16px;
+      border-bottom: 0.5px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #title {
+      font-family: 'Playfair Display', Georgia, serif;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+
+    #subtitle {
+      font-size: 12px;
+      color: var(--text2);
+      margin-top: 2px;
+    }
+
+    #stamp-pill {
+      font-size: 12px;
+      color: var(--gold);
+      background: var(--gold-bg);
+      border: 0.5px solid var(--gold-border);
+      border-radius: 20px;
+      padding: 5px 14px;
+      transition: all 0.2s;
+    }
+
+    #header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #user-info {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text2);
+    }
+
+    #user-name {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .spotify-badge {
+      font-size: 10px;
+      color: var(--green);
+      background: var(--green-bg);
+      border: 0.5px solid var(--green-border);
+      border-radius: 20px;
+      padding: 2px 9px;
+      letter-spacing: 0.05em;
+    }
+
+    .auth-btn {
+      font-size: 12px;
+      font-family: 'Inter', sans-serif;
+      background: var(--green-bg);
+      color: var(--green);
+      border: 0.5px solid var(--green-border);
+      border-radius: 20px;
+      padding: 5px 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-decoration: none;
+      display: inline-block;
+    }
+
+    .auth-btn:hover {
+      background: var(--green);
+      color: var(--bg);
+    }
+
+    .logout-btn {
+      background: var(--surface);
+      color: var(--text2);
+      border-color: var(--border);
+    }
+
+    .logout-btn:hover {
+      background: var(--surface2);
+      color: var(--text);
+    }
+
+    .apple-badge {
+      font-size: 10px;
+      color: #fc3c44;
+      background: rgba(252,60,68,0.12);
+      border: 0.5px solid rgba(252,60,68,0.35);
+      border-radius: 20px;
+      padding: 2px 9px;
+      letter-spacing: 0.05em;
+    }
+
+    .apple-btn {
+      background: rgba(252,60,68,0.1);
+      color: #fc3c44;
+      border-color: rgba(252,60,68,0.35);
+    }
+
+    .apple-btn:hover {
+      background: #fc3c44;
+      color: #fff;
+    }
+
+    #body {
+      display: flex;
+      gap: 20px;
+      flex: 1;
+      padding: 20px 0;
+      overflow: hidden;
+    }
+
+    /* ── Countries ──────────────────────────── */
+    #countries-col {
+      flex: 1;
+      min-width: 0;
+      overflow-y: auto;
+      padding-right: 8px;
+    }
+
+    #countries-col::-webkit-scrollbar { width: 3px; }
+    #countries-col::-webkit-scrollbar-track { background: transparent; }
+    #countries-col::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+    .region {
+      margin-bottom: 22px;
+    }
+
+    .region-name {
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      color: var(--text3);
+      text-transform: uppercase;
+      margin-bottom: 9px;
+      padding-bottom: 7px;
+      border-bottom: 0.5px solid var(--border);
+    }
+
+    .country-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .c-btn {
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 5px 11px;
+      font-size: 12px;
+      font-family: 'Inter', sans-serif;
+      color: var(--text2);
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+
+    .c-btn:hover {
+      background: var(--surface2);
+      border-color: var(--border2);
+      color: var(--text);
+    }
+
+    .c-btn.stamped {
+      background: var(--gold-bg);
+      border-color: var(--gold-border);
+      color: var(--gold);
+      font-weight: 500;
+    }
+
+    .c-btn.active {
+      background: var(--text);
+      border-color: var(--text);
+      color: var(--bg);
+      font-weight: 500;
+    }
+
+    /* ── Panel ──────────────────────────────── */
+    #panel {
+      width: 340px;
+      flex-shrink: 0;
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #panel-empty {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 12px;
+      padding: 32px;
+      text-align: center;
+    }
+
+    .empty-icon {
+      width: 48px;
+      height: 48px;
+      opacity: 0.15;
+    }
+
+    #panel-empty p {
+      font-size: 13px;
+      color: var(--text2);
+      line-height: 1.6;
+    }
+
+    #panel-active {
+      display: none;
+      flex-direction: column;
+      height: 100%;
+    }
+
+    #panel-head {
+      padding: 16px 18px 13px;
+      border-bottom: 0.5px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #panel-country-name {
+      font-family: 'Playfair Display', Georgia, serif;
+      font-size: 20px;
+      font-weight: 600;
+    }
+
+    #panel-meta {
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--text2);
+    }
+
+    .stamped-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--gold);
+      background: var(--gold-bg);
+      border: 0.5px solid var(--gold-border);
+      border-radius: 20px;
+      padding: 2px 9px;
+      letter-spacing: 0.05em;
+    }
+
+    #panel-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 18px;
+    }
+
+    #panel-scroll::-webkit-scrollbar { width: 3px; }
+    #panel-scroll::-webkit-scrollbar-track { background: transparent; }
+    #panel-scroll::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+    /* ── Loading ────────────────────────────── */
+    #loading {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 220px;
+      gap: 12px;
+    }
+
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 1.5px solid var(--border2);
+      border-top-color: var(--gold);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #loading-label {
+      font-size: 12px;
+      color: var(--text2);
+      letter-spacing: 0.04em;
+    }
+
+    /* ── Content ────────────────────────────── */
+    #rec-content { display: none; }
+
+    .heritage {
+      font-size: 13px;
+      color: var(--text2);
+      line-height: 1.7;
+      margin-bottom: 16px;
+      font-style: italic;
+    }
+
+    .genres {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-bottom: 16px;
+    }
+
+    .genre-tag {
+      font-size: 10px;
+      color: var(--text3);
+      background: var(--surface2);
+      border: 0.5px solid var(--border);
+      border-radius: 20px;
+      padding: 2px 9px;
+      letter-spacing: 0.06em;
+    }
+
+    .section-heading {
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      color: var(--text3);
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    .artist {
+      background: var(--surface2);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 11px 13px 13px;
+      margin-bottom: 10px;
+      transition: all 0.15s;
+      cursor: pointer;
+    }
+
+    .artist:hover {
+      border-color: var(--border2);
+      background: var(--surface);
+    }
+
+    .artist:last-child { margin-bottom: 0; }
+
+    .artist.loading {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    .artist.expanded {
+      border-color: var(--gold-border);
+    }
+
+    .artist-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .artist-name {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    .artist-genre {
+      font-size: 11px;
+      color: var(--text2);
+      margin-top: 1px;
+    }
+
+    .era {
+      font-size: 9px;
+      padding: 2px 8px;
+      border-radius: 20px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+    }
+
+    .era-contemporary { background: var(--green-bg); color: var(--green); border: 0.5px solid var(--green-border); }
+    .era-classic      { background: var(--blue-bg);  color: var(--blue);  border: 0.5px solid var(--blue-border); }
+    .era-legendary    { background: var(--gold-bg);  color: var(--gold);  border: 0.5px solid var(--gold-border); }
+
+    .similar {
+      font-size: 11px;
+      color: var(--text3);
+      font-style: italic;
+      margin-bottom: 10px;
+    }
+
+    .tracks {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .track-player {
+      width: 100%;
+      height: 80px;
+      border-radius: 6px;
+      border: none;
+    }
+
+    .dyk {
+      margin-top: 16px;
+      padding: 12px 14px;
+      background: var(--gold-bg);
+      border: 0.5px solid var(--gold-border);
+      border-radius: var(--radius);
+    }
+
+    .dyk-label {
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      color: var(--gold);
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .dyk-text {
+      font-size: 12px;
+      color: #a08040;
+      line-height: 1.65;
+    }
+
+    .error-msg {
+      font-size: 13px;
+      color: var(--red);
+      line-height: 1.6;
+      padding: 16px 0;
+    }
+
+    .error-msg small {
+      display: block;
+      margin-top: 6px;
+      font-size: 11px;
+      opacity: 0.6;
+    }
+
+    /* ── Stamps display ─────────────────────── */
+    #stamps-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      align-items: center;
+    }
+
+    /* ── Globe Overlay ──────────────────────── */
+    #globe-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(6, 6, 10, 0.93);
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 28px;
+      z-index: 1000;
+      backdrop-filter: blur(4px);
+    }
+
+    #globe-canvas {
+      display: block;
+      filter: drop-shadow(0 0 40px rgba(74,158,255,0.2));
+    }
+
+    #globe-labels {
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-height: 60px;
+    }
+
+    #globe-label-country {
+      font-family: 'Playfair Display', Georgia, serif;
+      font-size: 30px;
+      font-weight: 600;
+      color: var(--text);
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 0.8s ease, transform 0.8s ease;
+    }
+
+    #globe-label-decade {
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      color: var(--blue);
+      text-transform: uppercase;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.7s ease 0.25s, transform 0.7s ease 0.25s;
+    }
+
+    /* ── Time Machine ───────────────────────── */
+    #tm-controls {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 20px;
+    }
+
+    #tm-selects {
+      display: flex;
+      gap: 6px;
+    }
+
+    .tm-select {
+      flex: 1;
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 6px 8px;
+      font-size: 11px;
+      font-family: 'Inter', sans-serif;
+      color: var(--text2);
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      min-width: 0;
+    }
+
+    .tm-select:focus { outline: none; border-color: var(--blue-border); }
+    .tm-select:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    #tm-btn {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 9px 14px;
+      font-size: 12px;
+      font-family: 'Inter', sans-serif;
+      color: var(--text2);
+      cursor: pointer;
+      transition: all 0.2s;
+      letter-spacing: 0.04em;
+    }
+
+    #tm-btn:hover:not(:disabled) {
+      background: var(--blue-bg);
+      border-color: var(--blue-border);
+      color: var(--blue);
+    }
+
+    #tm-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    #tm-btn .tm-icon {
+      font-size: 15px;
+    }
+
+    #tm-view {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      min-width: 0;
+      overflow-y: auto;
+      padding-right: 8px;
+    }
+
+    #tm-view::-webkit-scrollbar { width: 3px; }
+    #tm-view::-webkit-scrollbar-track { background: transparent; }
+    #tm-view::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+    #tm-back {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: none;
+      border: none;
+      font-size: 11px;
+      font-family: 'Inter', sans-serif;
+      color: var(--text3);
+      cursor: pointer;
+      padding: 0 0 14px 0;
+      transition: color 0.15s;
+      letter-spacing: 0.04em;
+    }
+
+    #tm-back:hover { color: var(--text2); }
+
+    #tm-header {
+      margin-bottom: 16px;
+    }
+
+    #tm-label {
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      color: var(--blue);
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    #tm-destination {
+      font-family: 'Playfair Display', Georgia, serif;
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    #tm-decade-badge {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--blue);
+      background: var(--blue-bg);
+      border: 0.5px solid var(--blue-border);
+      border-radius: 20px;
+      padding: 2px 10px;
+      letter-spacing: 0.06em;
+    }
+
+    #tm-genre {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+      margin: 14px 0 8px;
+    }
+
+    #tm-desc {
+      font-size: 12px;
+      color: var(--text2);
+      line-height: 1.7;
+      font-style: italic;
+      margin-bottom: 16px;
+    }
+
+    .tm-tracks-heading {
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      color: var(--text3);
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    .tm-track {
+      margin-bottom: 8px;
+    }
+
+    .tm-track:last-child { margin-bottom: 0; }
+
+    #tm-loading {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 60px 0;
+    }
+
+    #tm-loading-label {
+      font-size: 12px;
+      color: var(--text2);
+      letter-spacing: 0.04em;
+    }
+
+    /* ── Apple Music inline player ──────────── */
+    .am-player {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--surface2);
+      border: 0.5px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+
+    .am-player-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .am-player-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .am-player-artist {
+      font-size: 11px;
+      color: var(--text2);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .am-play-btn {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      border: none;
+      background: #fc3c44;
+      color: #fff;
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: opacity 0.15s;
+    }
+
+    .am-play-btn:hover { opacity: 0.85; }
+    .am-play-btn.loading { opacity: 0.5; cursor: wait; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <div>
+        <div id="title">Musical Passport</div>
+      </div>
+      <div id="header-right">
+        <div id="user-info" style="display:none;">
+          <span class="spotify-badge">♫ Spotify</span>
+          <span id="user-name"></span>
+        </div>
+        <div id="apple-user-info" style="display:none; align-items:center;">
+          <span class="apple-badge">♫ Apple Music</span>
+        </div>
+        <div id="stamp-pill">0 stamps collected</div>
+        <a href="/auth/login" id="login-btn" class="auth-btn">Connect Spotify</a>
+        <button id="apple-login-btn" class="auth-btn apple-btn" onclick="initAppleMusic()">Connect Apple Music</button>
+        <a href="/auth/logout" id="logout-btn" class="auth-btn logout-btn" style="display:none;">Logout</a>
+        <button id="apple-logout-btn" class="auth-btn logout-btn" onclick="disconnectAppleMusic()" style="display:none;">Disconnect</button>
+      </div>
+    </div>
+
+    <div id="body">
+      <!-- Countries list + Time Machine -->
+      <div id="countries-col">
+        <div id="tm-controls">
+          <div id="tm-selects">
+            <select id="tm-country-select" class="tm-select" disabled>
+              <option value="">Random country</option>
+            </select>
+            <select id="tm-decade-select" class="tm-select" disabled>
+              <option value="">Random decade</option>
+              <option>1940s</option>
+              <option>1950s</option>
+              <option>1960s</option>
+              <option>1970s</option>
+              <option>1980s</option>
+              <option>1990s</option>
+              <option>2000s</option>
+              <option>2010s</option>
+            </select>
+          </div>
+          <button id="tm-btn" onclick="launchTimeMachine()" disabled title="Connect Spotify or Apple Music to use the Time Machine">
+            <span class="tm-icon">⏳</span> Time Machine
+          </button>
+        </div>
+      </div>
+
+      <!-- Time Machine view (replaces countries-col) -->
+      <div id="tm-view">
+        <button id="tm-back" onclick="showCountries()">← Back to countries</button>
+        <div id="tm-loading">
+          <div class="spinner"></div>
+          <div id="tm-loading-label">Travelling back in time…</div>
+        </div>
+        <div id="tm-result" style="display:none;">
+          <div id="tm-header">
+            <div id="tm-label">Time Machine</div>
+            <div id="tm-destination"></div>
+            <span id="tm-decade-badge"></span>
+          </div>
+          <div id="tm-genre"></div>
+          <p id="tm-desc"></p>
+          <div class="tm-tracks-heading">5 essential tracks</div>
+          <div id="tm-tracks"></div>
+        </div>
+      </div>
+
+      <!-- Recommendation panel -->
+      <div id="panel">
+        <div id="panel-empty">
+          <svg class="empty-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2"/>
+            <path d="M16 22h16M16 28h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            <circle cx="36" cy="30" r="5" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M36 28v2l1 1" stroke="currentColor" stroke-width="1" stroke-linecap="round"/>
+          </svg>
+          <p>Select any country to get AI-powered music recommendations, cultural context, and Spotify links.</p>
+        </div>
+
+        <div id="panel-active">
+          <div id="panel-head">
+            <div id="panel-country-name"></div>
+            <div id="panel-meta">Passport entry</div>
+          </div>
+          <div id="panel-scroll">
+            <div id="loading">
+              <div class="spinner"></div>
+              <div id="loading-label">Tuning in…</div>
+            </div>
+            <div id="rec-content"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── Authentication ──────────────────────────
+    let currentUser = null;
+    let userTopArtists = [];
+    let currentService = null; // 'spotify' | 'apple-music' | null
+
+    async function checkAuth() {
+      try {
+        const res = await fetch("/api/me", {
+          credentials: 'include'
+        });
+        if (res.ok) {
+          const data = await res.json();
+          currentUser = data.user;
+          userTopArtists = data.topArtists;
+          updateAuthUI(true);
+        } else {
+          updateAuthUI(false);
+        }
+      } catch (err) {
+        updateAuthUI(false);
+      }
+    }
+
+    function updateAuthUI(isSpotifyLoggedIn) {
+      const loginBtn       = document.getElementById("login-btn");
+      const logoutBtn      = document.getElementById("logout-btn");
+      const userInfo       = document.getElementById("user-info");
+      const userName       = document.getElementById("user-name");
+      const appleLoginBtn  = document.getElementById("apple-login-btn");
+      const appleLogoutBtn = document.getElementById("apple-logout-btn");
+      const appleUserInfo  = document.getElementById("apple-user-info");
+      const tmBtn          = document.getElementById("tm-btn");
+
+      if (isSpotifyLoggedIn && currentUser) {
+        currentService = "spotify";
+        userInfo.style.display = "flex";
+        userName.textContent = currentUser.displayName || currentUser.email;
+        logoutBtn.style.display = "inline-block";
+        loginBtn.style.display = "none";
+        appleLoginBtn.style.display = "none";
+        appleLogoutBtn.style.display = "none";
+        appleUserInfo.style.display = "none";
+        tmBtn.disabled = false;
+        tmBtn.title = "";
+        document.querySelectorAll(".tm-select").forEach(s => s.disabled = false);
+      } else if (currentService === "apple-music") {
+        appleUserInfo.style.display = "flex";
+        appleLogoutBtn.style.display = "inline-block";
+        loginBtn.style.display = "none";
+        logoutBtn.style.display = "none";
+        userInfo.style.display = "none";
+        appleLoginBtn.style.display = "none";
+        tmBtn.disabled = false;
+        tmBtn.title = "";
+        document.querySelectorAll(".tm-select").forEach(s => s.disabled = false);
+      } else {
+        currentService = null;
+        loginBtn.style.display = "inline-block";
+        appleLoginBtn.style.display = "inline-block";
+        logoutBtn.style.display = "none";
+        appleLogoutBtn.style.display = "none";
+        userInfo.style.display = "none";
+        appleUserInfo.style.display = "none";
+        tmBtn.disabled = true;
+        tmBtn.title = "Connect Spotify or Apple Music to use the Time Machine";
+        document.querySelectorAll(".tm-select").forEach(s => s.disabled = true);
+      }
+    }
+
+    // Check auth on page load
+    checkAuth();
+
+    const REGIONS = [
+      { name: "Europe", countries: ["France","Germany","Sweden","Norway","Portugal","Spain","Italy","Greece","Poland","Iceland","Finland","Ireland","Netherlands","Romania","Serbia","Ukraine","Hungary","Czechia","Turkey"] },
+      { name: "Latin America", countries: ["Brazil","Argentina","Colombia","Cuba","Mexico","Chile","Peru","Jamaica","Venezuela","Bolivia","Ecuador","Panama"] },
+      { name: "Africa", countries: ["Nigeria","Ghana","Senegal","Mali","Ethiopia","South Africa","Egypt","Cameroon","Congo","Kenya","Algeria","Morocco","Tanzania"] },
+      { name: "Middle East", countries: ["Lebanon","Iran","Israel","Saudi Arabia","Armenia","Azerbaijan","Georgia"] },
+      { name: "Asia", countries: ["Japan","South Korea","India","China","Indonesia","Thailand","Vietnam","Philippines","Pakistan","Bangladesh","Taiwan","Mongolia"] },
+      { name: "Oceania", countries: ["Australia","New Zealand","Papua New Guinea","Fiji"] },
+      { name: "North America & Caribbean", countries: ["USA","Canada","Haiti","Trinidad & Tobago","Barbados"] },
+    ];
+
+    const stamps = new Set();
+    let activeBtn = null;
+    let activeCountry = null;
+
+    // Populate country dropdown with optgroups by region
+    const tmCountrySelect = document.getElementById("tm-country-select");
+    REGIONS.forEach(r => {
+      const group = document.createElement("optgroup");
+      group.label = r.name;
+      r.countries.forEach(c => {
+        const opt = document.createElement("option");
+        opt.value = c;
+        opt.textContent = c;
+        group.appendChild(opt);
+      });
+      tmCountrySelect.appendChild(group);
+    });
+
+    // Build country buttons
+    const col = document.getElementById("countries-col");
+    REGIONS.forEach(r => {
+      const block = document.createElement("div");
+      block.className = "region";
+      block.innerHTML = `<div class="region-name">${r.name}</div><div class="country-grid"></div>`;
+      const grid = block.querySelector(".country-grid");
+      r.countries.forEach(c => {
+        const btn = document.createElement("button");
+        btn.className = "c-btn";
+        btn.textContent = c;
+        btn.dataset.country = c;
+        btn.addEventListener("click", () => selectCountry(c, btn));
+        grid.appendChild(btn);
+      });
+      col.appendChild(block);
+    });
+
+    function selectCountry(name, btn) {
+      if (activeBtn) {
+        activeBtn.classList.remove("active");
+        if (stamps.has(activeBtn.dataset.country)) activeBtn.classList.add("stamped");
+      }
+      activeBtn = btn;
+      activeCountry = name;
+      btn.classList.remove("stamped");
+      btn.classList.add("active");
+
+      document.getElementById("panel-empty").style.display = "none";
+      document.getElementById("panel-active").style.display = "flex";
+      document.getElementById("panel-country-name").textContent = name;
+      document.getElementById("panel-meta").innerHTML = stamps.has(name)
+        ? '<span class="stamped-badge">✦ Stamped</span>'
+        : 'Passport entry';
+      document.getElementById("loading").style.display = "flex";
+      document.getElementById("rec-content").style.display = "none";
+      document.getElementById("loading-label").textContent = `Tuning in to ${name}…`;
+
+      fetchRecs(name);
+    }
+
+    async function fetchRecs(country) {
+      const snap = country;
+      try {
+        const res = await fetch("/api/recommend", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: 'include',
+          body: JSON.stringify({ country }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Server error");
+
+        stamps.add(snap);
+        updateStamps();
+
+        if (activeCountry === snap) {
+          document.getElementById("panel-meta").innerHTML = '<span class="stamped-badge">✦ Stamped</span>';
+          renderRecs(data);
+        }
+
+        document.querySelectorAll(".c-btn").forEach(b => {
+          if (stamps.has(b.dataset.country) && !b.classList.contains("active")) b.classList.add("stamped");
+        });
+
+      } catch (err) {
+        if (activeCountry === snap) {
+          document.getElementById("loading").style.display = "none";
+          document.getElementById("rec-content").style.display = "block";
+          document.getElementById("rec-content").innerHTML =
+            `<div class="error-msg">Could not load recommendations.<small>${err.message}</small></div>`;
+        }
+      }
+    }
+
+    function updateStamps() {
+      const n = stamps.size;
+      document.getElementById("stamp-pill").textContent =
+        n === 0 ? "0 stamps collected" : `${n} stamp${n !== 1 ? "s" : ""} collected`;
+    }
+
+    function eraClass(era) {
+      if (!era) return "era-contemporary";
+      const e = era.toLowerCase();
+      if (e.includes("legend")) return "era-legendary";
+      if (e.includes("classic")) return "era-classic";
+      return "era-contemporary";
+    }
+
+    function renderRecs(rec) {
+      document.getElementById("loading").style.display = "none";
+      const el = document.getElementById("rec-content");
+      el.style.display = "block";
+
+      let html = "";
+
+      if (rec.genres?.length) {
+        html += `<div class="genres">${rec.genres.map(g => `<span class="genre-tag">${g}</span>`).join("")}</div>`;
+      }
+
+      html += `<div class="section-heading">Recommended artists (click to play)</div>`;
+
+      (rec.artists || []).forEach((a, index) => {
+        html += `
+          <div class="artist" data-artist-index="${index}" data-artist-name="${a.name.replace(/"/g, '&quot;')}">
+            <div class="artist-top">
+              <div>
+                <div class="artist-name">${a.name}</div>
+                <div class="artist-genre">${a.genre}</div>
+              </div>
+              <span class="era ${eraClass(a.era)}">${a.era}</span>
+            </div>
+            <span class="similar">Fans of ${a.similarTo}</span>
+            <div class="tracks" id="tracks-${index}" style="display: none; margin-top: 10px;"></div>
+          </div>`;
+      });
+
+      if (rec.didYouKnow) {
+        html += `
+          <div class="dyk">
+            <div class="dyk-label">Did you know</div>
+            <p class="dyk-text">${rec.didYouKnow}</p>
+          </div>`;
+      }
+
+      el.innerHTML = html;
+
+      // Add click handlers to artist cards
+      document.querySelectorAll('.artist').forEach(artistEl => {
+        artistEl.addEventListener('click', () => loadArtistTracks(artistEl));
+      });
+    }
+
+    async function loadArtistTracks(artistEl) {
+      const artistName = artistEl.dataset.artistName;
+      const index = artistEl.dataset.artistIndex;
+      const tracksContainer = document.getElementById(`tracks-${index}`);
+
+      // If already expanded, collapse it
+      if (artistEl.classList.contains('expanded')) {
+        artistEl.classList.remove('expanded');
+        tracksContainer.style.display = 'none';
+        tracksContainer.innerHTML = '';
+        return;
+      }
+
+      // Show loading state
+      artistEl.classList.add('loading');
+
+      try {
+        const endpoint = currentService === 'apple-music'
+          ? `/api/artist-tracks-apple/${encodeURIComponent(artistName)}`
+          : `/api/artist-tracks/${encodeURIComponent(artistName)}`;
+
+        const res  = await fetch(endpoint, { credentials: 'include' });
+        const data = await res.json();
+
+        if (!res.ok) throw new Error(data.error || 'Failed to load tracks');
+
+        artistEl.classList.remove('loading');
+        artistEl.classList.add('expanded');
+
+        if (data.tracks && data.tracks.length > 0) {
+          tracksContainer.innerHTML = data.tracks.map(renderTrackEmbed).join('');
+          tracksContainer.style.display = 'flex';
+          tracksContainer.style.flexDirection = 'column';
+        } else {
+          tracksContainer.innerHTML = '<p style="font-size: 11px; color: var(--text3); margin-top: 8px;">No tracks available</p>';
+          tracksContainer.style.display = 'block';
+        }
+      } catch (err) {
+        artistEl.classList.remove('loading');
+        console.error('Error loading tracks:', err);
+        tracksContainer.innerHTML = `<p style="font-size: 11px; color: var(--red); margin-top: 8px;">Failed to load tracks</p>`;
+        tracksContainer.style.display = 'block';
+      }
+    }
+
+    // ── Apple Music auth ─────────────────────────────────
+    async function initAppleMusic() {
+      if (typeof MusicKit === "undefined") {
+        alert("Apple Music is still loading — please try again in a moment.");
+        return;
+      }
+      try {
+        const res = await fetch("/api/apple-token");
+        const payload = await res.json();
+        if (!res.ok) { alert("Apple Music not configured: " + payload.error); return; }
+
+        await MusicKit.configure({ developerToken: payload.token, app: { name: "Musical Passport", build: "1.0" } });
+        const kit = MusicKit.getInstance();
+        const userToken = await kit.authorize();
+        if (userToken) {
+          currentService = "apple-music";
+          updateAuthUI(false);
+
+          // Keep play button in sync with MusicKit playback state
+          kit.addEventListener("playbackStateDidChange", ({ state }) => {
+            const playing = state === MusicKit.PlaybackStates.playing;
+            const paused  = state === MusicKit.PlaybackStates.paused;
+            const ended   = state === MusicKit.PlaybackStates.ended || state === MusicKit.PlaybackStates.completed;
+            amPlaying = playing;
+            if (amCurrentBtn) {
+              amCurrentBtn.classList.remove('loading');
+              amCurrentBtn.textContent = playing ? '⏸' : '▶';
+              if (ended) { amCurrentBtn.textContent = '▶'; amCurrentId = null; }
+            }
+          });
+        }
+      } catch (err) {
+        console.error("Apple Music auth error:", err);
+        alert("Could not connect to Apple Music: " + err.message);
+      }
+    }
+
+    function disconnectAppleMusic() {
+      try { MusicKit.getInstance().unauthorize(); } catch (_) {}
+      currentService = null;
+      updateAuthUI(false);
+    }
+
+    // ── Apple Music playback engine ───────────────────────
+    let amCurrentId  = null;
+    let amPlaying    = false;
+    let amCurrentBtn = null;
+
+    async function playAppleMusicTrack(appleId, btn, event) {
+      if (event) event.stopPropagation();
+      const music = MusicKit.getInstance();
+
+      // Toggle pause if same track
+      if (amCurrentId === appleId && amPlaying) {
+        music.pause();
+        return;
+      }
+
+      // Reset previous button
+      if (amCurrentBtn) { amCurrentBtn.textContent = '▶'; amCurrentBtn.classList.remove('loading'); }
+
+      btn.classList.add('loading');
+      amCurrentBtn = btn;
+      amCurrentId  = appleId;
+
+      try {
+        await music.setQueue({ song: appleId });
+        await music.play();
+      } catch (err) {
+        console.error('Apple Music playback error:', err);
+        btn.classList.remove('loading');
+      }
+    }
+
+    // ── Track embed renderer ──────────────────────────────
+    function renderTrackEmbed(track) {
+      if (track.appleId) {
+        // Custom MusicKit JS player — no re-login prompt
+        const artist = track.artist ? `<div class="am-player-artist">${track.artist}</div>` : '';
+        return `<div class="am-player">
+          <div class="am-player-info">
+            <div class="am-player-title">${track.title}</div>
+            ${artist}
+          </div>
+          <button class="am-play-btn" onclick="playAppleMusicTrack('${track.appleId}', this, event)">▶</button>
+        </div>`;
+      } else if (track.spotifyId) {
+        // Spotify embed
+        return `<iframe class="track-player" src="https://open.spotify.com/embed/track/${track.spotifyId}?utm_source=generator&theme=0" frameBorder="0" allowfullscreen="" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture" loading="lazy"></iframe>`;
+      }
+      return `<div style="font-size:11px;color:var(--text3);padding:8px 0;">Track not available on this service</div>`;
+    }
+
+    // ── Time Machine ─────────────────────────────────────
+    const DECADES = ["1940s", "1950s","1960s","1970s","1980s","1990s","2000s","2010s"];
+
+    const COUNTRY_COORDS = {
+      "France":[2.3,48.9],"Germany":[10.5,51.2],"Sweden":[18.6,60.1],"Norway":[10.7,59.9],
+      "Portugal":[-8.2,39.4],"Spain":[-3.7,40.4],"Italy":[12.6,41.9],"Greece":[21.8,37.0],
+      "Poland":[19.1,52.2],"Iceland":[-22.0,65.0],"Finland":[24.9,60.2],"Ireland":[-8.0,53.4],
+      "Netherlands":[5.3,52.1],"Romania":[25.0,45.9],"Serbia":[21.0,44.0],"Ukraine":[32.0,49.0],
+      "Hungary":[19.0,47.5],"Czechia":[15.5,49.8],"Turkey":[35.2,39.0],
+      "Brazil":[-51.9,-14.2],"Argentina":[-63.6,-38.4],"Colombia":[-74.3,4.6],"Cuba":[-79.5,22.0],
+      "Mexico":[-102.5,23.6],"Chile":[-71.5,-35.7],"Peru":[-75.0,-9.2],"Jamaica":[-77.3,18.1],
+      "Venezuela":[-66.6,6.4],"Bolivia":[-64.9,-16.3],"Ecuador":[-78.5,-1.8],"Panama":[-80.8,8.5],
+      "Nigeria":[8.7,9.1],"Ghana":[-1.0,7.9],"Senegal":[-14.5,14.5],"Mali":[-1.6,17.6],
+      "Ethiopia":[40.5,9.1],"South Africa":[25.0,-29.0],"Egypt":[30.8,26.8],"Cameroon":[12.4,4.0],
+      "Congo":[15.8,-0.2],"Kenya":[37.9,0.0],"Algeria":[1.7,28.0],"Morocco":[-7.1,31.8],
+      "Tanzania":[34.9,-6.4],"Lebanon":[35.9,33.9],"Iran":[53.7,32.4],"Israel":[34.9,31.5],
+      "Saudi Arabia":[45.1,23.9],"Armenia":[45.0,40.1],"Azerbaijan":[47.6,40.1],"Georgia":[43.4,42.3],
+      "Japan":[138.3,36.2],"South Korea":[127.8,35.9],"India":[78.9,20.6],"China":[104.2,35.9],
+      "Indonesia":[113.9,-0.8],"Thailand":[101.0,15.9],"Vietnam":[106.3,14.1],"Philippines":[122.9,12.9],
+      "Pakistan":[69.3,30.4],"Bangladesh":[90.4,23.7],"Taiwan":[120.9,23.7],"Mongolia":[103.8,46.9],
+      "Australia":[133.8,-25.3],"New Zealand":[172.5,-40.9],"Papua New Guinea":[143.9,-6.3],"Fiji":[178.1,-17.7],
+      "USA":[-101.3,39.3],"Canada":[-96.8,56.1],"Haiti":[-72.3,18.9],
+      "Trinidad & Tobago":[-61.2,10.7],"Barbados":[-59.6,13.2],
+    };
+
+    function getAllCountries() {
+      return REGIONS.flatMap(r => r.countries);
+    }
+
+    function showCountries() {
+      document.getElementById("tm-view").style.display = "none";
+      document.getElementById("countries-col").style.display = "block";
+    }
+
+    // ── Globe animation ──────────────────────────────────
+    function runGlobeAnimation(country, decade) {
+      return new Promise(resolve => {
+        const [targetLon, targetLat] = COUNTRY_COORDS[country] || [0, 0];
+        const overlay   = document.getElementById('globe-overlay');
+        const canvas    = document.getElementById('globe-canvas');
+        const ctx       = canvas.getContext('2d');
+        const labelCo   = document.getElementById('globe-label-country');
+        const labelDec  = document.getElementById('globe-label-decade');
+        const W = canvas.width, H = canvas.height;
+        const cx = W / 2, cy = H / 2;
+        const TILT = 22 * Math.PI / 180; // slight downward tilt (radians)
+
+        // Reset labels
+        labelCo.textContent = country;
+        labelDec.textContent = decade;
+        labelCo.style.transition = 'none';
+        labelDec.style.transition = 'none';
+        labelCo.style.opacity = '0';
+        labelDec.style.opacity = '0';
+        labelCo.style.transform = 'translateY(8px)';
+        labelDec.style.transform = 'translateY(6px)';
+
+        // Show overlay
+        overlay.style.opacity = '0';
+        overlay.style.display = 'flex';
+        requestAnimationFrame(() => {
+          overlay.style.transition = 'opacity 0.35s ease';
+          overlay.style.opacity = '1';
+        });
+
+        const ROTATE_MS = 1900;
+        const ZOOM_MS   = 1100;
+        const TOTAL_MS  = ROTATE_MS + ZOOM_MS;
+        const startRotation = targetLon - 115; // start 115° off
+
+        function easeInOut(t) { return t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2; }
+        function easeOut(t)   { return 1 - Math.pow(1-t,3); }
+
+        // Orthographic projection with tilt
+        function project(lon, lat, rotation, R) {
+          const φ = (lon - rotation) * Math.PI / 180;
+          const λ = lat * Math.PI / 180;
+          const x3 =  Math.cos(λ) * Math.sin(φ);
+          const yRaw = Math.sin(λ);
+          const zRaw = Math.cos(λ) * Math.cos(φ);
+          const y3 = yRaw * Math.cos(TILT) - zRaw * Math.sin(TILT);
+          const z3 = yRaw * Math.sin(TILT) + zRaw * Math.cos(TILT);
+          return { x: cx + x3 * R, y: cy - y3 * R, z: z3 };
+        }
+
+        function drawLine(pts) {
+          let drawing = false;
+          ctx.beginPath();
+          for (let i = 0; i < pts.length; i++) {
+            const p = pts[i];
+            if (p.z > 0) {
+              if (!drawing) { ctx.moveTo(p.x, p.y); drawing = true; }
+              else ctx.lineTo(p.x, p.y);
+            } else { drawing = false; }
+          }
+          ctx.stroke();
+        }
+
+        function drawFrame(rotation, R) {
+          ctx.clearRect(0, 0, W, H);
+
+          // Clip to globe
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx, cy, R, 0, Math.PI * 2);
+          ctx.clip();
+
+          // Ocean gradient
+          const g = ctx.createRadialGradient(cx - R*0.28, cy - R*0.28, 0, cx, cy, R*1.05);
+          g.addColorStop(0, '#1e3160');
+          g.addColorStop(0.6, '#0e1a38');
+          g.addColorStop(1, '#060c18');
+          ctx.fillStyle = g;
+          ctx.fillRect(cx - R - 1, cy - R - 1, R*2 + 2, R*2 + 2);
+
+          // Grid lines
+          ctx.strokeStyle = 'rgba(90,140,230,0.14)';
+          ctx.lineWidth = 0.6;
+          for (let lat = -80; lat <= 80; lat += 20) {
+            const pts = [];
+            for (let lon = -180; lon <= 180; lon += 4) pts.push(project(lon, lat, rotation, R));
+            drawLine(pts);
+          }
+          for (let lon = 0; lon < 360; lon += 20) {
+            const pts = [];
+            for (let lat = -90; lat <= 90; lat += 4) pts.push(project(lon, lat, rotation, R));
+            drawLine(pts);
+          }
+
+          ctx.restore(); // end clip
+
+          // Globe rim
+          ctx.beginPath();
+          ctx.arc(cx, cy, R, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(74,158,255,0.45)';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          // Atmosphere halo
+          const atm = ctx.createRadialGradient(cx, cy, R * 0.88, cx, cy, R * 1.18);
+          atm.addColorStop(0, 'rgba(74,158,255,0.0)');
+          atm.addColorStop(0.5, 'rgba(74,158,255,0.06)');
+          atm.addColorStop(1, 'rgba(74,158,255,0.0)');
+          ctx.beginPath();
+          ctx.arc(cx, cy, R * 1.18, 0, Math.PI * 2);
+          ctx.fillStyle = atm;
+          ctx.fill();
+
+          // Country dot + pulse rings
+          const dot = project(targetLon, targetLat, rotation, R);
+          if (dot.z > 0.04) {
+            const v = Math.min(1, (dot.z - 0.04) / 0.25);
+            const pulse = (Date.now() / 1400) % 1;
+            for (let i = 0; i < 3; i++) {
+              const p = (pulse + i * 0.333) % 1;
+              ctx.beginPath();
+              ctx.arc(dot.x, dot.y, 5 + p * 24, 0, Math.PI * 2);
+              ctx.strokeStyle = `rgba(74,158,255,${(1 - p) * 0.5 * v})`;
+              ctx.lineWidth = 1.5;
+              ctx.stroke();
+            }
+            ctx.beginPath();
+            ctx.arc(dot.x, dot.y, 5, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(74,158,255,${0.92 * v})`;
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(dot.x, dot.y, 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255,255,255,${v})`;
+            ctx.fill();
+          }
+        }
+
+        let animStart = null;
+        function animate(ts) {
+          if (!animStart) animStart = ts;
+          const elapsed = ts - animStart;
+          let rotation, R;
+
+          if (elapsed < ROTATE_MS) {
+            const p = easeInOut(elapsed / ROTATE_MS);
+            rotation = startRotation + (targetLon - startRotation) * p;
+            R = 112;
+            if (p > 0.5) {
+              labelCo.style.transition = 'opacity 0.8s ease, transform 0.8s ease';
+              labelCo.style.opacity = '1';
+              labelCo.style.transform = 'translateY(0)';
+            }
+            if (p > 0.65) {
+              labelDec.style.transition = 'opacity 0.7s ease, transform 0.7s ease';
+              labelDec.style.opacity = '1';
+              labelDec.style.transform = 'translateY(0)';
+            }
+          } else {
+            const p = easeOut((elapsed - ROTATE_MS) / ZOOM_MS);
+            rotation = targetLon;
+            R = 112 + p * 52; // zoom 112 → 164
+          }
+
+          drawFrame(rotation, R);
+
+          if (elapsed < TOTAL_MS) {
+            requestAnimationFrame(animate);
+          } else {
+            overlay.style.transition = 'opacity 0.45s ease';
+            overlay.style.opacity = '0';
+            setTimeout(() => {
+              overlay.style.display = 'none';
+              overlay.style.opacity = '';
+              overlay.style.transition = '';
+              resolve();
+            }, 450);
+          }
+        }
+        requestAnimationFrame(animate);
+      });
+    }
+
+    // ── Time Machine launch ───────────────────────────────
+    async function launchTimeMachine() {
+      const allCountries = getAllCountries();
+      const selectedCountry = document.getElementById("tm-country-select").value;
+      const selectedDecade  = document.getElementById("tm-decade-select").value;
+      const country = selectedCountry || allCountries[Math.floor(Math.random() * allCountries.length)];
+      const decade  = selectedDecade  || DECADES[Math.floor(Math.random() * DECADES.length)];
+
+      // Prepare TM view (hidden behind overlay until animation finishes)
+      document.getElementById("countries-col").style.display = "none";
+      document.getElementById("tm-view").style.display = "flex";
+      document.getElementById("tm-loading").style.display = "flex";
+      document.getElementById("tm-loading-label").textContent = `Tuning in to ${country}…`;
+      document.getElementById("tm-result").style.display = "none";
+
+      // Run globe animation and API call in parallel
+      const animPromise = runGlobeAnimation(country, decade);
+      const apiPromise = fetch("/api/time-machine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ country, decade, service: currentService || "spotify" }),
+      }).then(r => r.json().then(d => {
+        if (!r.ok) throw new Error(d.error || "Server error");
+        return d;
+      }));
+
+      // Wait for animation to finish before revealing results
+      await animPromise;
+
+      try {
+        const data = await apiPromise;
+        document.getElementById("tm-destination").textContent = country;
+        document.getElementById("tm-decade-badge").textContent = decade;
+        document.getElementById("tm-genre").textContent = data.genre;
+        document.getElementById("tm-desc").textContent = data.description;
+
+        const tracksEl = document.getElementById("tm-tracks");
+        tracksEl.innerHTML = "";
+        (data.tracks || []).forEach(track => {
+          const div = document.createElement("div");
+          div.className = "tm-track";
+          div.innerHTML = renderTrackEmbed(track);
+          tracksEl.appendChild(div);
+        });
+
+        document.getElementById("tm-loading").style.display = "none";
+        document.getElementById("tm-result").style.display = "block";
+      } catch (err) {
+        document.getElementById("tm-loading").style.display = "none";
+        document.getElementById("tm-result").style.display = "block";
+        document.getElementById("tm-tracks").innerHTML =
+          `<div class="error-msg">Could not load Time Machine.<small>${err.message}</small></div>`;
+      }
+    }
+  </script>
+
+  <!-- Globe animation overlay -->
+  <div id="globe-overlay">
+    <canvas id="globe-canvas" width="300" height="300"></canvas>
+    <div id="globe-labels">
+      <div id="globe-label-country"></div>
+      <div id="globe-label-decade"></div>
+    </div>
+  </div>
+</body>
+</html>
