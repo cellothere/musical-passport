@@ -127,37 +127,62 @@ app.post("/api/recommend", async (req, res) => {
     return res.status(400).json({ error: "Missing country in request body." });
   }
 
-  // Get user's top artists if authenticated
+  // Get user's top artists and liked songs if authenticated
   let topArtists = [];
+  let likedSongs = [];
   const authHeader = req.headers.authorization;
   const accessToken = (authHeader && authHeader.startsWith("Bearer "))
     ? authHeader.slice(7)
     : req.session.accessToken;
 
   if (accessToken) {
-    try {
-      const topArtistsResponse = await fetch(
+    // Fetch top artists and a random sample of liked songs in parallel
+    await Promise.all([
+      // Top 10 artists
+      fetch(
         "https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term",
-        {
-          headers: { Authorization: "Bearer " + accessToken },
+        { headers: { Authorization: "Bearer " + accessToken } }
+      ).then(async (r) => {
+        if (r.ok) {
+          const d = await r.json();
+          topArtists = d.items ? d.items.map((a) => a.name) : [];
         }
-      );
+      }).catch((err) => console.error("Error fetching top artists:", err)),
 
-      if (topArtistsResponse.ok) {
-        const topArtistsData = await topArtistsResponse.json();
-        topArtists = topArtistsData.items
-          ? topArtistsData.items.map((a) => a.name)
-          : [];
-      }
-    } catch (err) {
-      console.error("Error fetching top artists:", err);
-      // Continue without personalization
-    }
+      // Random sample of liked songs — first fetch total, then grab a random page
+      fetch(
+        "https://api.spotify.com/v1/me/tracks?limit=1",
+        { headers: { Authorization: "Bearer " + accessToken } }
+      ).then(async (r) => {
+        if (!r.ok) return;
+        const { total } = await r.json();
+        if (!total) return;
+        // Pick a random offset so we get variety across the whole library
+        const maxOffset = Math.max(0, Math.min(total - 10, total - 1));
+        const offset = Math.floor(Math.random() * maxOffset);
+        const tracksRes = await fetch(
+          `https://api.spotify.com/v1/me/tracks?limit=10&offset=${offset}`,
+          { headers: { Authorization: "Bearer " + accessToken } }
+        );
+        if (tracksRes.ok) {
+          const tracksData = await tracksRes.json();
+          likedSongs = tracksData.items
+            ? tracksData.items.map((i) => `${i.track.name} by ${i.track.artists[0].name}`)
+            : [];
+        }
+      }).catch((err) => console.error("Error fetching liked songs:", err)),
+    ]);
   }
 
   // Build personalization context
-  const personalizationNote = topArtists.length > 0
-    ? `\n\nThe user enjoys these artists: ${topArtists.slice(0, 5).join(", ")}. Use this to personalize the "similarTo" comparisons to artists they might actually know.`
+  const artistNote = topArtists.length > 0
+    ? `\nTop artists they listen to: ${topArtists.join(", ")}.`
+    : "";
+  const songsNote = likedSongs.length > 0
+    ? `\nSome songs from their liked songs library: ${likedSongs.join("; ")}.`
+    : "";
+  const personalizationNote = (artistNote || songsNote)
+    ? `\n\nPersonalization context for this user:${artistNote}${songsNote}\nUse this to personalize the "similarTo" comparisons to artists and styles they will recognize.`
     : "";
 
   try {
@@ -430,7 +455,7 @@ async function fetchArtistTracks(artistName) {
 
 // Initiate Spotify OAuth flow
 app.get("/auth/login", (req, res) => {
-  const scope = "user-top-read user-read-private user-read-email";
+  const scope = "user-top-read user-read-private user-read-email user-library-read";
   const authUrl =
     "https://accounts.spotify.com/authorize?" +
     querystring.stringify({
