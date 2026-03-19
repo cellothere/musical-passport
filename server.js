@@ -455,7 +455,8 @@ async function fetchArtistTracks(artistName) {
 // ── Spotify OAuth endpoints ──────────────────────────────
 
 // Initiate Spotify OAuth flow
-app.get("/auth/login", (req, res) => {
+app.get("/auth/login", (_req, res) => {
+  console.log("SPOTIFY_REDIRECT_URI:", SPOTIFY_REDIRECT_URI);
   const scope = "user-top-read user-read-private user-read-email user-library-read";
   const authUrl =
     "https://accounts.spotify.com/authorize?" +
@@ -518,11 +519,11 @@ app.get("/auth/logout", (req, res) => {
 
 // Mobile PKCE token exchange — called by the React Native app after OAuth redirect
 app.post("/auth/mobile-callback", async (req, res) => {
-  const { code, codeVerifier } = req.body;
+  const { code, codeVerifier, redirectUri } = req.body;
   if (!code || !codeVerifier) {
     return res.status(400).json({ error: "Missing code or codeVerifier" });
   }
-  const mobileRedirectUri = `${process.env.MOBILE_REDIRECT_URI || "musical-passport://"}`;
+  const mobileRedirectUri = redirectUri || process.env.MOBILE_REDIRECT_URI || "musical-passport://callback";
   try {
     const tokenResponse = await fetch("https://accounts.spotify.com/api/token", {
       method: "POST",
