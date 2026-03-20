@@ -380,6 +380,108 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
   }
 });
 
+// ── Genre Spotlight endpoint ─────────────────────────────
+app.post("/api/genre-spotlight", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
+
+  const { genre, country, service = "spotify" } = req.body;
+  if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [{
+          role: "user",
+          content: `Give a short spotlight on the genre "${genre}" as it exists in "${country}".
+
+Return exactly this JSON:
+{
+  "explanation": "2-3 crisp sentences: what defines this genre in ${country}, its roots, and why it matters",
+  "tracks": [
+    { "title": "exact track title", "artist": "exact artist name" }
+  ]
+}
+Include exactly 6 tracks that are essential to this genre in ${country}. Use exact titles and artist names as they appear on streaming platforms.`,
+        }],
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ error: data.error.message });
+
+    const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
+    const spotlight = JSON.parse(raw);
+
+    // Search streaming catalog for each track
+    let tracks;
+
+    if (service === "apple-music") {
+      const appleToken = generateAppleMusicToken();
+      const tracksWithIds = await Promise.all(
+        (spotlight.tracks || []).map(async (track) => {
+          if (!appleToken) return { ...track, appleId: null };
+          try {
+            const q = `${track.title} ${track.artist}`;
+            const r = await fetch(
+              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=1`,
+              { headers: { Authorization: `Bearer ${appleToken}` } }
+            );
+            const d = await r.json();
+            const s = d.results?.songs?.data?.[0];
+            return s
+              ? { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null }
+              : { ...track, appleId: null, previewUrl: null };
+          } catch { return { ...track, appleId: null }; }
+        })
+      );
+      tracks = tracksWithIds.filter(t => t.appleId).slice(0, 5);
+    } else {
+      const accessToken = await getClientAccessToken();
+      const tracksWithIds = await Promise.all(
+        (spotlight.tracks || []).map(async (track) => {
+          if (!accessToken) return { ...track, spotifyId: null };
+          try {
+            const q1 = `track:${track.title} artist:${track.artist}`;
+            const r1 = await fetch(
+              `https://api.spotify.com/v1/search?q=${encodeURIComponent(q1)}&type=track&limit=1&market=US`,
+              { headers: { Authorization: "Bearer " + accessToken } }
+            );
+            const d1 = await r1.json();
+            const found1 = d1.tracks?.items?.[0];
+            if (found1) return { ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` };
+
+            const r2 = await fetch(
+              `https://api.spotify.com/v1/search?q=${encodeURIComponent(`${track.title} ${track.artist}`)}&type=track&limit=1&market=US`,
+              { headers: { Authorization: "Bearer " + accessToken } }
+            );
+            const d2 = await r2.json();
+            const found2 = d2.tracks?.items?.[0];
+            return found2
+              ? { ...track, spotifyId: found2.id, previewUrl: found2.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found2.id}` }
+              : { ...track, spotifyId: null };
+          } catch { return { ...track, spotifyId: null }; }
+        })
+      );
+      tracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
+    }
+
+    res.json({ genre, country, explanation: spotlight.explanation, tracks });
+  } catch (err) {
+    console.error("Genre spotlight error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Helper function to fetch artist tracks ──────────────
 async function fetchArtistTracks(artistName) {
   try {
