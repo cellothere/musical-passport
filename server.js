@@ -379,6 +379,7 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
   }
 });
 
+
 // ── Genre Spotlight endpoint ─────────────────────────────
 app.post("/api/genre-spotlight", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
