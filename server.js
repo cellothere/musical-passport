@@ -6,6 +6,7 @@ const path = require("path");
 const session = require("express-session");
 const querystring = require("querystring");
 const { createSign } = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.set('trust proxy', 1); // Required for Railway/Heroku reverse proxy
@@ -87,6 +88,42 @@ function generateAppleMusicToken() {
   }
 }
 
+// ── Supabase client ───────────────────────────────────────
+const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+  : null;
+
+function makeCacheKey(parts) {
+  return parts.filter(Boolean).join("_").toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
+}
+
+async function getCached(cacheKey) {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from("recommendation_cache")
+    .select("*")
+    .eq("cache_key", cacheKey)
+    .single();
+  if (error || !data) return null;
+  supabase.from("recommendation_cache")
+    .update({ hit_count: data.hit_count + 1, last_accessed_at: new Date().toISOString() })
+    .eq("cache_key", cacheKey)
+    .then(() => {});
+  return data;
+}
+
+async function storeCache(cacheKey, endpoint, result, artistPool = null) {
+  if (!supabase) return;
+  await supabase.from("recommendation_cache").upsert(
+    { cache_key: cacheKey, endpoint, result, artist_pool: artistPool },
+    { onConflict: "cache_key" }
+  );
+}
+
+function pickRandom(arr, n) {
+  return [...arr].sort(() => Math.random() - 0.5).slice(0, n);
+}
+
 // CORS must be configured to allow credentials
 app.use(
   cors({
@@ -128,13 +165,27 @@ app.post("/api/recommend", async (req, res) => {
     return res.status(400).json({ error: "Missing country in request body." });
   }
 
-  // Get user's top artists and liked songs if authenticated
-  let topArtists = [];
-  let likedSongs = [];
   const authHeader = req.headers.authorization;
   const accessToken = (authHeader && authHeader.startsWith("Bearer "))
     ? authHeader.slice(7)
     : req.session.accessToken;
+
+  // Cache-first for unauthenticated requests
+  if (!accessToken) {
+    const cacheKey = makeCacheKey(["recommend", country]);
+    const cached = await getCached(cacheKey);
+    if (cached && cached.artist_pool && cached.artist_pool.length >= 4) {
+      return res.json({
+        genres: cached.result.genres,
+        artists: pickRandom(cached.artist_pool, 4),
+        didYouKnow: cached.result.didYouKnow,
+      });
+    }
+  }
+
+  // Get user's top artists and liked songs if authenticated
+  let topArtists = [];
+  let likedSongs = [];
 
   if (accessToken) {
     // Fetch top artists and a random sample of liked songs in parallel
@@ -196,7 +247,7 @@ app.post("/api/recommend", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
+        max_tokens: accessToken ? 1000 : 2500,
         system:
           "You are a world music curator and ethnomusicologist with deep knowledge of both living and historical musical traditions. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
         messages: [
@@ -224,7 +275,7 @@ Return exactly this JSON:
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
 }
-era must be exactly one of: Contemporary, Classic, Legendary. Include exactly 4 artists mixing eras.${personalizationNote}`,
+era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly ${accessToken ? 4 : 12} artists mixing eras.${personalizationNote}`,
           },
         ],
       }),
@@ -240,6 +291,12 @@ era must be exactly one of: Contemporary, Classic, Legendary. Include exactly 4 
       .replace(/```json|```/g, "")
       .trim();
     const rec = JSON.parse(raw);
+
+    if (!accessToken) {
+      const cacheKey = makeCacheKey(["recommend", country]);
+      await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
+      return res.json({ genres: rec.genres, artists: pickRandom(rec.artists, 4), didYouKnow: rec.didYouKnow });
+    }
 
     res.json(rec);
   } catch (err) {
@@ -259,7 +316,11 @@ app.post("/api/time-machine", async (req, res) => {
   if (!country || !decade) {
     return res.status(400).json({ error: "Missing country or decade." });
   }
-  
+
+  const tmCacheKey = makeCacheKey(["timemachine", country, decade, service]);
+  const tmCached = await getCached(tmCacheKey);
+  if (tmCached) return res.json(tmCached.result);
+
   try {
     // Ask Claude for a genre spotlight + 5 track recommendations
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -372,7 +433,9 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
       validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
     }
 
-    res.json({ genre: spotlight.genre, description: spotlight.description, tracks: validTracks });
+    const tmResult = { genre: spotlight.genre, description: spotlight.description, tracks: validTracks };
+    await storeCache(tmCacheKey, "time-machine", tmResult);
+    res.json(tmResult);
   } catch (err) {
     console.error("Time machine error:", err);
     res.status(500).json({ error: err.message });
@@ -387,6 +450,10 @@ app.post("/api/genre-spotlight", async (req, res) => {
 
   const { genre, country, service = "spotify" } = req.body;
   if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
+
+  const gsCacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
+  const gsCached = await getCached(gsCacheKey);
+  if (gsCached) return res.json(gsCached.result);
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -475,7 +542,9 @@ Include exactly 6 tracks that are essential to this genre in ${country}. Use exa
       tracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
     }
 
-    res.json({ genre, country, explanation: spotlight.explanation, tracks });
+    const gsResult = { genre, country, explanation: spotlight.explanation, tracks };
+    await storeCache(gsCacheKey, "genre-spotlight", gsResult);
+    res.json(gsResult);
   } catch (err) {
     console.error("Genre spotlight error:", err);
     res.status(500).json({ error: err.message });
@@ -792,6 +861,173 @@ app.get("/api/me", async (req, res) => {
     });
   } catch (err) {
     console.error("Error fetching user data:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Find artist (confirm before full search) ─────────────
+app.get("/api/find-artist", async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: "Missing query." });
+
+  try {
+    const token = await getClientAccessToken();
+    if (!token) return res.status(503).json({ error: "Spotify unavailable." });
+
+    const r = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=artist&limit=1`,
+      { headers: { Authorization: "Bearer " + token } }
+    );
+    const data = await r.json();
+    const artist = data.artists?.items?.[0];
+    if (!artist) return res.status(404).json({ error: "Artist not found." });
+
+    res.json({
+      id: artist.id,
+      name: artist.name,
+      genres: artist.genres?.slice(0, 3) || [],
+      imageUrl: artist.images?.[0]?.url || null,
+      followers: artist.followers?.total || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Similar artists from around the world ────────────────
+app.post("/api/similar-artists", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
+
+  const { artistName } = req.body;
+  if (!artistName) return res.status(400).json({ error: "Missing artistName." });
+
+  const simCacheKey = makeCacheKey(["similar", artistName]);
+  const simCached = await getCached(simCacheKey);
+  if (simCached && simCached.artist_pool && simCached.artist_pool.length >= 4) {
+    return res.json({
+      baseArtist: simCached.result.baseArtist,
+      sonicSummary: simCached.result.sonicSummary,
+      artists: pickRandom(simCached.artist_pool, 4),
+    });
+  }
+
+  try {
+    const token = await getClientAccessToken();
+    if (!token) return res.status(503).json({ error: "Could not authenticate with Spotify." });
+
+    // Step 1: Look up artist on Spotify for genres
+    const artistSearch = await fetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`,
+      { headers: { Authorization: "Bearer " + token } }
+    );
+    const artistData = await artistSearch.json();
+    const artist = artistData.artists?.items?.[0];
+    if (!artist) return res.status(404).json({ error: "Artist not found on Spotify." });
+
+    const foundName = artist.name;
+    const genres = artist.genres?.slice(0, 5) || [];
+
+    // Step 2: Get some track IDs for audio features
+    const tracksSearch = await fetch(
+      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(foundName)}&type=track&limit=5&market=US`,
+      { headers: { Authorization: "Bearer " + token } }
+    );
+    const tracksData = await tracksSearch.json();
+    const trackIds = (tracksData.tracks?.items || []).slice(0, 5).map(t => t.id);
+
+    // Step 3: Try audio features (optional enrichment, may fail on newer API tiers)
+    let audioProfile = null;
+    if (trackIds.length > 0) {
+      try {
+        const featuresRes = await fetch(
+          `https://api.spotify.com/v1/audio-features?ids=${trackIds.join(",")}`,
+          { headers: { Authorization: "Bearer " + token } }
+        );
+        const featuresData = await featuresRes.json();
+        const features = (featuresData.audio_features || []).filter(Boolean);
+        if (features.length > 0) {
+          const avg = (key) => (features.reduce((s, f) => s + f[key], 0) / features.length).toFixed(2);
+          audioProfile = {
+            danceability: avg("danceability"),
+            energy: avg("energy"),
+            valence: avg("valence"),
+            acousticness: avg("acousticness"),
+            tempo: Math.round(features.reduce((s, f) => s + f.tempo, 0) / features.length),
+          };
+        }
+      } catch (e) {
+        console.log("Audio features unavailable:", e.message);
+      }
+    }
+
+    // Step 4: Build Claude prompt
+    const profileLines = audioProfile
+      ? `Spotify audio profile (averaged across top tracks):
+- Danceability: ${audioProfile.danceability} / 1.0
+- Energy: ${audioProfile.energy} / 1.0
+- Valence (positivity): ${audioProfile.valence} / 1.0
+- Acousticness: ${audioProfile.acousticness} / 1.0
+- Tempo: ${audioProfile.tempo} BPM`
+      : "";
+
+    const prompt = `Find 12 artists from different countries around the world who sound similar to ${foundName}.
+
+Their profile:
+- Primary genres: ${genres.length > 0 ? genres.join(", ") : "mainstream pop"}
+${profileLines}
+
+Rules:
+- Each artist must be from a DIFFERENT country
+- Spread across at least 5 different continents
+- Mix of contemporary and classic artists
+- Avoid globally mainstream acts (no top-10 global chart artists)
+- Focus on capturing the same sonic energy, emotional feel, or stylistic DNA
+
+Return ONLY valid JSON:
+{
+  "baseArtist": "${foundName}",
+  "sonicSummary": "2 sentences describing what defines their sound and why people love it",
+  "artists": [
+    {
+      "name": "exact artist name as on Spotify",
+      "country": "full country name",
+      "countryCode": "2-letter ISO code",
+      "genre": "their primary genre",
+      "era": "Contemporary|Golden Era|Pioneer",
+      "description": "2 sentences on their sound",
+      "similarityReason": "1 specific sentence on why they match ${foundName}'s energy"
+    }
+  ]
+}`;
+
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4500,
+        system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const claudeData = await claudeRes.json();
+    if (claudeData.error) return res.status(500).json({ error: claudeData.error.message });
+
+    const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
+    const result = JSON.parse(raw);
+
+    const simMeta = { baseArtist: result.baseArtist || foundName, sonicSummary: result.sonicSummary || "" };
+    const simPool = result.artists || [];
+    await storeCache(simCacheKey, "similar-artists", simMeta, simPool);
+    res.json({ ...simMeta, artists: pickRandom(simPool, 4) });
+  } catch (err) {
+    console.error("Similar artists error:", err);
     res.status(500).json({ error: err.message });
   }
 });
