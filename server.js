@@ -260,7 +260,6 @@ app.post("/api/time-machine", async (req, res) => {
     return res.status(400).json({ error: "Missing country or decade." });
   }
   
-
   try {
     // Ask Claude for a genre spotlight + 5 track recommendations
     const response = await fetch("https://api.anthropic.com/v1/messages", {
