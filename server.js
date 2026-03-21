@@ -1078,7 +1078,24 @@ app.post("/api/similar-artists", async (req, res) => {
       }
     }
 
-    // Step 4: Build Claude prompt
+    // Step 4: Fetch Spotify's own related artists for signal
+    let spotifyRelated = [];
+    try {
+      const relatedRes = await fetch(
+        `https://api.spotify.com/v1/artists/${artist.id}/related-artists`,
+        { headers: { Authorization: "Bearer " + token } }
+      );
+      const relatedData = await relatedRes.json();
+      spotifyRelated = (relatedData.artists || []).slice(0, 10).map(a => ({
+        name: a.name,
+        genres: a.genres?.slice(0, 3) || [],
+        country: a.country || null, // Spotify doesn't provide country, Claude will fill this in
+      }));
+    } catch (e) {
+      console.log("Related artists unavailable:", e.message);
+    }
+
+    // Step 5: Build Claude prompt
     const profileLines = audioProfile
       ? `Spotify audio profile (averaged across top tracks):
 - Danceability: ${audioProfile.danceability} / 1.0
@@ -1088,17 +1105,22 @@ app.post("/api/similar-artists", async (req, res) => {
 - Tempo: ${audioProfile.tempo} BPM`
       : "";
 
+    const relatedLines = spotifyRelated.length > 0
+      ? `\nSpotify's related artists (use these as sonic reference — include any that are from non-Western or underrepresented countries, otherwise use them as style anchors to find global equivalents):\n${spotifyRelated.map(a => `- ${a.name}${a.genres.length ? ` (${a.genres.join(", ")})` : ""}`).join("\n")}`
+      : "";
+
     const prompt = `Find 12 artists from different countries around the world who sound similar to ${foundName}.
 
 Their profile:
 - Primary genres: ${genres.length > 0 ? genres.join(", ") : "mainstream pop"}
-${profileLines}
+${profileLines}${relatedLines}
 
 Rules:
 - Each artist must be from a DIFFERENT country
 - Spread across at least 5 different continents
 - Mix of contemporary and classic artists
 - Avoid globally mainstream acts (no top-10 global chart artists)
+- If any of Spotify's related artists above are from Africa, Asia, Latin America, Middle East, or Oceania, include them directly
 - Focus on capturing the same sonic energy, emotional feel, or stylistic DNA
 
 Return ONLY valid JSON:
