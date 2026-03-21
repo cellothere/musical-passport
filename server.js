@@ -124,6 +124,87 @@ function pickRandom(arr, n) {
   return [...arr].sort(() => Math.random() - 0.5).slice(0, n);
 }
 
+const REGION_BY_CODE = {
+  // Africa
+  ZA:"Africa",NG:"Africa",GH:"Africa",SN:"Africa",ET:"Africa",CM:"Africa",KE:"Africa",
+  EG:"Africa",MA:"Africa",TZ:"Africa",CI:"Africa",AO:"Africa",MZ:"Africa",ZW:"Africa",
+  UG:"Africa",RW:"Africa",ZM:"Africa",TN:"Africa",LY:"Africa",SD:"Africa",GN:"Africa",
+  BF:"Africa",BJ:"Africa",TG:"Africa",SL:"Africa",LR:"Africa",NA:"Africa",BW:"Africa",
+  MW:"Africa",MG:"Africa",MU:"Africa",CV:"Africa",
+  // Asia
+  JP:"Asia",KR:"Asia",IN:"Asia",CN:"Asia",ID:"Asia",TH:"Asia",VN:"Asia",PH:"Asia",
+  PK:"Asia",BD:"Asia",TW:"Asia",MN:"Asia",MM:"Asia",KH:"Asia",LA:"Asia",MY:"Asia",
+  SG:"Asia",LK:"Asia",NP:"Asia",AF:"Asia",KZ:"Asia",UZ:"Asia",TJ:"Asia",KG:"Asia",
+  TM:"Asia",HK:"Asia",
+  // Europe
+  FR:"Europe",DE:"Europe",SE:"Europe",NO:"Europe",PT:"Europe",ES:"Europe",IT:"Europe",
+  GR:"Europe",PL:"Europe",IS:"Europe",FI:"Europe",IE:"Europe",NL:"Europe",RO:"Europe",
+  RS:"Europe",UA:"Europe",HU:"Europe",CZ:"Europe",TR:"Europe",BE:"Europe",CH:"Europe",
+  AT:"Europe",DK:"Europe",GB:"Europe",HR:"Europe",BG:"Europe",SK:"Europe",SI:"Europe",
+  LT:"Europe",LV:"Europe",EE:"Europe",AL:"Europe",MK:"Europe",BA:"Europe",ME:"Europe",
+  LU:"Europe",MT:"Europe",CY:"Europe",
+  // Latin America
+  BR:"Latin America",AR:"Latin America",CO:"Latin America",CU:"Latin America",
+  MX:"Latin America",CL:"Latin America",PE:"Latin America",JM:"Latin America",
+  VE:"Latin America",BO:"Latin America",EC:"Latin America",PA:"Latin America",
+  UY:"Latin America",PY:"Latin America",CR:"Latin America",DO:"Latin America",
+  PR:"Latin America",GT:"Latin America",HN:"Latin America",SV:"Latin America",
+  NI:"Latin America",BZ:"Latin America",GY:"Latin America",SR:"Latin America",
+  TT:"Latin America",BB:"Latin America",HT:"Latin America",
+  // Middle East
+  LB:"Middle East",IR:"Middle East",IL:"Middle East",SA:"Middle East",AM:"Middle East",
+  AZ:"Middle East",GE:"Middle East",IQ:"Middle East",SY:"Middle East",JO:"Middle East",
+  YE:"Middle East",OM:"Middle East",AE:"Middle East",KW:"Middle East",QA:"Middle East",
+  BH:"Middle East",PS:"Middle East",
+  // North America
+  US:"North America",CA:"North America",
+  // Oceania
+  AU:"Oceania",NZ:"Oceania",PG:"Oceania",FJ:"Oceania",WS:"Oceania",TO:"Oceania",
+  VU:"Oceania",SB:"Oceania",
+};
+
+function regionOf(artist) {
+  const code = (artist.countryCode || "").toUpperCase();
+  return REGION_BY_CODE[code] || "Other";
+}
+
+// Pick n artists from pool ensuring each comes from a different country,
+// and maximising regional diversity.
+function pickDiverse(arr, n) {
+  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+
+  // Group by region
+  const byRegion = {};
+  for (const a of shuffled) {
+    const r = regionOf(a);
+    (byRegion[r] = byRegion[r] || []).push(a);
+  }
+
+  const regions = Object.keys(byRegion).sort(() => Math.random() - 0.5);
+  const chosen = [];
+  const usedCountries = new Set();
+
+  // Round-robin across regions
+  let pass = 0;
+  while (chosen.length < n) {
+    let added = false;
+    for (const region of regions) {
+      if (chosen.length >= n) break;
+      const candidates = byRegion[region].filter(a => !usedCountries.has(a.country || a.countryCode));
+      if (candidates.length === 0) continue;
+      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      chosen.push(pick);
+      usedCountries.add(pick.country || pick.countryCode);
+      added = true;
+    }
+    // Safety: if a full pass added nothing, break to avoid infinite loop
+    if (!added) break;
+    pass++;
+  }
+
+  return chosen;
+}
+
 // CORS must be configured to allow credentials
 app.use(
   cors({
@@ -611,8 +692,19 @@ async function fetchArtistTracks(artistName) {
 
     console.log(`  Found ${tracksSearchData.tracks.items.length} tracks via search`);
 
-    // Return top 3 tracks
-    return tracksSearchData.tracks.items.slice(0, 3).map(track => ({
+    // Filter to tracks where at least one credited artist matches the searched name
+    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const searchedNorm = normalize(foundName);
+    const matched = tracksSearchData.tracks.items.filter(track =>
+      track.artists.some(a => {
+        const n = normalize(a.name);
+        return n.includes(searchedNorm) || searchedNorm.includes(n);
+      })
+    );
+
+    const pool = matched.length >= 2 ? matched : tracksSearchData.tracks.items;
+
+    return pool.slice(0, 3).map(track => ({
       title: track.name,
       spotifyId: track.id,
       previewUrl: track.preview_url || null,
@@ -908,7 +1000,7 @@ app.post("/api/similar-artists", async (req, res) => {
     return res.json({
       baseArtist: simCached.result.baseArtist,
       sonicSummary: simCached.result.sonicSummary,
-      artists: pickRandom(simCached.artist_pool, 4),
+      artists: pickDiverse(simCached.artist_pool, 4),
     });
   }
 
@@ -1025,7 +1117,7 @@ Return ONLY valid JSON:
     const simMeta = { baseArtist: result.baseArtist || foundName, sonicSummary: result.sonicSummary || "" };
     const simPool = result.artists || [];
     await storeCache(simCacheKey, "similar-artists", simMeta, simPool);
-    res.json({ ...simMeta, artists: pickRandom(simPool, 4) });
+    res.json({ ...simMeta, artists: pickDiverse(simPool, 4) });
   } catch (err) {
     console.error("Similar artists error:", err);
     res.status(500).json({ error: err.message });
