@@ -966,13 +966,28 @@ app.get("/api/find-artist", async (req, res) => {
     const token = await getClientAccessToken();
     if (!token) return res.status(503).json({ error: "Spotify unavailable." });
 
+    // Use the artist: field filter so Spotify searches artist names specifically,
+    // not track/album titles that happen to match the query.
     const r = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=artist&limit=1`,
+      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(q)}&type=artist&limit=5`,
       { headers: { Authorization: "Bearer " + token } }
     );
     const data = await r.json();
-    const artist = data.artists?.items?.[0];
-    if (!artist) return res.status(404).json({ error: "Artist not found." });
+    const candidates = data.artists?.items || [];
+    if (candidates.length === 0) return res.status(404).json({ error: "Artist not found." });
+
+    // Pick the candidate whose name most closely matches the query
+    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const qNorm = normalize(q);
+    const artist = candidates.find(a => normalize(a.name) === qNorm)
+      || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
+      || candidates[0];
+
+    // Reject if name shares no overlap with query (e.g. "toulouse" → "Nicky Romero")
+    const aName = normalize(artist.name);
+    if (!aName.includes(qNorm) && !qNorm.includes(aName)) {
+      return res.status(404).json({ error: "Artist not found." });
+    }
 
     res.json({
       id: artist.id,
