@@ -1025,12 +1025,22 @@ app.post("/api/similar-artists", async (req, res) => {
 
     // Step 1: Look up artist on Spotify for genres
     const artistSearch = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`,
+      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(artistName)}&type=artist&limit=5`,
       { headers: { Authorization: "Bearer " + token } }
     );
     const artistData = await artistSearch.json();
-    const artist = artistData.artists?.items?.[0];
-    if (!artist) return res.status(404).json({ error: "Artist not found on Spotify." });
+    const candidates = artistData.artists?.items || [];
+    if (candidates.length === 0) return res.status(404).json({ error: "Artist not found on Spotify." });
+
+    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const qNorm = normalize(artistName);
+    const artist = candidates.find(a => normalize(a.name) === qNorm)
+      || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
+      || candidates[0];
+
+    if (!normalize(artist.name).includes(qNorm) && !qNorm.includes(normalize(artist.name))) {
+      return res.status(404).json({ error: "Artist not found on Spotify." });
+    }
 
     const foundName = artist.name;
     const genres = artist.genres?.slice(0, 5) || [];
