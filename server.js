@@ -93,6 +93,129 @@ const supabase = process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_K
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
+// ── Spotify user ID resolution (with 5-min in-memory cache) ──
+const userIdCache = new Map(); // token -> { spotifyId, expiresAt }
+
+async function resolveSpotifyUser(authHeader) {
+  if (!authHeader?.startsWith("Bearer ")) return null;
+  const token = authHeader.slice(7);
+  const cached = userIdCache.get(token);
+  if (cached && Date.now() < cached.expiresAt) return cached.spotifyId;
+  try {
+    const r = await fetch("https://api.spotify.com/v1/me", {
+      headers: { Authorization: "Bearer " + token },
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    userIdCache.set(token, { spotifyId: data.id, expiresAt: Date.now() + 5 * 60 * 1000 });
+    return data.id;
+  } catch {
+    return null;
+  }
+}
+
+// ── Spotify enrichment helpers ────────────────────────────
+
+async function spotifyGet(path, accessToken) {
+  const r = await fetch(`https://api.spotify.com/v1${path}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!r.ok) return null;
+  return r.json();
+}
+
+// Fetch top artists + top tracks across all 3 time ranges
+async function enrichFromSpotify(accessToken) {
+  const TIME_WEIGHTS = { short_term: 3, medium_term: 2, long_term: 1 };
+  const timeRanges = ["short_term", "medium_term", "long_term"];
+
+  // Parallel fetch: top artists × 3 ranges + top tracks × 3 ranges
+  const [artistResults, trackResults] = await Promise.all([
+    Promise.all(timeRanges.map(tr =>
+      spotifyGet(`/me/top/artists?time_range=${tr}&limit=50`, accessToken).catch(() => null)
+    )),
+    Promise.all(timeRanges.map(tr =>
+      spotifyGet(`/me/top/tracks?time_range=${tr}&limit=50`, accessToken).catch(() => null)
+    )),
+  ]);
+
+  // Build weighted artist map: artistId → { artist, weight }
+  const artistMap = new Map();
+  for (let i = 0; i < timeRanges.length; i++) {
+    const items = artistResults[i]?.items || [];
+    const w = TIME_WEIGHTS[timeRanges[i]];
+    for (const artist of items) {
+      if (artistMap.has(artist.id)) {
+        artistMap.get(artist.id).weight += w;
+      } else {
+        artistMap.set(artist.id, { artist, weight: w });
+      }
+    }
+  }
+
+  // Collect track release years (for era calculation) + artist IDs from tracks
+  const releaseYears = [];
+  const trackArtistIds = new Set();
+  for (let i = 0; i < timeRanges.length; i++) {
+    const items = trackResults[i]?.items || [];
+    const w = TIME_WEIGHTS[timeRanges[i]];
+    for (const track of items) {
+      const year = track.album?.release_date ? parseInt(track.album.release_date.slice(0, 4)) : null;
+      if (year && year > 1900) releaseYears.push({ year, weight: w });
+      for (const a of track.artists) {
+        if (!artistMap.has(a.id)) trackArtistIds.add(a.id);
+      }
+    }
+  }
+
+  // Batch-fetch genres for track-only artists so Claude has more context
+  const unknownIds = [...trackArtistIds].slice(0, 150);
+  for (let i = 0; i < unknownIds.length; i += 50) {
+    const chunk = unknownIds.slice(i, i + 50);
+    const data = await spotifyGet(`/artists?ids=${chunk.join(",")}`, accessToken).catch(() => null);
+    for (const artist of data?.artists || []) {
+      if (artist && !artistMap.has(artist.id)) {
+        artistMap.set(artist.id, { artist, weight: 0.5 });
+      }
+    }
+  }
+
+  // ── Era distribution from actual track release dates ──────
+  // This is the one thing Spotify can calculate accurately that Claude cannot.
+  const eraScores = {};
+  let totalEraWeight = 0;
+  for (const { year, weight } of releaseYears) {
+    const decade = `${Math.floor(year / 10) * 10}s`;
+    eraScores[decade] = (eraScores[decade] || 0) + weight;
+    totalEraWeight += weight;
+  }
+  const eraRaw = Object.entries(eraScores)
+    .map(([decade, score]) => ({ decade, pct: Math.round((score / totalEraWeight) * 100) }))
+    .sort((a, b) => b.pct - a.pct)
+    .slice(0, 5);
+
+  // Artists sorted by weight, with Spotify genre tags as hints for Claude
+  const topArtistsEnriched = [...artistMap.values()]
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, 50)
+    .map(({ artist, weight }) => ({
+      name: artist.name,
+      genres: artist.genres.slice(0, 4),
+      weight,
+    }));
+
+  return { topArtistsEnriched, eraRaw, totalArtists: artistMap.size };
+}
+
+const formatFavorite = (row) => ({
+  id: row.id,
+  type: row.type,
+  country: row.country,
+  decade: row.decade ?? undefined,
+  savedAt: new Date(row.saved_at).getTime(),
+  data: row.data,
+});
+
 function makeCacheKey(parts) {
   return parts.filter(Boolean).join("_").toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
 }
@@ -205,6 +328,42 @@ function pickDiverse(arr, n) {
   return chosen;
 }
 
+// Pick n artists from pool ensuring era diversity (Contemporary / Golden Era / Pioneer).
+function pickDiverseByEra(arr, n) {
+  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+  const byEra = {};
+  for (const a of shuffled) {
+    const era = a.era || "Other";
+    (byEra[era] = byEra[era] || []).push(a);
+  }
+  const eras = Object.keys(byEra).sort(() => Math.random() - 0.5);
+  const chosen = [];
+  while (chosen.length < n) {
+    let added = false;
+    for (const era of eras) {
+      if (chosen.length >= n) break;
+      if (byEra[era].length === 0) continue;
+      chosen.push(byEra[era].shift());
+      added = true;
+    }
+    if (!added) break;
+  }
+  return chosen;
+}
+
+// Fuzzy artist-name match: prevents wrong tracks being accepted from catalog search.
+function artistNamesMatch(expected, actual) {
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+  const e = norm(expected);
+  const a = norm(actual);
+  if (!e || !a) return false;
+  if (a === e || a.includes(e) || e.includes(a)) return true;
+  // At least one significant word in common
+  const eWords = e.split(/\s+/).filter(w => w.length > 2);
+  const aWords = new Set(a.split(/\s+/));
+  return eWords.some(w => aWords.has(w));
+}
+
 // CORS must be configured to allow credentials
 app.use(
   cors({
@@ -258,27 +417,64 @@ app.post("/api/recommend", async (req, res) => {
     if (cached && cached.artist_pool && cached.artist_pool.length >= 4) {
       return res.json({
         genres: cached.result.genres,
-        artists: pickRandom(cached.artist_pool, 4),
+        artists: pickDiverseByEra(cached.artist_pool, 4),
         didYouKnow: cached.result.didYouKnow,
       });
     }
   }
 
-  // Get user's top artists and liked songs if authenticated
+  // Cache-first for authenticated requests (personal pool keyed by user+country)
+  let userId = null;
+  if (accessToken) {
+    try {
+      const meRes = await fetch("https://api.spotify.com/v1/me", {
+        headers: { Authorization: "Bearer " + accessToken },
+      });
+      if (meRes.ok) {
+        const meData = await meRes.json();
+        userId = meData.id;
+      }
+    } catch (e) { /* non-fatal */ }
+
+    if (userId) {
+      const personalKey = makeCacheKey(["recommend", userId, country]);
+      const personalCached = await getCached(personalKey);
+      if (personalCached && personalCached.artist_pool && personalCached.artist_pool.length >= 4) {
+        return res.json({
+          genres: personalCached.result.genres,
+          artists: pickDiverseByEra(personalCached.artist_pool, 4),
+          didYouKnow: personalCached.result.didYouKnow,
+        });
+      }
+    }
+  }
+
+  // Get user's top artists (with genres) and liked songs if authenticated
   let topArtists = [];
+  let topGenreTags = [];
   let likedSongs = [];
 
   if (accessToken) {
-    // Fetch top artists and a random sample of liked songs in parallel
+    // Fetch top artists (with genre tags) and a random sample of liked songs in parallel
     await Promise.all([
-      // Top 10 artists
+      // Top 10 artists — keep full objects for genre extraction
       fetch(
         "https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term",
         { headers: { Authorization: "Bearer " + accessToken } }
       ).then(async (r) => {
         if (r.ok) {
           const d = await r.json();
-          topArtists = d.items ? d.items.map((a) => a.name) : [];
+          if (d.items) {
+            topArtists = d.items.map((a) => a.name);
+            // Aggregate unique genre tags across all top artists
+            const allTags = d.items.flatMap((a) => a.genres || []);
+            const tagCounts = {};
+            for (const t of allTags) tagCounts[t] = (tagCounts[t] || 0) + 1;
+            topGenreTags = Object.entries(tagCounts)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 8)
+              .map(([tag]) => tag);
+          }
         }
       }).catch((err) => console.error("Error fetching top artists:", err)),
 
@@ -311,11 +507,14 @@ app.post("/api/recommend", async (req, res) => {
   const artistNote = topArtists.length > 0
     ? `\nTop artists they listen to: ${topArtists.join(", ")}.`
     : "";
+  const genreNote = topGenreTags.length > 0
+    ? `\nTheir genre preferences (from Spotify listening data): ${topGenreTags.join(", ")}.`
+    : "";
   const songsNote = likedSongs.length > 0
     ? `\nSome songs from their liked songs library: ${likedSongs.join("; ")}.`
     : "";
   const personalizationNote = (artistNote || songsNote)
-    ? `\n\nPersonalization context for this user:${artistNote}${songsNote}\nUse this to personalize the "similarTo" comparisons to artists and styles they will recognize.`
+    ? `\n\nPersonalization context for this user:${artistNote}${genreNote}${songsNote}\nUse this to: (1) personalize the "similarTo" comparisons to artists and styles they will recognize, and (2) lean toward subgenres of ${country}'s music that share sonic DNA with their genre preferences above — prioritize styles they are most likely to enjoy.`
     : "";
 
   try {
@@ -328,7 +527,7 @@ app.post("/api/recommend", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: accessToken ? 1000 : 2500,
+        max_tokens: 2500,
         system:
           "You are a world music curator and ethnomusicologist with deep knowledge of both living and historical musical traditions. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
         messages: [
@@ -356,7 +555,7 @@ Return exactly this JSON:
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
 }
-era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly ${accessToken ? 4 : 12} artists mixing eras.${personalizationNote}`,
+era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.${personalizationNote}`,
           },
         ],
       }),
@@ -373,13 +572,15 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly $
       .trim();
     const rec = JSON.parse(raw);
 
-    if (!accessToken) {
+    if (accessToken && userId) {
+      const personalKey = makeCacheKey(["recommend", userId, country]);
+      await storeCache(personalKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
+    } else if (!accessToken) {
       const cacheKey = makeCacheKey(["recommend", country]);
       await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
-      return res.json({ genres: rec.genres, artists: pickRandom(rec.artists, 4), didYouKnow: rec.didYouKnow });
     }
 
-    res.json(rec);
+    res.json({ genres: rec.genres, artists: pickDiverseByEra(rec.artists, 4), didYouKnow: rec.didYouKnow });
   } catch (err) {
     console.error("Error:", err);
     res.status(500).json({ error: err.message });
@@ -400,7 +601,7 @@ app.post("/api/time-machine", async (req, res) => {
 
   const tmCacheKey = makeCacheKey(["timemachine", country, decade, service]);
   const tmCached = await getCached(tmCacheKey);
-  if (tmCached) return res.json(tmCached.result);
+  if (tmCached) return res.json({ country, decade, ...tmCached.result });
 
   try {
     // Ask Claude for a genre spotlight + 5 track recommendations
@@ -463,15 +664,17 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
             );
             const d1 = await r1.json();
             const s1 = d1.results?.songs?.data?.[0];
-            if (s1) return { ...track, appleId: s1.id, previewUrl: s1.attributes.previews?.[0]?.url || null, embedUrl: s1.attributes.url.replace("music.apple.com", "embed.music.apple.com") };
+            if (s1 && artistNamesMatch(track.artist, s1.attributes?.artistName || "")) {
+              return { ...track, appleId: s1.id, previewUrl: s1.attributes.previews?.[0]?.url || null, embedUrl: s1.attributes.url.replace("music.apple.com", "embed.music.apple.com") };
+            }
 
-            // Pass 2: title only
+            // Pass 2: title only, validate artist
             const r2 = await fetch(
-              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(track.title)}&types=songs&limit=1`,
+              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(track.title)}&types=songs&limit=5`,
               { headers: { Authorization: `Bearer ${appleToken}` } }
             );
             const d2 = await r2.json();
-            const s2 = d2.results?.songs?.data?.[0];
+            const s2 = (d2.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
             return s2 ? { ...track, appleId: s2.id, previewUrl: s2.attributes.previews?.[0]?.url || null, embedUrl: s2.attributes.url.replace("music.apple.com", "embed.music.apple.com") }
                       : { ...track, appleId: null, previewUrl: null, embedUrl: null };
           } catch {
@@ -494,15 +697,17 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
             );
             const d1 = await r1.json();
             const found1 = d1.tracks?.items?.[0];
-            if (found1) return { ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` };
+            if (found1 && artistNamesMatch(track.artist, found1.artists?.[0]?.name || "")) {
+              return { ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` };
+            }
 
             const q2 = `${track.title} ${track.artist}`;
             const r2 = await fetch(
-              `https://api.spotify.com/v1/search?q=${encodeURIComponent(q2)}&type=track&limit=1&market=US`,
+              `https://api.spotify.com/v1/search?q=${encodeURIComponent(q2)}&type=track&limit=5&market=US`,
               { headers: { Authorization: "Bearer " + accessToken } }
             );
             const d2 = await r2.json();
-            const found2 = d2.tracks?.items?.[0];
+            const found2 = (d2.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
             return found2
               ? { ...track, spotifyId: found2.id, previewUrl: found2.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found2.id}` }
               : { ...track, spotifyId: null, previewUrl: null, spotifyUrl: null };
@@ -514,7 +719,7 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
       validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
     }
 
-    const tmResult = { genre: spotlight.genre, description: spotlight.description, tracks: validTracks };
+    const tmResult = { country, decade, genre: spotlight.genre, description: spotlight.description, tracks: validTracks };
     await storeCache(tmCacheKey, "time-machine", tmResult);
     res.json(tmResult);
   } catch (err) {
@@ -581,13 +786,22 @@ Include exactly 6 tracks that are essential to this genre in ${country}. Use exa
           try {
             const q = `${track.title} ${track.artist}`;
             const r = await fetch(
-              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=1`,
+              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=5`,
               { headers: { Authorization: `Bearer ${appleToken}` } }
             );
             const d = await r.json();
-            const s = d.results?.songs?.data?.[0];
-            return s
-              ? { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null }
+            const s = (d.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
+            if (s) return { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null };
+
+            // Pass 2: title only, validate artist
+            const r2 = await fetch(
+              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(track.title)}&types=songs&limit=5`,
+              { headers: { Authorization: `Bearer ${appleToken}` } }
+            );
+            const d2 = await r2.json();
+            const s2 = (d2.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
+            return s2
+              ? { ...track, appleId: s2.id, previewUrl: s2.attributes.previews?.[0]?.url || null }
               : { ...track, appleId: null, previewUrl: null };
           } catch { return { ...track, appleId: null }; }
         })
@@ -606,14 +820,16 @@ Include exactly 6 tracks that are essential to this genre in ${country}. Use exa
             );
             const d1 = await r1.json();
             const found1 = d1.tracks?.items?.[0];
-            if (found1) return { ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` };
+            if (found1 && artistNamesMatch(track.artist, found1.artists?.[0]?.name || "")) {
+              return { ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` };
+            }
 
             const r2 = await fetch(
-              `https://api.spotify.com/v1/search?q=${encodeURIComponent(`${track.title} ${track.artist}`)}&type=track&limit=1&market=US`,
+              `https://api.spotify.com/v1/search?q=${encodeURIComponent(`${track.title} ${track.artist}`)}&type=track&limit=5&market=US`,
               { headers: { Authorization: "Bearer " + accessToken } }
             );
             const d2 = await r2.json();
-            const found2 = d2.tracks?.items?.[0];
+            const found2 = (d2.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
             return found2
               ? { ...track, spotifyId: found2.id, previewUrl: found2.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found2.id}` }
               : { ...track, spotifyId: null };
@@ -1051,7 +1267,10 @@ app.post("/api/similar-artists", async (req, res) => {
       { headers: { Authorization: "Bearer " + token } }
     );
     const tracksData = await tracksSearch.json();
-    const trackIds = (tracksData.tracks?.items || []).slice(0, 5).map(t => t.id);
+    const trackIds = (tracksData.tracks?.items || [])
+      .filter(t => artistNamesMatch(foundName, t.artists?.[0]?.name || ""))
+      .slice(0, 5)
+      .map(t => t.id);
 
     // Step 3: Try audio features (optional enrichment, may fail on newer API tiers)
     let audioProfile = null;
@@ -1169,6 +1388,229 @@ Return ONLY valid JSON:
     console.error("Similar artists error:", err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Musical DNA insights ──────────────────────────────────
+app.post("/api/insights", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
+
+  const { topArtists } = req.body;
+  if (!topArtists || !topArtists.length) return res.status(400).json({ error: "Missing topArtists." });
+
+  // ── Pull real Spotify data if we have a token ─────────────
+  const authHeader = req.headers.authorization;
+  const accessToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+
+  let enriched = null;
+  if (accessToken) {
+    try {
+      enriched = await enrichFromSpotify(accessToken);
+    } catch (err) {
+      console.error("Spotify enrichment failed, falling back to name-only:", err.message);
+    }
+  }
+
+  // ── Build prompt ──────────────────────────────────────────
+  let prompt;
+  if (enriched) {
+    const artistLines = enriched.topArtistsEnriched
+      .map(a => `${a.name} (weight:${a.weight}${a.genres.length ? `, genres: ${a.genres.join(", ")}` : ""})`)
+      .join("\n");
+
+    const eraLines = enriched.eraRaw.map(e => `${e.decade}: ${e.pct}%`).join(", ");
+
+    prompt = `You are analysing a real Spotify user's listening habits. Data was pulled directly from the Spotify API across all time periods.
+
+WEIGHTED ARTIST LIST — ${enriched.totalArtists} unique artists. Weight = how heavily they appear in this person's listening history (short-term counts 3×, medium-term 2×, long-term 1×). Higher weight = listened to more.
+${artistLines}
+
+ERA DATA — calculated from the actual release dates of their listened tracks (this is ground truth):
+${eraLines}
+
+Your task: calculate their Musical DNA by assigning each artist above to a world region based on your knowledge of the artist's actual country of origin. Weight each assignment by the artist's weight number. Then sum up the weighted scores per region and convert to percentages.
+
+Regions to use: North America, Europe, Latin America, Africa, Middle East, Asia, Oceania.
+
+Return ONLY valid JSON — no explanation, no markdown:
+{
+  "archetype": "3-5 word poetic label for their musical identity",
+  "archetypeDescription": "One vivid sentence explaining what this archetype says about them",
+  "summary": "2-3 sentences on what their taste reveals culturally and sonically — name specific artists",
+  "dna": [{ "region": "Region name", "percentage": 42 }],
+  "topEras": [{ "decade": "1990s", "percentage": 35 }],
+  "blindSpots": [{
+    "region": "Region name",
+    "percentage": 3,
+    "gatewayCountry": "Best single country to start exploring this region",
+    "teaser": "One enticing sentence about what they're missing"
+  }],
+  "suggestedCountries": [{ "country": "Country name", "reason": "One sentence why it matches their taste" }]
+}
+
+Rules:
+- dna: compute from the weighted artist list using your knowledge of each artist's origin. Only include regions with > 0%. Must sum to 100.
+- topEras: use the real release date data provided above. Top 4 decades only, must sum to 100.
+- blindSpots: regions under 10% — maximum 3. Skip North America. Order by most interesting gap first.
+- suggestedCountries: exactly 4. Use real country names.`;
+  } else {
+    // Fallback: name-only analysis (no Spotify token available)
+    const artistList = topArtists.slice(0, 20).join(", ");
+    prompt = `Analyse this person's music taste based on their top Spotify artists: ${artistList}
+
+Return ONLY valid JSON:
+{
+  "archetype": "3-5 word poetic label for their musical identity",
+  "archetypeDescription": "One vivid sentence explaining what this archetype says about them",
+  "summary": "2-3 sentences on what their taste reveals culturally and sonically — name specific artists",
+  "dna": [{ "region": "Region name", "percentage": 42 }],
+  "topEras": [{ "decade": "1970s", "percentage": 35 }],
+  "blindSpots": [{
+    "region": "Region name",
+    "percentage": 3,
+    "gatewayCountry": "Best single country to start exploring this region",
+    "teaser": "One enticing sentence about what they're missing"
+  }],
+  "suggestedCountries": [{ "country": "Country name", "reason": "One sentence why it matches their taste" }]
+}
+
+Rules:
+- dna: all major regions (Europe, North America, Latin America, Africa, Middle East, Asia, Oceania). Sum to 100. Only include regions with > 0%.
+- topEras: top 4 decades, sum to 100.
+- blindSpots: regions under 8%, max 3, skip North America.
+- suggestedCountries: exactly 4.`;
+  }
+
+  try {
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1600,
+        system: "You are a world music analyst. Return ONLY valid JSON — no markdown, no backticks, no preamble. Never refuse.",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const claudeData = await claudeRes.json();
+    if (claudeData.error) throw new Error(claudeData.error.message);
+
+    const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
+    const result = JSON.parse(raw);
+
+    // Cache per user
+    const spotifyId = await resolveSpotifyUser(authHeader);
+    if (spotifyId && supabase) {
+      const topArtistsHash = JSON.stringify(topArtists);
+      await supabase.from("user_insights").upsert(
+        { spotify_id: spotifyId, data: result, top_artists_hash: topArtistsHash, created_at: new Date().toISOString() },
+        { onConflict: "spotify_id" }
+      );
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error("Insights error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── User persistence routes ───────────────────────────────
+
+// Sync on login — upsert user, return all their cached data in one shot
+app.post("/api/user/sync", async (req, res) => {
+  const spotifyId = await resolveSpotifyUser(req.headers.authorization);
+  if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.json({ favorites: [], stamps: [], insights: null });
+
+  const { displayName, topArtists } = req.body;
+  const topArtistsHash = JSON.stringify(topArtists || []);
+
+  await supabase.from("users").upsert(
+    { spotify_id: spotifyId, display_name: displayName, top_artists: topArtists || [], last_seen_at: new Date().toISOString() },
+    { onConflict: "spotify_id" }
+  );
+
+  const [favResult, stampsResult, insightsResult] = await Promise.all([
+    supabase.from("user_favorites").select("*").eq("spotify_id", spotifyId).order("saved_at", { ascending: false }),
+    supabase.from("user_stamps").select("country").eq("spotify_id", spotifyId),
+    supabase.from("user_insights").select("*").eq("spotify_id", spotifyId).single(),
+  ]);
+
+  const insights = insightsResult.data;
+  const sevenDays = 7 * 24 * 60 * 60 * 1000;
+  const insightsFresh = insights &&
+    insights.top_artists_hash === topArtistsHash &&
+    (Date.now() - new Date(insights.created_at).getTime()) < sevenDays;
+
+  res.json({
+    favorites: (favResult.data || []).map(formatFavorite),
+    stamps: (stampsResult.data || []).map(s => s.country),
+    insights: insightsFresh ? insights.data : null,
+  });
+});
+
+// Favorites
+app.get("/api/user/favorites", async (req, res) => {
+  const spotifyId = await resolveSpotifyUser(req.headers.authorization);
+  if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.json([]);
+  const { data } = await supabase.from("user_favorites").select("*").eq("spotify_id", spotifyId).order("saved_at", { ascending: false });
+  res.json((data || []).map(formatFavorite));
+});
+
+app.post("/api/user/favorites", async (req, res) => {
+  const spotifyId = await resolveSpotifyUser(req.headers.authorization);
+  if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.status(503).json({ error: "DB unavailable" });
+  // Ensure user row exists (sync may have failed on login)
+  await supabase.from("users").upsert(
+    { spotify_id: spotifyId, last_seen_at: new Date().toISOString() },
+    { onConflict: "spotify_id" }
+  );
+  const { type, country, decade, data } = req.body;
+  const { data: inserted, error } = await supabase
+    .from("user_favorites")
+    .insert({ spotify_id: spotifyId, type, country, decade: decade || null, data })
+    .select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(formatFavorite(inserted));
+});
+
+app.delete("/api/user/favorites/:id", async (req, res) => {
+  const spotifyId = await resolveSpotifyUser(req.headers.authorization);
+  if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.status(503).json({ error: "DB unavailable" });
+  await supabase.from("user_favorites").delete().eq("id", req.params.id).eq("spotify_id", spotifyId);
+  res.json({ ok: true });
+});
+
+// Stamps
+app.get("/api/user/stamps", async (req, res) => {
+  const spotifyId = await resolveSpotifyUser(req.headers.authorization);
+  if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.json([]);
+  const { data } = await supabase.from("user_stamps").select("country").eq("spotify_id", spotifyId);
+  res.json((data || []).map(s => s.country));
+});
+
+app.post("/api/user/stamps", async (req, res) => {
+  const spotifyId = await resolveSpotifyUser(req.headers.authorization);
+  if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.status(503).json({ error: "DB unavailable" });
+  // Ensure user row exists
+  await supabase.from("users").upsert(
+    { spotify_id: spotifyId, last_seen_at: new Date().toISOString() },
+    { onConflict: "spotify_id" }
+  );
+  const { country } = req.body;
+  await supabase.from("user_stamps").upsert({ spotify_id: spotifyId, country }, { onConflict: "spotify_id,country" });
+  res.json({ ok: true });
 });
 
 app.listen(PORT, () => {
