@@ -953,6 +953,30 @@
     // Check auth on page load
     checkAuth();
 
+    const FLAG_EMOJI = {
+      "France":"🇫🇷","Germany":"🇩🇪","Sweden":"🇸🇪","Norway":"🇳🇴","Portugal":"🇵🇹",
+      "Spain":"🇪🇸","Italy":"🇮🇹","Greece":"🇬🇷","Poland":"🇵🇱","Iceland":"🇮🇸",
+      "Finland":"🇫🇮","Ireland":"🇮🇪","Netherlands":"🇳🇱","Romania":"🇷🇴","Serbia":"🇷🇸",
+      "Ukraine":"🇺🇦","Hungary":"🇭🇺","Czechia":"🇨🇿","Turkey":"🇹🇷",
+      "Brazil":"🇧🇷","Argentina":"🇦🇷","Colombia":"🇨🇴","Cuba":"🇨🇺","Mexico":"🇲🇽",
+      "Chile":"🇨🇱","Peru":"🇵🇪","Jamaica":"🇯🇲","Venezuela":"🇻🇪","Bolivia":"🇧🇴",
+      "Ecuador":"🇪🇨","Panama":"🇵🇦",
+      "Nigeria":"🇳🇬","Ghana":"🇬🇭","Senegal":"🇸🇳","Mali":"🇲🇱","Ethiopia":"🇪🇹",
+      "South Africa":"🇿🇦","Egypt":"🇪🇬","Cameroon":"🇨🇲","Congo":"🇨🇬","Kenya":"🇰🇪",
+      "Algeria":"🇩🇿","Morocco":"🇲🇦","Tanzania":"🇹🇿",
+      "Lebanon":"🇱🇧","Iran":"🇮🇷","Israel":"🇮🇱","Saudi Arabia":"🇸🇦","Armenia":"🇦🇲",
+      "Azerbaijan":"🇦🇿","Georgia":"🇬🇪",
+      "Japan":"🇯🇵","South Korea":"🇰🇷","India":"🇮🇳","China":"🇨🇳","Indonesia":"🇮🇩",
+      "Thailand":"🇹🇭","Vietnam":"🇻🇳","Philippines":"🇵🇭","Pakistan":"🇵🇰",
+      "Bangladesh":"🇧🇩","Taiwan":"🇹🇼","Mongolia":"🇲🇳",
+      "Australia":"🇦🇺","New Zealand":"🇳🇿","Papua New Guinea":"🇵🇬","Fiji":"🇫🇯",
+      "USA":"🇺🇸","Canada":"🇨🇦","Haiti":"🇭🇹","Trinidad & Tobago":"🇹🇹","Barbados":"🇧🇧",
+    };
+    function countryFlag(name) {
+      const e = FLAG_EMOJI[name];
+      return e ? `${e} ` : "";
+    }
+
     const REGIONS = [
       { name: "Europe", countries: ["France","Germany","Sweden","Norway","Portugal","Spain","Italy","Greece","Poland","Iceland","Finland","Ireland","Netherlands","Romania","Serbia","Ukraine","Hungary","Czechia","Turkey"] },
       { name: "Latin America", countries: ["Brazil","Argentina","Colombia","Cuba","Mexico","Chile","Peru","Jamaica","Venezuela","Bolivia","Ecuador","Panama"] },
@@ -991,7 +1015,7 @@
       r.countries.forEach(c => {
         const btn = document.createElement("button");
         btn.className = "c-btn";
-        btn.textContent = c;
+        btn.innerHTML = countryFlag(c) + c;
         btn.dataset.country = c;
         btn.addEventListener("click", () => selectCountry(c, btn));
         grid.appendChild(btn);

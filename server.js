@@ -550,7 +550,7 @@ Return exactly this JSON:
       "name": "Name",
       "genre": "specific genre",
       "era": "Contemporary",
-      "similarTo": "A well-known artist the listener might know"
+      "similarTo": "One well-known artist name only, no description (e.g. 'Bob Dylan')"
     }
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
@@ -631,7 +631,6 @@ IMPORTANT RULES FOR UNUSUAL COMBINATIONS:
 Return exactly this JSON:
 {
   "genre": "genre name (be specific and evocative)",
-  "description": "2 vivid sentences explaining the connection between ${country} and the ${decade} for this genre — acknowledge any anachronism and explain what the creative angle is",
   "tracks": [
     { "title": "track title", "artist": "artist name" }
   ]
@@ -719,7 +718,7 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
       validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
     }
 
-    const tmResult = { country, decade, genre: spotlight.genre, description: spotlight.description, tracks: validTracks };
+    const tmResult = { country, decade, genre: spotlight.genre, tracks: validTracks };
     await storeCache(tmCacheKey, "time-machine", tmResult);
     res.json(tmResult);
   } catch (err) {
