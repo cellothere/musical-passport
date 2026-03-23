@@ -1444,14 +1444,14 @@ Return ONLY valid JSON — no explanation, no markdown:
     "gatewayCountry": "Best single country to start exploring this region",
     "teaser": "One enticing sentence about what they're missing"
   }],
-  "suggestedCountries": [{ "country": "Country name", "reason": "One sentence why it matches their taste" }]
+  "picks": [{ "type": "country", "country": "Country name" }, { "type": "genre", "country": "Country name", "genre": "Genre name" }]
 }
 
 Rules:
 - dna: compute from the weighted artist list using your knowledge of each artist's origin. Only include regions with > 0%. Must sum to 100.
 - topEras: use the real release date data provided above. Top 4 decades only, must sum to 100.
-- blindSpots: regions under 10% — maximum 3. Skip North America. Order by most interesting gap first.
-- suggestedCountries: exactly 4. Use real country names.`;
+- blindSpots: regions under 10% — maximum 3. Skip North America. Order by most interesting gap first. gatewayCountry must be a lesser-known, genuinely interesting country (avoid obvious choices like Nigeria for Africa or Japan for Asia — prefer e.g. Eritrea, Togo, Mongolia, Georgia).
+- picks: exactly 4 items. 2 must be type "country" — choose specific lesser-known countries from the blind spot regions (different from each gatewayCountry). 2 must be type "genre" — niche genres from regions the user already enjoys but hasn't fully explored. Each genre pick needs both "country" (origin country) and "genre" (specific genre name). Example: [{ type:"country", country:"Eritrea" }, { type:"genre", country:"Mali", genre:"Wassoulou" }, { type:"country", country:"Georgia" }, { type:"genre", country:"Brazil", genre:"Baião" }]`;
   } else {
     // Fallback: name-only analysis (no Spotify token available)
     const artistList = topArtists.slice(0, 20).join(", ");
@@ -1470,14 +1470,14 @@ Return ONLY valid JSON:
     "gatewayCountry": "Best single country to start exploring this region",
     "teaser": "One enticing sentence about what they're missing"
   }],
-  "suggestedCountries": [{ "country": "Country name", "reason": "One sentence why it matches their taste" }]
+  "picks": [{ "type": "country", "country": "Country name" }, { "type": "genre", "country": "Country name", "genre": "Genre name" }]
 }
 
 Rules:
 - dna: all major regions (Europe, North America, Latin America, Africa, Middle East, Asia, Oceania). Sum to 100. Only include regions with > 0%.
 - topEras: top 4 decades, sum to 100.
-- blindSpots: regions under 8%, max 3, skip North America.
-- suggestedCountries: exactly 4.`;
+- blindSpots: regions under 8%, max 3, skip North America. gatewayCountry must be a lesser-known, genuinely interesting country (avoid obvious choices like Nigeria for Africa or Japan for Asia — prefer e.g. Eritrea, Togo, Mongolia, Georgia).
+- picks: exactly 4 items. 2 must be type "country" — choose specific lesser-known countries from the blind spot regions (different from each gatewayCountry). 2 must be type "genre" — niche genres from regions the user already enjoys but hasn't fully explored. Each genre pick needs both "country" (origin country) and "genre" (specific genre name). Example: [{ type:"country", country:"Eritrea" }, { type:"genre", country:"Mali", genre:"Wassoulou" }, { type:"country", country:"Georgia" }, { type:"genre", country:"Brazil", genre:"Baião" }]`;
   }
 
   try {
@@ -1512,6 +1512,10 @@ Rules:
       );
     }
 
+    // Normalise: support both old suggestedCountries and new picks
+    if (!result.picks && result.suggestedCountries) {
+      result.picks = result.suggestedCountries.map(c => ({ type: 'country', country: c.country }));
+    }
     res.json(result);
   } catch (err) {
     console.error("Insights error:", err);
