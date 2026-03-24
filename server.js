@@ -364,6 +364,203 @@ function artistNamesMatch(expected, actual) {
   return eWords.some(w => aWords.has(w));
 }
 
+// ── MusicBrainz helpers ──────────────────────────────────
+const MB_BASE = "https://musicbrainz.org/ws/2";
+const MB_UA   = "MusicalPassport/1.0 (contact@musicalpassport.app)";
+
+// Rate-limit queue: MusicBrainz allows 1 req/sec. 4s timeout per request.
+const MB_TIMEOUT_MS = 4000;
+const mbQueue = [];
+let mbBusy = false;
+function mbFetch(url) {
+  return new Promise((resolve, reject) => {
+    mbQueue.push({ url, resolve, reject });
+    if (!mbBusy) drainMbQueue();
+  });
+}
+async function drainMbQueue() {
+  mbBusy = true;
+  while (mbQueue.length > 0) {
+    const { url, resolve, reject } = mbQueue.shift();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MB_TIMEOUT_MS);
+    try {
+      const r = await fetch(url, {
+        headers: { "User-Agent": MB_UA, Accept: "application/json" },
+        signal: controller.signal,
+      });
+      resolve(r);
+    } catch (e) {
+      if (e.name === "AbortError") {
+        console.warn(`[MB] Request timed out: ${url}`);
+        resolve({ ok: false, status: 408 }); // resolve (not reject) so callers degrade gracefully
+      } else {
+        reject(e);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (mbQueue.length > 0) await new Promise(r => setTimeout(r, 1100));
+  }
+  mbBusy = false;
+}
+
+// In-memory cache for MB artist → ISO country (avoids repeat lookups within a process lifetime)
+const mbArtistCache = new Map(); // artistName → { country: string|null, at: number }
+const MB_ARTIST_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+async function getMbArtistCached(artistName) {
+  const key = artistName.toLowerCase().trim();
+  const mem = mbArtistCache.get(key);
+  if (mem && Date.now() - mem.at < MB_ARTIST_CACHE_TTL) return mem.country;
+
+  // Check Supabase for persistence across restarts
+  if (supabase) {
+    const dbKey = makeCacheKey(["mb-artist", key]);
+    const row = await getCached(dbKey);
+    if (row?.result?.country !== undefined) {
+      mbArtistCache.set(key, { country: row.result.country, at: Date.now() });
+      return row.result.country;
+    }
+  }
+  return undefined; // cache miss
+}
+
+async function setMbArtistCached(artistName, country) {
+  const key = artistName.toLowerCase().trim();
+  mbArtistCache.set(key, { country, at: Date.now() });
+  if (supabase) {
+    const dbKey = makeCacheKey(["mb-artist", key]);
+    await storeCache(dbKey, "mb-artist", { country });
+  }
+}
+
+// Country name → ISO-2 code (historical/cultural regions return null → skip MB)
+const COUNTRY_ISO = {
+  "Afghanistan":"AF","Albania":"AL","Algeria":"DZ","Angola":"AO","Argentina":"AR",
+  "Armenia":"AM","Australia":"AU","Austria":"AT","Azerbaijan":"AZ","Bahrain":"BH",
+  "Bangladesh":"BD","Barbados":"BB","Belgium":"BE","Belize":"BZ","Benin":"BJ",
+  "Bolivia":"BO","Bosnia":"BA","Botswana":"BW","Brazil":"BR","Bulgaria":"BG",
+  "Burkina Faso":"BF","Cambodia":"KH","Cameroon":"CM","Canada":"CA","Cape Verde":"CV",
+  "Chile":"CL","China":"CN","Colombia":"CO","Congo":"CG","Costa Rica":"CR",
+  "Croatia":"HR","Cuba":"CU","Cyprus":"CY","Czechia":"CZ","Czech Republic":"CZ",
+  "Denmark":"DK","Dominican Republic":"DO","Ecuador":"EC","Egypt":"EG",
+  "El Salvador":"SV","Eritrea":"ER","Estonia":"EE","Ethiopia":"ET","Fiji":"FJ",
+  "Finland":"FI","France":"FR","Georgia":"GE","Germany":"DE","Ghana":"GH",
+  "Greece":"GR","Guatemala":"GT","Guinea":"GN","Guyana":"GY","Haiti":"HT",
+  "Honduras":"HN","Hong Kong":"HK","Hungary":"HU","Iceland":"IS","India":"IN",
+  "Indonesia":"ID","Iran":"IR","Iraq":"IQ","Ireland":"IE","Israel":"IL",
+  "Italy":"IT","Ivory Coast":"CI","Jamaica":"JM","Japan":"JP","Jordan":"JO",
+  "Kazakhstan":"KZ","Kenya":"KE","Kosovo":"XK","Kuwait":"KW","Kyrgyzstan":"KG",
+  "Laos":"LA","Latvia":"LV","Lebanon":"LB","Liberia":"LR","Libya":"LY",
+  "Lithuania":"LT","Luxembourg":"LU","Madagascar":"MG","Malawi":"MW",
+  "Malaysia":"MY","Mali":"ML","Malta":"MT","Mauritius":"MU","Mexico":"MX",
+  "Moldova":"MD","Mongolia":"MN","Montenegro":"ME","Morocco":"MA","Mozambique":"MZ",
+  "Myanmar":"MM","Namibia":"NA","Nepal":"NP","Netherlands":"NL","New Zealand":"NZ",
+  "Nicaragua":"NI","Nigeria":"NG","North Macedonia":"MK","Norway":"NO","Oman":"OM",
+  "Pakistan":"PK","Palestine":"PS","Panama":"PA","Papua New Guinea":"PG",
+  "Paraguay":"PY","Peru":"PE","Philippines":"PH","Poland":"PL","Portugal":"PT",
+  "Puerto Rico":"PR","Qatar":"QA","Romania":"RO","Rwanda":"RW","Samoa":"WS",
+  "Saudi Arabia":"SA","Senegal":"SN","Serbia":"RS","Sierra Leone":"SL",
+  "Singapore":"SG","Slovakia":"SK","Slovenia":"SI","Solomon Islands":"SB",
+  "Somalia":"SO","South Africa":"ZA","South Korea":"KR","Spain":"ES",
+  "Sri Lanka":"LK","Sudan":"SD","Suriname":"SR","Sweden":"SE","Switzerland":"CH",
+  "Syria":"SY","Taiwan":"TW","Tajikistan":"TJ","Tanzania":"TZ","Thailand":"TH",
+  "Togo":"TG","Tonga":"TO","Trinidad & Tobago":"TT","Tunisia":"TN","Turkey":"TR",
+  "Turkmenistan":"TM","UAE":"AE","Uganda":"UG","Ukraine":"UA","Uruguay":"UY",
+  "USA":"US","Uzbekistan":"UZ","Vanuatu":"VU","Venezuela":"VE","Vietnam":"VN",
+  "Wales":"GB","Scotland":"GB","Yemen":"YE","Zambia":"ZM","Zimbabwe":"ZW",
+  "Djibouti":"DJ","Kuwait":"KW","Bahrain":"BH",
+};
+
+// Parse "1960s" → { start: 1960, end: 1969 }
+function parseDecade(decade) {
+  const yr = parseInt(decade, 10);
+  if (isNaN(yr)) return null;
+  return { start: yr, end: yr + 9 };
+}
+
+// Look up an artist on MusicBrainz; returns their ISO country code or null
+async function mbArtistCountry(artistName) {
+  const cached = await getMbArtistCached(artistName);
+  if (cached !== undefined) return cached;
+  try {
+    const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(artistName)}&limit=3&fmt=json`;
+    const r = await mbFetch(url);
+    if (!r.ok) { await setMbArtistCached(artistName, null); return null; }
+    const d = await r.json();
+    const top = (d.artists || []).find(a => (a.score || 0) >= 80);
+    const country = top?.country ?? null;
+    await setMbArtistCached(artistName, country);
+    return country;
+  } catch { return null; }
+}
+
+// Fetch real recordings from MusicBrainz for a country+decade
+// Returns array of { title, artist } or empty array
+async function mbRecordingsForCountryDecade(isoCode, decade) {
+  const range = parseDecade(decade);
+  if (!range) return [];
+  try {
+    const query = `country:${isoCode} AND date:[${range.start} TO ${range.end}]`;
+    const url = `${MB_BASE}/recording?query=${encodeURIComponent(query)}&limit=40&fmt=json`;
+    const r = await mbFetch(url);
+    if (!r.ok) return [];
+    const d = await r.json();
+    const recordings = d.recordings || [];
+    // Extract title + primary artist, deduplicate by artist to get variety
+    const seen = new Set();
+    const results = [];
+    for (const rec of recordings) {
+      const title = rec.title;
+      const artist = rec["artist-credit"]?.[0]?.name || rec["artist-credit"]?.[0]?.artist?.name;
+      if (!title || !artist || seen.has(artist)) continue;
+      seen.add(artist);
+      results.push({ title, artist });
+      if (results.length >= 20) break;
+    }
+    return results;
+  } catch { return []; }
+}
+
+// Background: verify Claude's artist pool against MusicBrainz and update cache.
+// Only checks the first 4 artists (the displayed ones) to keep the MB queue short.
+async function verifyArtistPoolWithMB(artists, country, cacheKeys) {
+  const isoCode = COUNTRY_ISO[country];
+  if (!isoCode) return; // historical/cultural region — skip
+  try {
+    const toCheck = artists.slice(0, 4); // cap at 4 to avoid long queue pile-up
+    const verified = [];
+    for (const artist of toCheck) {
+      const mbCountry = await mbArtistCountry(artist.name);
+      // Keep if MB doesn't know (null) or agrees, drop only on clear mismatch
+      if (!mbCountry || mbCountry === isoCode) {
+        verified.push(artist);
+      } else {
+        console.log(`[MB] Filtered ${artist.name}: MB says ${mbCountry}, expected ${isoCode}`);
+      }
+    }
+    // Preserve the rest of the pool untouched
+    const fullVerified = [...verified, ...artists.slice(4)];
+    // Only update cache if we actually filtered something out
+    if (verified.length < toCheck.length && fullVerified.length >= 4 && supabase) {
+      for (const key of cacheKeys) {
+        if (!key) continue;
+        const existing = await getCached(key);
+        if (existing) {
+          await storeCache(key, "recommend",
+            { genres: existing.result.genres, didYouKnow: existing.result.didYouKnow },
+            fullVerified
+          );
+          console.log(`[MB] Updated cache ${key}: removed ${toCheck.length - verified.length} mismatched artists`);
+        }
+      }
+    }
+  } catch (e) {
+    console.error("[MB] verifyArtistPoolWithMB error:", e.message);
+  }
+}
+
 // CORS must be configured to allow credentials
 app.use(
   cors({
@@ -572,15 +769,23 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
       .trim();
     const rec = JSON.parse(raw);
 
+    const keysToVerify = [];
     if (accessToken && userId) {
       const personalKey = makeCacheKey(["recommend", userId, country]);
       await storeCache(personalKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
+      keysToVerify.push(personalKey);
     } else if (!accessToken) {
       const cacheKey = makeCacheKey(["recommend", country]);
       await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
+      keysToVerify.push(cacheKey);
     }
 
     res.json({ genres: rec.genres, artists: pickDiverseByEra(rec.artists, 4), didYouKnow: rec.didYouKnow });
+
+    // Background: verify artist origins via MusicBrainz, update cache for next request
+    if (keysToVerify.length) {
+      verifyArtistPoolWithMB(rec.artists, country, keysToVerify).catch(() => {});
+    }
   } catch (err) {
     console.error("Error:", err);
     res.status(500).json({ error: err.message });
@@ -604,6 +809,81 @@ app.post("/api/time-machine", async (req, res) => {
   if (tmCached) return res.json({ country, decade, ...tmCached.result });
 
   try {
+    // ── Attempt MusicBrainz for real verified tracks first ──
+    const isoCode = COUNTRY_ISO[country];
+    let mbTracks = [];
+    if (isoCode) {
+      console.log(`[MB] Fetching recordings for ${country} (${isoCode}) ${decade}`);
+      mbTracks = await mbRecordingsForCountryDecade(isoCode, decade);
+      console.log(`[MB] Got ${mbTracks.length} recordings`);
+    }
+
+    // If MB gave us enough real tracks, use them + ask Claude only for genre label
+    if (mbTracks.length >= 8) {
+      const trackList = mbTracks.slice(0, 20).map(t => `"${t.title}" by ${t.artist}`).join("\n");
+      const genreResponse = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 300,
+          system: "You are a world music historian. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+          messages: [{ role: "user", content: `These are real recordings from ${country} in the ${decade}:\n${trackList}\n\nReturn JSON: {"genre": "the dominant genre or style that connects these tracks (be specific)", "picks": ["track title 1", "track title 2", "track title 3", "track title 4", "track title 5", "track title 6", "track title 7", "track title 8"]} — pick the 8 most representative tracks from the list above.` }],
+        }),
+      });
+      const genreData = await genreResponse.json();
+      if (!genreData.error) {
+        const genreRaw = (genreData.content[0].text || "").replace(/```json|```/g, "").trim();
+        const genreParsed = JSON.parse(genreRaw);
+        // Filter mbTracks to Claude's picks, preserving order
+        const pickedTitles = new Set((genreParsed.picks || []).map(t => t.toLowerCase()));
+        const pickedTracks = mbTracks.filter(t => pickedTitles.has(t.title.toLowerCase())).slice(0, 8);
+        // Fallback: if Claude's picks didn't match well, just use top 8
+        const tracksToSearch = pickedTracks.length >= 5 ? pickedTracks : mbTracks.slice(0, 8);
+
+        // Search picked tracks on Spotify/Apple Music
+        let validTracks;
+        if (service === "apple-music") {
+          const appleToken = generateAppleMusicToken();
+          const tracksWithIds = await Promise.all(tracksToSearch.map(async (track) => {
+            if (!appleToken) return { ...track, appleId: null };
+            try {
+              const q = `${track.title} ${track.artist}`;
+              const r = await fetch(`https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=3`, { headers: { Authorization: `Bearer ${appleToken}` } });
+              const d = await r.json();
+              const s = (d.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
+              return s ? { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null, embedUrl: s.attributes.url.replace("music.apple.com", "embed.music.apple.com") }
+                       : { ...track, appleId: null };
+            } catch { return { ...track, appleId: null }; }
+          }));
+          validTracks = tracksWithIds.filter(t => t.appleId).slice(0, 5);
+        } else {
+          const accessToken = await getClientAccessToken();
+          const tracksWithIds = await Promise.all(tracksToSearch.map(async (track) => {
+            if (!accessToken) return { ...track, spotifyId: null };
+            try {
+              const q = `track:${track.title} artist:${track.artist}`;
+              const r = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=3&market=US`, { headers: { Authorization: "Bearer " + accessToken } });
+              const d = await r.json();
+              const found = (d.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
+              return found ? { ...track, spotifyId: found.id, previewUrl: found.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found.id}` }
+                           : { ...track, spotifyId: null };
+            } catch { return { ...track, spotifyId: null }; }
+          }));
+          validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
+        }
+
+        if (validTracks.length >= 3) {
+          const tmResult = { country, decade, genre: genreParsed.genre, tracks: validTracks, source: "musicbrainz" };
+          await storeCache(tmCacheKey, "time-machine", tmResult);
+          console.log(`[MB] Time Machine served ${validTracks.length} verified tracks for ${country} ${decade}`);
+          return res.json(tmResult);
+        }
+        console.log(`[MB] Not enough tracks found on streaming (${validTracks.length}), falling back to Claude`);
+      }
+    }
+
+    // ── Fallback: Claude picks all tracks ──
     // Ask Claude for a genre spotlight + 5 track recommendations
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1074,6 +1354,35 @@ app.get("/api/apple-token", (req, res) => {
   const token = generateAppleMusicToken();
   if (!token) return res.status(503).json({ error: "Apple Music is not configured on this server. Add APPLE_TEAM_ID, APPLE_KEY_ID, and APPLE_PRIVATE_KEY to .env" });
   res.json({ token });
+});
+
+// Fetch Apple Music user's library artists to power insights
+app.get("/api/apple-me", async (req, res) => {
+  const devToken = generateAppleMusicToken();
+  if (!devToken) return res.status(503).json({ error: "Apple Music not configured." });
+
+  const authHeader = req.headers.authorization;
+  const userToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!userToken) return res.status(401).json({ error: "Missing user token." });
+
+  try {
+    // Fetch up to 100 library artists across two pages
+    const fetchPage = (offset) =>
+      fetch(`https://api.music.apple.com/v1/me/library/artists?limit=50&offset=${offset}`, {
+        headers: { Authorization: `Bearer ${devToken}`, "Music-User-Token": userToken },
+      }).then(r => r.json());
+
+    const [page1, page2] = await Promise.all([fetchPage(0), fetchPage(50)]);
+    const artists = [
+      ...(page1.data || []),
+      ...(page2.data || []),
+    ].map(a => a.attributes?.name).filter(Boolean);
+
+    res.json({ topArtists: artists.slice(0, 50) });
+  } catch (err) {
+    console.error("Apple me error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get tracks for a specific artist via Apple Music catalog
