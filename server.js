@@ -217,7 +217,9 @@ const formatFavorite = (row) => ({
 });
 
 function makeCacheKey(parts) {
-  return parts.filter(Boolean).join("_").toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
+  return parts.filter(Boolean).join("_").toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // ó→o, ú→u, ø→o, etc.
+    .replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
 }
 
 async function getCached(cacheKey) {
@@ -364,6 +366,86 @@ function artistNamesMatch(expected, actual) {
   return eWords.some(w => aWords.has(w));
 }
 
+// ── Discogs helpers ──────────────────────────────────────
+const DISCOGS_BASE = "https://api.discogs.com";
+const DISCOGS_UA   = "MusicalPassport/1.0 (contact@musicalpassport.app)";
+
+// Some country names differ between our app and Discogs
+const DISCOGS_COUNTRY_NAME = {
+  "USA": "United States",
+  "Ivory Coast": "Côte D'Ivoire",
+  "Congo": "Congo, The Republic Of The",
+  "South Korea": "South Korea",
+  "Trinidad & Tobago": "Trinidad & Tobago",
+  "UAE": "United Arab Emirates",
+};
+
+async function discogsFetch(url) {
+  const token = process.env.DISCOGS_TOKEN;
+  const headers = { "User-Agent": DISCOGS_UA };
+  if (token) headers["Authorization"] = `Discogs token=${token}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    return await fetch(url, { headers, signal: controller.signal });
+  } catch (e) {
+    if (e.name === "AbortError") {
+      console.warn(`[Discogs] Request timed out: ${url}`);
+      return { ok: false, status: 408 };
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Fetch real tracks from Discogs for a country+decade.
+// Returns array of { title, artist } or empty array.
+async function discogsTracksForCountryDecade(country, decade) {
+  if (!process.env.DISCOGS_TOKEN) return []; // skip if no token — rate limit too tight
+  const range = parseDecade(decade);
+  if (!range) return [];
+  const discogsCountry = DISCOGS_COUNTRY_NAME[country] ?? country;
+  try {
+    // Search for top masters from this country in this decade, sorted by collector want-lists
+    const searchUrl = `${DISCOGS_BASE}/database/search?country=${encodeURIComponent(discogsCountry)}&year=${range.start}-${range.end}&type=master&sort=want&sort_order=desc&per_page=20`;
+    const searchRes = await discogsFetch(searchUrl);
+    if (!searchRes.ok) return [];
+    const searchData = await searchRes.json();
+    const masters = (searchData.results || []).slice(0, 5);
+    if (masters.length === 0) return [];
+    console.log(`[Discogs] Found ${masters.length} masters for ${country} ${decade}`);
+
+    // Fetch tracklists for each master sequentially (polite rate limiting)
+    const tracks = [];
+    for (const master of masters) {
+      try {
+        await new Promise(r => setTimeout(r, 400)); // stay well under 60 req/min
+        const masterRes = await discogsFetch(`${DISCOGS_BASE}/masters/${master.id}`);
+        if (!masterRes.ok) continue;
+        const masterData = await masterRes.json();
+        // Artist name: from master data (more reliable than splitting title string)
+        const releaseArtist = (masterData.artists || []).map(a => a.name).join(", ")
+          || master.title.split(" - ")[0]?.trim()
+          || "Unknown";
+        for (const track of (masterData.tracklist || []).slice(0, 4)) {
+          if (!track.title || track.type_ === "heading") continue;
+          // Some tracks have their own artist credits
+          const trackArtist = track.artists?.length
+            ? track.artists.map(a => a.name).join(", ")
+            : releaseArtist;
+          tracks.push({ title: track.title, artist: trackArtist });
+        }
+      } catch { continue; }
+    }
+    console.log(`[Discogs] Got ${tracks.length} tracks for ${country} ${decade}`);
+    return tracks;
+  } catch (e) {
+    console.error("[Discogs] Error:", e.message);
+    return [];
+  }
+}
+
 // ── MusicBrainz helpers ──────────────────────────────────
 const MB_BASE = "https://musicbrainz.org/ws/2";
 const MB_UA   = "MusicalPassport/1.0 (contact@musicalpassport.app)";
@@ -494,6 +576,25 @@ async function mbArtistCountry(artistName) {
     await setMbArtistCached(artistName, country);
     return country;
   } catch { return null; }
+}
+
+// Filter a track list to only those whose artist is actually from isoCode.
+// Keeps tracks where MB doesn't know the artist (null) to avoid over-filtering.
+async function filterTracksByArtistOrigin(tracks, isoCode) {
+  const checked = new Map(); // artist name → country (local dedup within this call)
+  const filtered = [];
+  for (const track of tracks) {
+    if (!checked.has(track.artist)) {
+      checked.set(track.artist, await mbArtistCountry(track.artist));
+    }
+    const artistCountry = checked.get(track.artist);
+    if (!artistCountry || artistCountry === isoCode) {
+      filtered.push(track);
+    } else {
+      console.log(`[MB] Dropping "${track.title}" by ${track.artist} (artist is ${artistCountry}, expected ${isoCode})`);
+    }
+  }
+  return filtered;
 }
 
 // Fetch real recordings from MusicBrainz for a country+decade
@@ -792,6 +893,65 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
   }
 });
 
+// Shared: given a pool of { title, artist } tracks from a real data source,
+// ask Claude to label the genre and pick the best, then verify on streaming.
+// Returns { genre, tracks, source } or null if not enough land on streaming.
+async function resolveRealTracks(sourceTracks, country, decade, service, apiKey, source) {
+  const trackList = sourceTracks.slice(0, 20).map(t => `"${t.title}" by ${t.artist}`).join("\n");
+  const genreResponse = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 300,
+      system: "You are a world music historian. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+      messages: [{ role: "user", content: `These are real recordings from ${country} in the ${decade}:\n${trackList}\n\nReturn JSON: {"genre": "the dominant genre or style that connects these tracks (be specific)", "picks": ["track title 1", "track title 2", "track title 3", "track title 4", "track title 5", "track title 6", "track title 7", "track title 8"]} — pick the 8 most representative tracks from the list above.` }],
+    }),
+  });
+  const genreData = await genreResponse.json();
+  if (genreData.error) return null;
+
+  const genreRaw = (genreData.content[0].text || "").replace(/```json|```/g, "").trim();
+  const genreParsed = JSON.parse(genreRaw);
+  const pickedTitles = new Set((genreParsed.picks || []).map(t => t.toLowerCase()));
+  const pickedTracks = sourceTracks.filter(t => pickedTitles.has(t.title.toLowerCase())).slice(0, 8);
+  const tracksToSearch = pickedTracks.length >= 5 ? pickedTracks : sourceTracks.slice(0, 8);
+
+  let validTracks;
+  if (service === "apple-music") {
+    const appleToken = generateAppleMusicToken();
+    const results = await Promise.all(tracksToSearch.map(async (track) => {
+      if (!appleToken) return { ...track, appleId: null };
+      try {
+        const q = `${track.title} ${track.artist}`;
+        const r = await fetch(`https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=3`, { headers: { Authorization: `Bearer ${appleToken}` } });
+        const d = await r.json();
+        const s = (d.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
+        return s ? { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null, embedUrl: s.attributes.url.replace("music.apple.com", "embed.music.apple.com") }
+                 : { ...track, appleId: null };
+      } catch { return { ...track, appleId: null }; }
+    }));
+    validTracks = results.filter(t => t.appleId).slice(0, 5);
+  } else {
+    const accessToken = await getClientAccessToken();
+    const results = await Promise.all(tracksToSearch.map(async (track) => {
+      if (!accessToken) return { ...track, spotifyId: null };
+      try {
+        const q = `track:${track.title} artist:${track.artist}`;
+        const r = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=3&market=US`, { headers: { Authorization: "Bearer " + accessToken } });
+        const d = await r.json();
+        const found = (d.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
+        return found ? { ...track, spotifyId: found.id, previewUrl: found.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found.id}` }
+                     : { ...track, spotifyId: null };
+      } catch { return { ...track, spotifyId: null }; }
+    }));
+    validTracks = results.filter(t => t.spotifyId).slice(0, 5);
+  }
+
+  if (validTracks.length < 3) return null;
+  return { genre: genreParsed.genre, tracks: validTracks, source };
+}
+
 // ── Time Machine endpoint ────────────────────────────────
 app.post("/api/time-machine", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -818,69 +978,33 @@ app.post("/api/time-machine", async (req, res) => {
       console.log(`[MB] Got ${mbTracks.length} recordings`);
     }
 
-    // If MB gave us enough real tracks, use them + ask Claude only for genre label
+    // ── Try MusicBrainz ──
+    // Filter by artist origin to avoid release-country false positives (e.g. Western
+    // albums pressed for USSR distribution showing up for Uzbekistan, Kazakhstan, etc.)
     if (mbTracks.length >= 8) {
-      const trackList = mbTracks.slice(0, 20).map(t => `"${t.title}" by ${t.artist}`).join("\n");
-      const genreResponse = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 300,
-          system: "You are a world music historian. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
-          messages: [{ role: "user", content: `These are real recordings from ${country} in the ${decade}:\n${trackList}\n\nReturn JSON: {"genre": "the dominant genre or style that connects these tracks (be specific)", "picks": ["track title 1", "track title 2", "track title 3", "track title 4", "track title 5", "track title 6", "track title 7", "track title 8"]} — pick the 8 most representative tracks from the list above.` }],
-        }),
-      });
-      const genreData = await genreResponse.json();
-      if (!genreData.error) {
-        const genreRaw = (genreData.content[0].text || "").replace(/```json|```/g, "").trim();
-        const genreParsed = JSON.parse(genreRaw);
-        // Filter mbTracks to Claude's picks, preserving order
-        const pickedTitles = new Set((genreParsed.picks || []).map(t => t.toLowerCase()));
-        const pickedTracks = mbTracks.filter(t => pickedTitles.has(t.title.toLowerCase())).slice(0, 8);
-        // Fallback: if Claude's picks didn't match well, just use top 8
-        const tracksToSearch = pickedTracks.length >= 5 ? pickedTracks : mbTracks.slice(0, 8);
-
-        // Search picked tracks on Spotify/Apple Music
-        let validTracks;
-        if (service === "apple-music") {
-          const appleToken = generateAppleMusicToken();
-          const tracksWithIds = await Promise.all(tracksToSearch.map(async (track) => {
-            if (!appleToken) return { ...track, appleId: null };
-            try {
-              const q = `${track.title} ${track.artist}`;
-              const r = await fetch(`https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=3`, { headers: { Authorization: `Bearer ${appleToken}` } });
-              const d = await r.json();
-              const s = (d.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
-              return s ? { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null, embedUrl: s.attributes.url.replace("music.apple.com", "embed.music.apple.com") }
-                       : { ...track, appleId: null };
-            } catch { return { ...track, appleId: null }; }
-          }));
-          validTracks = tracksWithIds.filter(t => t.appleId).slice(0, 5);
-        } else {
-          const accessToken = await getClientAccessToken();
-          const tracksWithIds = await Promise.all(tracksToSearch.map(async (track) => {
-            if (!accessToken) return { ...track, spotifyId: null };
-            try {
-              const q = `track:${track.title} artist:${track.artist}`;
-              const r = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=3&market=US`, { headers: { Authorization: "Bearer " + accessToken } });
-              const d = await r.json();
-              const found = (d.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
-              return found ? { ...track, spotifyId: found.id, previewUrl: found.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found.id}` }
-                           : { ...track, spotifyId: null };
-            } catch { return { ...track, spotifyId: null }; }
-          }));
-          validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
-        }
-
-        if (validTracks.length >= 3) {
-          const tmResult = { country, decade, genre: genreParsed.genre, tracks: validTracks, source: "musicbrainz" };
-          await storeCache(tmCacheKey, "time-machine", tmResult);
-          console.log(`[MB] Time Machine served ${validTracks.length} verified tracks for ${country} ${decade}`);
-          return res.json(tmResult);
-        }
-        console.log(`[MB] Not enough tracks found on streaming (${validTracks.length}), falling back to Claude`);
+      const filteredTracks = await filterTracksByArtistOrigin(mbTracks, isoCode);
+      console.log(`[MB] ${mbTracks.length} recordings → ${filteredTracks.length} after origin filter`);
+      const resolved = await resolveRealTracks(filteredTracks, country, decade, service, apiKey, "musicbrainz");
+      if (resolved) {
+        const tmResult = { country, decade, ...resolved };
+        await storeCache(tmCacheKey, "time-machine", tmResult);
+        console.log(`[MB] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
+        return res.json(tmResult);
       }
+      console.log(`[MB] Not enough tracks found on streaming, trying Discogs`);
+    }
+
+    // ── Try Discogs (better coverage for non-Western music) ──
+    const discogsTracks = await discogsTracksForCountryDecade(country, decade);
+    if (discogsTracks.length >= 5) {
+      const resolved = await resolveRealTracks(discogsTracks, country, decade, service, apiKey, "discogs");
+      if (resolved) {
+        const tmResult = { country, decade, ...resolved };
+        await storeCache(tmCacheKey, "time-machine", tmResult);
+        console.log(`[Discogs] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
+        return res.json(tmResult);
+      }
+      console.log(`[Discogs] Not enough tracks found on streaming, falling back to Claude`);
     }
 
     // ── Fallback: Claude picks all tracks ──
