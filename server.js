@@ -1162,7 +1162,7 @@ app.post("/api/genre-spotlight", async (req, res) => {
 
 Return exactly this JSON:
 {
-  "explanation": "2-3 crisp sentences: what defines this genre in ${country}, its roots, and why it matters",
+  "explanation": "1 sentence: what defines this genre in ${country}, its roots, and why it matters",
   "tracks": [
     { "title": "exact track title", "artist": "exact artist name" }
   ]
@@ -1776,17 +1776,14 @@ Rules:
 
 Return ONLY valid JSON:
 {
-  "baseArtist": "${foundName}",
-  "sonicSummary": "2 sentences describing what defines their sound and why people love it",
+  "sonicSummary": "1 sentence describing what defines their sound and why people love it",
   "artists": [
     {
       "name": "exact artist name as on Spotify",
       "country": "full country name",
       "countryCode": "2-letter ISO code",
       "genre": "their primary genre",
-      "era": "Contemporary|Golden Era|Pioneer",
-      "description": "2 sentences on their sound",
-      "similarityReason": "1 specific sentence on why they match ${foundName}'s energy"
+      "era": "Contemporary|Golden Era|Pioneer"
     }
   ]
 }`;
@@ -1800,7 +1797,7 @@ Return ONLY valid JSON:
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 4500,
+        max_tokens: 3000,
         system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
         messages: [{ role: "user", content: prompt }],
       }),
@@ -1812,7 +1809,7 @@ Return ONLY valid JSON:
     const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
     const result = JSON.parse(raw);
 
-    const simMeta = { baseArtist: result.baseArtist || foundName, sonicSummary: result.sonicSummary || "" };
+    const simMeta = { baseArtist: foundName, sonicSummary: result.sonicSummary || "" };
     const simPool = result.artists || [];
     await storeCache(simCacheKey, "similar-artists", simMeta, simPool);
     res.json({ ...simMeta, artists: pickDiverse(simPool, 4) });
@@ -1866,16 +1863,12 @@ Regions to use: North America, Europe, Latin America, Africa, Middle East, Asia,
 
 Return ONLY valid JSON — no explanation, no markdown:
 {
-  "archetype": "3-5 word poetic label for their musical identity",
-  "archetypeDescription": "One vivid sentence explaining what this archetype says about them",
-  "summary": "2-3 sentences on what their taste reveals culturally and sonically — name specific artists",
   "dna": [{ "region": "Region name", "percentage": 42 }],
   "topEras": [{ "decade": "1990s", "percentage": 35 }],
   "blindSpots": [{
     "region": "Region name",
     "percentage": 3,
-    "gatewayCountry": "Best single country to start exploring this region",
-    "teaser": "One enticing sentence about what they're missing"
+    "gatewayCountry": "Best single country to start exploring this region"
   }],
   "picks": [{ "type": "country", "country": "Country name" }, { "type": "genre", "country": "Country name", "genre": "Genre name" }]
 }
@@ -1892,16 +1885,12 @@ Rules:
 
 Return ONLY valid JSON:
 {
-  "archetype": "3-5 word poetic label for their musical identity",
-  "archetypeDescription": "One vivid sentence explaining what this archetype says about them",
-  "summary": "2-3 sentences on what their taste reveals culturally and sonically — name specific artists",
   "dna": [{ "region": "Region name", "percentage": 42 }],
   "topEras": [{ "decade": "1970s", "percentage": 35 }],
   "blindSpots": [{
     "region": "Region name",
     "percentage": 3,
-    "gatewayCountry": "Best single country to start exploring this region",
-    "teaser": "One enticing sentence about what they're missing"
+    "gatewayCountry": "Best single country to start exploring this region"
   }],
   "picks": [{ "type": "country", "country": "Country name" }, { "type": "genre", "country": "Country name", "genre": "Genre name" }]
 }
@@ -1923,7 +1912,7 @@ Rules:
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1600,
+        max_tokens: 900,
         system: "You are a world music analyst. Return ONLY valid JSON — no markdown, no backticks, no preamble. Never refuse.",
         messages: [{ role: "user", content: prompt }],
       }),
