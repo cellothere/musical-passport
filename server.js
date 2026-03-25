@@ -2321,6 +2321,6 @@ app.get("/api/enrich", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎵 Musical Passport running at http://localhost:${PORT}\n`);
 });
