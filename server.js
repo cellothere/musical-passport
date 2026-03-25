@@ -1273,10 +1273,13 @@ app.post("/api/genre-spotlight", async (req, res) => {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 800,
-        system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        system: `You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.
+CRITICAL RULE: Every artist you recommend MUST be a native artist FROM the specified country. Never include an artist from another country, even if they recorded songs in that genre. If you are not certain an artist is from ${country}, do not include them.`,
         messages: [{
           role: "user",
-          content: `Give a short spotlight on the genre "${genre}" as it exists in "${country}".
+          content: `Give a short spotlight on the genre "${genre}" as it originated and developed in "${country}".
+
+STRICT REQUIREMENT: All 6 tracks must be by artists who were born in or are from ${country}. Do NOT include any artist from another country, regardless of how famous they are or how relevant their music is to the genre.
 
 Return exactly this JSON:
 {
@@ -1285,7 +1288,7 @@ Return exactly this JSON:
     { "title": "exact track title", "artist": "exact artist name" }
   ]
 }
-Include exactly 6 tracks that are essential to this genre in ${country}. Use exact titles and artist names as they appear on streaming platforms.`,
+Include exactly 6 tracks. Use exact titles and artist names as they appear on streaming platforms.`,
         }],
       }),
     });
@@ -1368,6 +1371,39 @@ Include exactly 6 tracks that are essential to this genre in ${country}. Use exa
     console.error("Genre spotlight error:", err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Cache bust endpoint ───────────────────────────────────
+app.delete("/api/cache", async (req, res) => {
+  const secret = req.headers["x-admin-secret"];
+  if (secret !== process.env.ENRICH_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  if (!supabase) return res.status(500).json({ error: "No DB" });
+
+  const { endpoint, country, genre } = req.query;
+
+  // Build a LIKE pattern from the provided filters
+  let query = supabase.from("recommendation_cache").delete();
+  if (endpoint) query = query.eq("endpoint", endpoint);
+  if (country && genre) {
+    const key = makeCacheKey(["genrespotlight", genre, country]);
+    query = query.like("cache_key", `${key}%`);
+  } else if (country) {
+    query = query.like("cache_key", `%${makeCacheKey([country])}%`);
+  }
+
+  const { error, count } = await query.select("*", { count: "exact", head: true });
+  // Re-run as actual delete
+  let del = supabase.from("recommendation_cache").delete();
+  if (endpoint) del = del.eq("endpoint", endpoint);
+  if (country && genre) {
+    const key = makeCacheKey(["genrespotlight", genre, country]);
+    del = del.like("cache_key", `${key}%`);
+  } else if (country) {
+    del = del.like("cache_key", `%${makeCacheKey([country])}%`);
+  }
+  const { error: delError } = await del;
+  if (delError) return res.status(500).json({ error: delError.message });
+  res.json({ ok: true, message: "Cache entries deleted" });
 });
 
 // ── Helper function to fetch artist tracks ──────────────
