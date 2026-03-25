@@ -56,6 +56,52 @@ async function getClientAccessToken() {
   }
 }
 
+// ── Artist tracks in-memory cache ────────────────────────
+const artistTracksMemCache = new Map(); // key → { tracks, cachedAt }
+const ARTIST_TRACKS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// ── Spotify API queue (rate-limit protection) ────────────
+// Spotify client-credentials endpoints allow ~30 req/s but burst 429s under
+// concurrent load. Queue all client-credentials calls sequentially with a
+// small gap between them so we never fire two at once.
+const spotifyQueue = [];
+let spotifyBusy = false;
+
+function spotifyEnqueue(fn) {
+  return new Promise((resolve, reject) => {
+    spotifyQueue.push({ fn, resolve, reject });
+    if (!spotifyBusy) drainSpotifyQueue();
+  });
+}
+
+async function drainSpotifyQueue() {
+  if (spotifyQueue.length === 0) { spotifyBusy = false; return; }
+  spotifyBusy = true;
+  const { fn, resolve, reject } = spotifyQueue.shift();
+  try { resolve(await fn()); } catch (e) { reject(e); }
+  setTimeout(drainSpotifyQueue, 200); // 200ms between calls → max ~5/s
+}
+
+// Wraps fetch with retry-on-429 logic.
+// If Retry-After > MAX_RETRY_WAIT_S we don't retry — Spotify issued a long-term
+// ban (up to 24h on some endpoints). Waiting that long blocks the whole queue.
+const MAX_RETRY_WAIT_S = 5;
+async function spotifyFetch(url, options = {}, retries = 1) {
+  const res = await fetch(url, options);
+  if (res.status === 429 && retries > 0) {
+    const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
+    if (retryAfter > MAX_RETRY_WAIT_S) {
+      console.warn(`  [Spotify] 429 with Retry-After ${retryAfter}s – long-term limit hit, not retrying`);
+      return res; // caller sees 429, returns []
+    }
+    const wait = (retryAfter + 1) * 1000;
+    console.log(`  [Spotify] 429 – waiting ${wait}ms before retry`);
+    await new Promise(r => setTimeout(r, wait));
+    return spotifyFetch(url, options, retries - 1);
+  }
+  return res;
+}
+
 // ── Apple Music developer token (ES256 JWT) ──────────────
 let appleMusicToken = null;
 let appleMusicTokenExpiry = null;
@@ -243,6 +289,54 @@ async function storeCache(cacheKey, endpoint, result, artistPool = null) {
     { cache_key: cacheKey, endpoint, result, artist_pool: artistPool },
     { onConflict: "cache_key" }
   );
+}
+
+// ── Enrichment queue ──────────────────────────────────────
+async function addToEnrichmentQueue(artists, country) {
+  if (!supabase || !artists?.length) return;
+  const rows = artists.map(a => ({ country, artist: a.name }));
+  await supabase.from("enrichment_queue")
+    .upsert(rows, { onConflict: "country,artist", ignoreDuplicates: true });
+}
+
+async function processEnrichmentBatch(batchSize = 5) {
+  if (!supabase) return { processed: 0, total: 0 };
+
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const { data: items } = await supabase
+    .from("enrichment_queue")
+    .select("id, country, artist, attempts")
+    .is("completed_at", null)
+    .lt("attempts", 3)
+    .or(`last_attempted_at.is.null,last_attempted_at.lt.${oneHourAgo}`)
+    .order("created_at", { ascending: true })
+    .limit(batchSize);
+
+  if (!items?.length) return { processed: 0, total: 0 };
+
+  let processed = 0;
+  for (const item of items) {
+    await supabase.from("enrichment_queue")
+      .update({ attempts: item.attempts + 1, last_attempted_at: new Date().toISOString() })
+      .eq("id", item.id);
+
+    try {
+      const tracks = await fetchArtistTracks(item.artist);
+      if (tracks.length > 0) {
+        await supabase.from("enrichment_queue")
+          .update({ completed_at: new Date().toISOString() })
+          .eq("id", item.id);
+        console.log(`[enrich] ✓ ${item.artist} (${item.country}) → ${tracks.length} tracks`);
+        processed++;
+      } else {
+        console.log(`[enrich] – ${item.artist} (${item.country}) → no tracks found`);
+      }
+    } catch (err) {
+      console.error(`[enrich] ✗ ${item.artist}: ${err.message}`);
+    }
+  }
+
+  return { processed, total: items.length };
 }
 
 function pickRandom(arr, n) {
@@ -713,6 +807,7 @@ app.post("/api/recommend", async (req, res) => {
     const cacheKey = makeCacheKey(["recommend", country]);
     const cached = await getCached(cacheKey);
     if (cached && cached.artist_pool && cached.artist_pool.length >= 4) {
+      console.log(`[recommend] cache hit (anon) → ${country}`);
       return res.json({
         genres: cached.result.genres,
         artists: pickDiverseByEra(cached.artist_pool, 4),
@@ -738,6 +833,7 @@ app.post("/api/recommend", async (req, res) => {
       const personalKey = makeCacheKey(["recommend", userId, country]);
       const personalCached = await getCached(personalKey);
       if (personalCached && personalCached.artist_pool && personalCached.artist_pool.length >= 4) {
+        console.log(`[recommend] cache hit (user:${userId}) → ${country}`);
         return res.json({
           genres: personalCached.result.genres,
           artists: pickDiverseByEra(personalCached.artist_pool, 4),
@@ -859,6 +955,10 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
       }),
     });
 
+    if (response.status === 529) {
+      return res.status(503).json({ error: "Our servers are busy right now. Try again in a moment." });
+    }
+
     const data = await response.json();
 
     if (data.error) {
@@ -881,12 +981,16 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
       keysToVerify.push(cacheKey);
     }
 
+    console.log(`[recommend] Claude → ${country} (${rec.artists.length} artists, ${rec.genres.length} genres)`);
     res.json({ genres: rec.genres, artists: pickDiverseByEra(rec.artists, 4), didYouKnow: rec.didYouKnow });
 
     // Background: verify artist origins via MusicBrainz, update cache for next request
     if (keysToVerify.length) {
       verifyArtistPoolWithMB(rec.artists, country, keysToVerify).catch(() => {});
     }
+
+    // Background: queue all artists for track enrichment
+    addToEnrichmentQueue(rec.artists, country).catch(() => {});
   } catch (err) {
     console.error("Error:", err);
     res.status(500).json({ error: err.message });
@@ -966,7 +1070,10 @@ app.post("/api/time-machine", async (req, res) => {
 
   const tmCacheKey = makeCacheKey(["timemachine", country, decade, service]);
   const tmCached = await getCached(tmCacheKey);
-  if (tmCached) return res.json({ country, decade, ...tmCached.result });
+  if (tmCached) {
+    console.log(`[time-machine] cache hit (${tmCached.result.source ?? "claude"}) → ${country} ${decade}`);
+    return res.json({ country, decade, ...tmCached.result });
+  }
 
   try {
     // ── Attempt MusicBrainz for real verified tracks first ──
@@ -1043,6 +1150,10 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
         }],
       }),
     });
+
+    if (response.status === 529) {
+      return res.status(503).json({ error: "Our servers are busy right now. Try again in a moment." });
+    }
 
     const data = await response.json();
     if (data.error) return res.status(500).json({ error: data.error.message });
@@ -1124,6 +1235,7 @@ Include exactly 8 tracks emblematic of this genre/connection. Prioritize real hi
 
     const tmResult = { country, decade, genre: spotlight.genre, tracks: validTracks };
     await storeCache(tmCacheKey, "time-machine", tmResult);
+    console.log(`[time-machine] Claude → ${country} ${decade} (${validTracks.length} tracks)`);
     res.json(tmResult);
   } catch (err) {
     console.error("Time machine error:", err);
@@ -1142,7 +1254,10 @@ app.post("/api/genre-spotlight", async (req, res) => {
 
   const gsCacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
   const gsCached = await getCached(gsCacheKey);
-  if (gsCached) return res.json(gsCached.result);
+  if (gsCached) {
+    console.log(`[genre-spotlight] cache hit → ${genre} / ${country}`);
+    return res.json(gsCached.result);
+  }
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1244,6 +1359,7 @@ Include exactly 6 tracks that are essential to this genre in ${country}. Use exa
 
     const gsResult = { genre, country, explanation: spotlight.explanation, tracks };
     await storeCache(gsCacheKey, "genre-spotlight", gsResult);
+    console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${tracks.length} tracks)`);
     res.json(gsResult);
   } catch (err) {
     console.error("Genre spotlight error:", err);
@@ -1253,6 +1369,27 @@ Include exactly 6 tracks that are essential to this genre in ${country}. Use exa
 
 // ── Helper function to fetch artist tracks ──────────────
 async function fetchArtistTracks(artistName) {
+  return spotifyEnqueue(() => _fetchArtistTracksImpl(artistName));
+}
+
+async function _fetchArtistTracksImpl(artistName) {
+  const cacheKey = makeCacheKey(["artist-tracks", artistName]);
+
+  // 1. In-memory cache
+  const mem = artistTracksMemCache.get(cacheKey);
+  if (mem && Date.now() - mem.cachedAt < ARTIST_TRACKS_TTL_MS) {
+    console.log(`  [artist-tracks] mem cache hit → ${artistName}`);
+    return mem.tracks;
+  }
+
+  // 2. Supabase cache
+  const cached = await getCached(cacheKey);
+  if (cached?.result?.tracks) {
+    console.log(`  [artist-tracks] db cache hit → ${artistName}`);
+    artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
+    return cached.result.tracks;
+  }
+
   try {
     console.log(`  Searching Spotify for: "${artistName}"`);
 
@@ -1263,72 +1400,62 @@ async function fetchArtistTracks(artistName) {
       return [];
     }
 
-    // Search for the artist
-    const searchResponse = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=1`,
-      {
-        headers: { Authorization: "Bearer " + accessToken },
-      }
+    // Single search call for both artist + tracks (halves Spotify API usage)
+    const searchResponse = await spotifyFetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist,track&limit=10&market=US`,
+      { headers: { Authorization: "Bearer " + accessToken } }
     );
 
-    const searchData = await searchResponse.json();
-
     console.log(`  Search response status: ${searchResponse.status}`);
+
+    if (!searchResponse.ok) {
+      console.error(`  Spotify search failed: ${searchResponse.status} ${searchResponse.statusText}`);
+      return [];
+    }
+
+    const searchData = await searchResponse.json();
 
     if (searchData.error) {
       console.error(`  Spotify API error:`, searchData.error);
       return [];
     }
 
-    if (!searchData.artists || !searchData.artists.items || searchData.artists.items.length === 0) {
+    if (!searchData.artists?.items?.length) {
       console.log(`  No artists found for "${artistName}"`);
       return [];
     }
 
-    const artistId = searchData.artists.items[0].id;
     const foundName = searchData.artists.items[0].name;
-    console.log(`  Found artist: "${foundName}" (ID: ${artistId})`);
+    console.log(`  Found artist: "${foundName}"`);
 
-    // Search for tracks by this artist instead of using top-tracks endpoint
-    const tracksSearchResponse = await fetch(
-      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(foundName)}&type=track&limit=10&market=US`,
-      {
-        headers: { Authorization: "Bearer " + accessToken },
-      }
-    );
-
-    const tracksSearchData = await tracksSearchResponse.json();
-
-    if (tracksSearchData.error) {
-      console.error(`  Track search API error:`, tracksSearchData.error);
-      return [];
-    }
-
-    if (!tracksSearchData.tracks || !tracksSearchData.tracks.items || tracksSearchData.tracks.items.length === 0) {
-      console.log(`  No tracks found via search for "${foundName}"`);
-      return [];
-    }
-
-    console.log(`  Found ${tracksSearchData.tracks.items.length} tracks via search`);
+    const allTracks = searchData.tracks?.items || [];
+    console.log(`  Found ${allTracks.length} tracks via search`);
 
     // Filter to tracks where at least one credited artist matches the searched name
     const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
     const searchedNorm = normalize(foundName);
-    const matched = tracksSearchData.tracks.items.filter(track =>
+    const matched = allTracks.filter(track =>
       track.artists.some(a => {
         const n = normalize(a.name);
         return n.includes(searchedNorm) || searchedNorm.includes(n);
       })
     );
 
-    const pool = matched.length >= 2 ? matched : tracksSearchData.tracks.items;
+    const pool = matched.length >= 2 ? matched : allTracks;
 
-    return pool.slice(0, 3).map(track => ({
+    const tracks = pool.slice(0, 3).map(track => ({
       title: track.name,
       spotifyId: track.id,
       previewUrl: track.preview_url || null,
       spotifyUrl: `https://open.spotify.com/track/${track.id}`,
     }));
+
+    // Store in memory + Supabase
+    artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
+    storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
+    console.log(`  [artist-tracks] cached ${tracks.length} tracks → ${artistName}`);
+
+    return tracks;
   } catch (err) {
     console.error(`  Error fetching tracks for ${artistName}:`, err);
     return [];
@@ -1512,6 +1639,22 @@ app.get("/api/apple-me", async (req, res) => {
 // Get tracks for a specific artist via Apple Music catalog
 app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
   const artistName = decodeURIComponent(req.params.artistName);
+  const cacheKey = makeCacheKey(["artist-tracks-apple", artistName]);
+
+  // Memory cache
+  const mem = artistTracksMemCache.get(cacheKey);
+  if (mem && Date.now() - mem.cachedAt < ARTIST_TRACKS_TTL_MS) {
+    console.log(`  [artist-tracks-apple] mem cache hit → ${artistName}`);
+    return res.json({ tracks: mem.tracks });
+  }
+  // Supabase cache
+  const cached = await getCached(cacheKey);
+  if (cached?.result?.tracks) {
+    console.log(`  [artist-tracks-apple] db cache hit → ${artistName}`);
+    artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
+    return res.json({ tracks: cached.result.tracks });
+  }
+
   const token = generateAppleMusicToken();
   if (!token) return res.status(503).json({ error: "Apple Music not configured." });
 
@@ -1520,17 +1663,20 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
       `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=songs&limit=5`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
+    if (!r.ok) return res.json({ tracks: [] });
     const data = await r.json();
     const songs = (data.results?.songs?.data || []).slice(0, 3);
-    res.json({
-      tracks: songs.map(s => ({
-        title:      s.attributes.name,
-        artist:     s.attributes.artistName,
-        appleId:    s.id,
-        previewUrl: s.attributes.previews?.[0]?.url || null,
-        embedUrl:   s.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
-      })),
-    });
+    const tracks = songs.map(s => ({
+      title:      s.attributes.name,
+      artist:     s.attributes.artistName,
+      appleId:    s.id,
+      previewUrl: s.attributes.previews?.[0]?.url || null,
+      embedUrl:   s.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
+    }));
+    artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
+    storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
+    console.log(`  [artist-tracks-apple] cached ${tracks.length} tracks → ${artistName}`);
+    res.json({ tracks });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1584,6 +1730,9 @@ app.get("/api/me", async (req, res) => {
       }
     );
 
+    if (!topArtistsResponse.ok) {
+      return res.status(topArtistsResponse.status).json({ error: "Failed to fetch top artists" });
+    }
     const topArtistsData = await topArtistsResponse.json();
 
     res.json({
@@ -1660,6 +1809,7 @@ app.post("/api/similar-artists", async (req, res) => {
   const simCacheKey = makeCacheKey(["similar", artistName]);
   const simCached = await getCached(simCacheKey);
   if (simCached && simCached.artist_pool && simCached.artist_pool.length >= 4) {
+    console.log(`[similar-artists] cache hit → ${artistName}`);
     return res.json({
       baseArtist: simCached.result.baseArtist,
       sonicSummary: simCached.result.sonicSummary,
@@ -1812,6 +1962,7 @@ Return ONLY valid JSON:
     const simMeta = { baseArtist: foundName, sonicSummary: result.sonicSummary || "" };
     const simPool = result.artists || [];
     await storeCache(simCacheKey, "similar-artists", simMeta, simPool);
+    console.log(`[similar-artists] Claude → ${artistName} (${simPool.length} matches)`);
     res.json({ ...simMeta, artists: pickDiverse(simPool, 4) });
   } catch (err) {
     console.error("Similar artists error:", err);
@@ -1843,6 +1994,7 @@ app.post("/api/insights", async (req, res) => {
   // ── Build prompt ──────────────────────────────────────────
   let prompt;
   if (enriched) {
+    console.log(`[insights] enriched Spotify data → ${enriched.totalArtists} artists`);
     const artistLines = enriched.topArtistsEnriched
       .map(a => `${a.name} (weight:${a.weight}${a.genres.length ? `, genres: ${a.genres.join(", ")}` : ""})`)
       .join("\n");
@@ -1880,6 +2032,7 @@ Rules:
 - picks: exactly 4 items. 2 must be type "country" — choose specific lesser-known countries from the blind spot regions (different from each gatewayCountry). 2 must be type "genre" — niche genres from regions the user already enjoys but hasn't fully explored. Each genre pick needs both "country" (origin country) and "genre" (specific genre name). Example: [{ type:"country", country:"Eritrea" }, { type:"genre", country:"Mali", genre:"Wassoulou" }, { type:"country", country:"Georgia" }, { type:"genre", country:"Brazil", genre:"Baião" }]`;
   } else {
     // Fallback: name-only analysis (no Spotify token available)
+    console.log(`[insights] name-only fallback → ${topArtists.length} artists`);
     const artistList = topArtists.slice(0, 20).join(", ");
     prompt = `Analyse this person's music taste based on their top Spotify artists: ${artistList}
 
@@ -1938,6 +2091,7 @@ Rules:
     if (!result.picks && result.suggestedCountries) {
       result.picks = result.suggestedCountries.map(c => ({ type: 'country', country: c.country }));
     }
+    console.log(`[insights] Claude → ${result.dna?.length ?? 0} regions, ${result.blindSpots?.length ?? 0} blind spots, ${result.picks?.length ?? 0} picks`);
     res.json(result);
   } catch (err) {
     console.error("Insights error:", err);
@@ -2036,6 +2190,95 @@ app.post("/api/user/stamps", async (req, res) => {
   const { country } = req.body;
   await supabase.from("user_stamps").upsert({ spotify_id: spotifyId, country }, { onConflict: "spotify_id,country" });
   res.json({ ok: true });
+});
+
+// ── Country of the Day ───────────────────────────────────
+const DAILY_COUNTRIES = [
+  'Brazil', 'Japan', 'Nigeria', 'Cuba', 'Ethiopia', 'Colombia', 'Jamaica',
+  'Iran', 'Mali', 'South Korea', 'Portugal', 'Iceland', 'Greece', 'Algeria',
+  'India', 'Senegal', 'Vietnam', 'Argentina', 'Ghana', 'Turkey', 'Lebanon',
+  'Morocco', 'Peru', 'Georgia', 'Mongolia', 'Cambodia', 'Cape Verde',
+  'Trinidad & Tobago', 'Armenia', 'Azerbaijan', 'Laos', 'Papua New Guinea',
+];
+
+async function getOrCreateCountryOfDay(dateStr) {
+  if (!supabase) {
+    // Fallback: deterministic pick from date
+    const day = Math.floor(Date.now() / (1000 * 60 * 60 * 24));
+    return DAILY_COUNTRIES[day % DAILY_COUNTRIES.length];
+  }
+
+  // Return existing entry for today
+  const { data: existing } = await supabase
+    .from("country_of_day")
+    .select("country")
+    .eq("date", dateStr)
+    .single();
+  if (existing) return existing.country;
+
+  // Pick least-recently-used country with lowest hit count
+  const { data: recent } = await supabase
+    .from("country_of_day")
+    .select("country, hit_count")
+    .order("date", { ascending: false })
+    .limit(60);
+
+  const recentSet = new Set((recent || []).map(r => r.country));
+  const hitMap = {};
+  (recent || []).forEach(r => { hitMap[r.country] = (hitMap[r.country] || 0) + r.hit_count; });
+
+  // Prefer countries not used recently
+  let candidates = DAILY_COUNTRIES.filter(c => !recentSet.has(c));
+  if (candidates.length === 0) candidates = [...DAILY_COUNTRIES];
+
+  // Pick lowest hit count among candidates
+  candidates.sort((a, b) => (hitMap[a] || 0) - (hitMap[b] || 0));
+  const country = candidates[0];
+
+  await supabase.from("country_of_day").insert({ date: dateStr, country, hit_count: 0 });
+  return country;
+}
+
+app.get("/api/country-of-day", async (req, res) => {
+  const dateStr = req.query.date || new Date().toISOString().slice(0, 10);
+  const country = await getOrCreateCountryOfDay(dateStr);
+  res.json({ date: dateStr, country });
+});
+
+app.post("/api/country-of-day/hit", async (req, res) => {
+  if (!supabase) return res.json({ ok: true });
+  const { date } = req.body;
+  const dateStr = date || new Date().toISOString().slice(0, 10);
+  const { error } = await supabase.rpc("increment_country_hit", { target_date: dateStr });
+  if (error) {
+    // Fallback if RPC not yet created: read-then-write increment
+    const { data } = await supabase.from("country_of_day").select("hit_count").eq("date", dateStr).single();
+    if (data) {
+      await supabase.from("country_of_day").update({ hit_count: data.hit_count + 1 }).eq("date", dateStr);
+    }
+  }
+  res.json({ ok: true });
+});
+
+// ── Background enrichment endpoint ───────────────────────
+// Called by cron job (Railway scheduler or cron-job.org)
+// GET /api/enrich?secret=YOUR_ENRICH_SECRET&batch=5
+app.get("/api/enrich", async (req, res) => {
+  const secret = req.query.secret;
+  if (!secret || secret !== process.env.ENRICH_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const batchSize = Math.min(parseInt(req.query.batch || "5", 10), 20);
+
+  try {
+    const result = await processEnrichmentBatch(batchSize);
+    console.log(`[enrich] batch complete → ${result.processed}/${result.total} enriched`);
+    res.json(result);
+  } catch (err) {
+    console.error("[enrich] batch error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
