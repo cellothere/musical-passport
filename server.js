@@ -321,7 +321,10 @@ async function processEnrichmentBatch(batchSize = 5) {
       .eq("id", item.id);
 
     try {
-      const tracks = await fetchArtistTracks(item.artist);
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 20000)
+      );
+      const tracks = await Promise.race([fetchArtistTracks(item.artist), timeout]);
       if (tracks.length > 0) {
         await supabase.from("enrichment_queue")
           .update({ completed_at: new Date().toISOString() })
