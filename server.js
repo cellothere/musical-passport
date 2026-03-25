@@ -720,7 +720,6 @@ async function mbRecordingsForCountryDecade(isoCode, decade) {
     return results;
   } catch { return []; }
 }
-
 // Background: verify Claude's artist pool against MusicBrainz and update cache.
 // Only checks the first 4 artists (the displayed ones) to keep the MB queue short.
 async function verifyArtistPoolWithMB(artists, country, cacheKeys) {
