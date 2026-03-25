@@ -784,6 +784,8 @@ app.use(
   })
 );
 
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 // Proxy endpoint for Anthropic API (with personalization)
 app.post("/api/recommend", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
