@@ -291,6 +291,330 @@ async function storeCache(cacheKey, endpoint, result, artistPool = null) {
   );
 }
 
+// ── Flag review ───────────────────────────────────────────
+
+/**
+ * Delete all cache entries matching a country (but not artist-track caches,
+ * which are expensive to regenerate and are country-agnostic).
+ */
+async function bustCountryCache(country) {
+  if (!supabase) return;
+  const pattern = `%${makeCacheKey([country])}%`;
+  const { error } = await supabase
+    .from("recommendation_cache")
+    .delete()
+    .like("cache_key", pattern)
+    .not("cache_key", "like", "artist-tracks%");
+  if (!error) console.log(`[flag-review] busted cache entries matching "${country}"`);
+}
+
+/**
+ * Ask Claude for replacement tracks from a country/genre, then resolve them
+ * against Spotify or Apple Music. Uses spotifyEnqueue for Spotify calls.
+ */
+async function getReplacementTracks(country, genre, existingTracks, count, apiKey, service) {
+  if (count <= 0 || !apiKey) return [];
+  const existingArtists = [...new Set(existingTracks.map(t => t.artist).filter(Boolean))];
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 400,
+      system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks.",
+      messages: [{
+        role: "user",
+        content: `I need up to ${count} replacement tracks for the "${genre}" genre from ${country}.
+
+CRITICAL: Every artist MUST be born in or genuinely from ${country}. Return fewer tracks — or an empty list — rather than include any foreign artist.
+${existingArtists.length ? `Do not repeat: ${existingArtists.join(", ")}.` : ""}
+
+Return exactly this JSON:
+{
+  "tracks": [
+    { "title": "exact track title", "artist": "exact artist name from ${country}" }
+  ]
+}`,
+      }],
+    }),
+  });
+
+  const data = await response.json();
+  if (data.error) { console.error("[flag-review] Claude replacement error:", data.error.message); return []; }
+
+  let suggestions;
+  try {
+    suggestions = JSON.parse((data.content[0].text || "").replace(/```json|```/g, "").trim());
+  } catch { return []; }
+  if (!suggestions.tracks?.length) return [];
+
+  const found = [];
+
+  if (service === "apple-music") {
+    const appleToken = generateAppleMusicToken();
+    if (!appleToken) return [];
+    for (const track of suggestions.tracks) {
+      try {
+        await new Promise(r => setTimeout(r, 350)); // polite Apple Music delay
+        const q = `${track.title} ${track.artist}`;
+        const r = await fetch(
+          `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=5`,
+          { headers: { Authorization: `Bearer ${appleToken}` } }
+        );
+        const d = await r.json();
+        const s = (d.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
+        if (s) found.push({ ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null });
+      } catch { /* skip */ }
+    }
+  } else {
+    // Spotify — all calls go through the rate-limit queue
+    for (const track of suggestions.tracks) {
+      try {
+        const result = await spotifyEnqueue(async () => {
+          const accessToken = await getClientAccessToken();
+          if (!accessToken) return null;
+
+          // Pass 1: strict field search
+          const r1 = await spotifyFetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:${track.title} artist:${track.artist}`)}&type=track&limit=1&market=US`,
+            { headers: { Authorization: "Bearer " + accessToken } }
+          );
+          const d1 = await r1.json();
+          const hit1 = d1.tracks?.items?.[0];
+          if (hit1 && artistNamesMatch(track.artist, hit1.artists?.[0]?.name || "")) {
+            return { ...track, spotifyId: hit1.id, previewUrl: hit1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${hit1.id}` };
+          }
+
+          // Pass 2: looser search
+          const r2 = await spotifyFetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(`${track.title} ${track.artist}`)}&type=track&limit=5&market=US`,
+            { headers: { Authorization: "Bearer " + accessToken } }
+          );
+          const d2 = await r2.json();
+          const hit2 = (d2.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
+          if (hit2) {
+            return { ...track, spotifyId: hit2.id, previewUrl: hit2.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${hit2.id}` };
+          }
+          return null;
+        });
+        if (result) found.push(result);
+      } catch { /* skip */ }
+    }
+    return found.filter(t => t?.spotifyId);
+  }
+
+  return found;
+}
+
+/**
+ * Verify and repair a single (country, genre) cache entry.
+ * Uses Claude to audit all tracks, removes confirmed-wrong ones,
+ * and fetches replacements from the streaming catalog.
+ *
+ * Returns { fixed: boolean, verified: number, rejected: number }
+ */
+async function reviewGenreSpotlightContext({ country, genre, flags }, apiKey) {
+  const services = ["spotify", "apple-music"];
+  let anyFixed = false;
+  let totalVerified = 0;
+  let totalRejected = 0;
+
+  for (const service of services) {
+    const cacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
+    const cached = await getCached(cacheKey);
+    if (!cached?.result?.tracks?.length) continue;
+
+    const currentTracks = cached.result.tracks;
+    const flagComments = flags.filter(f => f.comment).map(f => `"${f.comment}"`).join(", ");
+    const flaggedSummary = [...new Set(flags.map(f => `"${f.track_title}" by ${f.track_artist || "Unknown"}`))].join(", ");
+
+    // Ask Claude to audit every track in the cached result
+    const verifyResponse = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 700,
+        system: "You are a world music fact-checker. Return ONLY valid JSON — no markdown, no backticks.",
+        messages: [{
+          role: "user",
+          content: `Audit these "${genre}" tracks currently cached for ${country}. Expert listeners flagged problems.
+
+Cached tracks:
+${currentTracks.map((t, i) => `${i + 1}. "${t.title}" by ${t.artist ?? "Unknown"}`).join("\n")}
+
+Flagged by testers: ${flaggedSummary}
+Tester comments: ${flagComments || "none"}
+
+For EVERY track above, determine:
+- Is the artist genuinely born in or from ${country}?
+- Does this track represent "${genre}" as it exists specifically in ${country}?
+
+A track must meet BOTH criteria to be verified. If uncertain, reject it.
+
+Return exactly this JSON:
+{
+  "verified": [{ "title": "...", "artist": "..." }],
+  "rejected": [{ "title": "...", "artist": "...", "reason": "one-line reason" }],
+  "explanation_update": "updated 1-2 sentence explanation for ${country}'s relationship to ${genre}, or null to keep existing"
+}`,
+        }],
+      }),
+    });
+
+    const verifyData = await verifyResponse.json();
+    if (verifyData.error) {
+      console.error(`[flag-review] Claude audit error for ${genre}/${country}:`, verifyData.error.message);
+      continue;
+    }
+
+    let audit;
+    try {
+      audit = JSON.parse((verifyData.content[0].text || "").replace(/```json|```/g, "").trim());
+    } catch {
+      console.error(`[flag-review] Failed to parse audit for ${genre}/${country} (${service})`);
+      continue;
+    }
+
+    totalVerified += audit.verified?.length ?? 0;
+    totalRejected += audit.rejected?.length ?? 0;
+
+    for (const r of audit.rejected || []) {
+      console.log(`[flag-review]   ✗ ${service} — "${r.title}" by ${r.artist}: ${r.reason}`);
+    }
+
+    if (!audit.rejected?.length) {
+      console.log(`[flag-review] No issues found for ${genre}/${country} (${service}) — flagged tracks may have already been evicted`);
+      continue;
+    }
+
+    // Keep the tracks Claude verified; discard the rest
+    const rejectedTitlesLower = new Set((audit.rejected || []).map(r => r.title.toLowerCase().trim()));
+    const keptTracks = currentTracks.filter(t => !rejectedTitlesLower.has((t.title || "").toLowerCase().trim()));
+
+    // Request replacements to bring the list back to up to 6 tracks
+    let newTracks = keptTracks;
+    const replacementsNeeded = Math.max(0, 6 - keptTracks.length);
+    if (replacementsNeeded > 0) {
+      console.log(`[flag-review] Requesting ${replacementsNeeded} replacement(s) for ${genre}/${country} (${service})`);
+      // Small pause between Claude calls to avoid rapid-fire requests
+      await new Promise(r => setTimeout(r, 1500));
+      const replacements = await getReplacementTracks(country, genre, keptTracks, replacementsNeeded, apiKey, service);
+      newTracks = [...keptTracks, ...replacements].slice(0, 6);
+      console.log(`[flag-review] Got ${replacements.length} replacement track(s)`);
+    }
+
+    const updatedResult = {
+      ...cached.result,
+      tracks: newTracks,
+      ...(audit.explanation_update ? { explanation: audit.explanation_update } : {}),
+    };
+    await storeCache(cacheKey, "genre-spotlight", updatedResult);
+    console.log(`[flag-review] ✓ Cache updated: ${genre}/${country} (${service}) — kept ${keptTracks.length}, added ${newTracks.length - keptTracks.length}`);
+    anyFixed = true;
+  }
+
+  return { fixed: anyFixed, verified: totalVerified, rejected: totalRejected };
+}
+
+/**
+ * Main flag-review loop. Called by the cron job.
+ * Groups pending flags by (country, genre) context, reviews each context,
+ * marks flags as reviewed, and logs outcomes.
+ *
+ * @param {number} maxContexts  Max distinct (country, genre) pairs to process per run.
+ *                              Keep low (2–3) to stay within cron timeouts and API limits.
+ */
+async function processFlaggedTracks(maxContexts = 2) {
+  if (!supabase) return { reviewed: 0, fixed: 0 };
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) { console.warn("[flag-review] No ANTHROPIC_API_KEY — skipping"); return { reviewed: 0, fixed: 0 }; }
+
+  // Fetch all unreviewed flags, ordered oldest first so nothing starves
+  const { data: flags, error } = await supabase
+    .from("track_flags")
+    .select("*")
+    .is("reviewed_at", null)
+    .order("created_at", { ascending: true })
+    .limit(200);
+
+  if (error) { console.error("[flag-review] DB error:", error.message); return { reviewed: 0, fixed: 0 }; }
+  if (!flags?.length) { console.log("[flag-review] No pending flags"); return { reviewed: 0, fixed: 0 }; }
+
+  console.log(`[flag-review] ${flags.length} unreviewed flag(s)`);
+
+  // Group by context: genre-spotlight flags by (country, genre), others by country alone
+  const contexts = new Map();
+  for (const flag of flags) {
+    const key = flag.genre
+      ? `genre:${flag.country}|||${flag.genre}`
+      : `country:${flag.country}`;
+    if (!contexts.has(key)) {
+      contexts.set(key, {
+        type: flag.genre ? "genre" : "country",
+        country: flag.country,
+        genre: flag.genre || null,
+        flags: [],
+      });
+    }
+    contexts.get(key).flags.push(flag);
+  }
+
+  let reviewed = 0;
+  let fixed = 0;
+  let processed = 0;
+
+  for (const [, ctx] of contexts) {
+    if (processed >= maxContexts) break;
+
+    const label = ctx.genre ? `${ctx.genre} / ${ctx.country}` : ctx.country;
+    console.log(`[flag-review] Processing: ${label} (${ctx.flags.length} flag(s))`);
+
+    let reviewResult = "reviewed";
+    try {
+      if (ctx.type === "genre") {
+        const result = await reviewGenreSpotlightContext(ctx, apiKey);
+        if (result.fixed) { fixed++; reviewResult = "fixed"; }
+        else reviewResult = "no_issues_found";
+      } else {
+        // No genre context — bust the whole country cache so it regenerates cleanly
+        await bustCountryCache(ctx.country);
+        reviewResult = "cache_busted";
+      }
+    } catch (err) {
+      console.error(`[flag-review] Error reviewing "${label}":`, err.message);
+      reviewResult = "error";
+    }
+
+    // Mark all flags in this context as reviewed
+    const flagIds = ctx.flags.map(f => f.id);
+    await supabase
+      .from("track_flags")
+      .update({ reviewed_at: new Date().toISOString(), review_result: reviewResult })
+      .in("id", flagIds);
+
+    reviewed += ctx.flags.length;
+    processed++;
+
+    // Pause between contexts — gives Spotify queue time to drain and Claude a breather
+    if (processed < Math.min(contexts.size, maxContexts)) {
+      await new Promise(r => setTimeout(r, 2500));
+    }
+  }
+
+  console.log(`[flag-review] Done — ${reviewed} flag(s) reviewed, ${fixed} cache(s) fixed`);
+  return { reviewed, fixed };
+}
+
 // ── Enrichment queue ──────────────────────────────────────
 async function addToEnrichmentQueue(artists, country) {
   if (!supabase || !artists?.length) return;
@@ -1275,21 +1599,23 @@ app.post("/api/genre-spotlight", async (req, res) => {
         model: "claude-sonnet-4-20250514",
         max_tokens: 800,
         system: `You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.
-CRITICAL RULE: Every artist you recommend MUST be a native artist FROM the specified country. Never include an artist from another country, even if they recorded songs in that genre. If you are not certain an artist is from ${country}, do not include them.`,
+CRITICAL RULE: Every artist you recommend MUST be a native artist FROM the specified country. Never include an artist from another country, even if they recorded songs in that genre. If you are not certain an artist is from ${country}, do not include them. It is better to return fewer tracks than to include an artist from the wrong country.`,
         messages: [{
           role: "user",
           content: `Give a short spotlight on the genre "${genre}" as it originated and developed in "${country}".
 
-STRICT REQUIREMENT: All 6 tracks must be by artists who were born in or are from ${country}. Do NOT include any artist from another country, regardless of how famous they are or how relevant their music is to the genre.
+STRICT REQUIREMENT: Every track must be by an artist who was born in or is from ${country}. Do NOT include any artist from another country, regardless of how famous they are or how well they fit the genre. If ${country} has a small or limited scene for this genre, return only as many tracks as genuinely exist — returning 1 or 2 tracks (or even an empty list) is far better than including foreign artists to fill a quota.
+
+When the local scene is small, use the explanation to honestly describe the country's relationship to the genre — its influences, radio history, or cultural context — rather than pretending it has more local artists than it does.
 
 Return exactly this JSON:
 {
-  "explanation": "1 sentence: what defines this genre in ${country}, its roots, and why it matters",
+  "explanation": "1–2 sentences: what defines this genre in ${country}, its roots, local context, and why it matters",
   "tracks": [
     { "title": "exact track title", "artist": "exact artist name" }
   ]
 }
-Include exactly 6 tracks. Use exact titles and artist names as they appear on streaming platforms.`,
+Include between 1 and 6 tracks — only genuine artists from ${country}. Use exact titles and artist names as they appear on streaming platforms.`,
         }],
       }),
     });
@@ -1372,6 +1698,29 @@ Include exactly 6 tracks. Use exact titles and artist names as they appear on st
     console.error("Genre spotlight error:", err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── Expert tester: flag a track for review ────────────────
+app.post("/api/flag-track", async (req, res) => {
+  const { trackTitle, trackArtist, spotifyId, appleId, country, genre, comment, userId } = req.body;
+  if (!trackTitle || !country) return res.status(400).json({ error: "Missing required fields." });
+
+  if (supabase) {
+    await supabase.from("track_flags").insert({
+      track_title: trackTitle,
+      track_artist: trackArtist ?? null,
+      spotify_id: spotifyId ?? null,
+      apple_id: appleId ?? null,
+      country,
+      genre: genre ?? null,
+      comment: comment ?? null,
+      flagged_by: userId ?? null,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  console.log(`[flag-track] "${trackTitle}" by ${trackArtist} (${country}${genre ? ` / ${genre}` : ''}) flagged by ${userId ?? 'anonymous'}${comment ? `: "${comment}"` : ''}`);
+  res.json({ ok: true });
 });
 
 // ── Cache bust endpoint ───────────────────────────────────
@@ -2303,6 +2652,7 @@ app.post("/api/country-of-day/hit", async (req, res) => {
 // ── Background enrichment endpoint ───────────────────────
 // Called by cron job (Railway scheduler or cron-job.org)
 // GET /api/enrich?secret=YOUR_ENRICH_SECRET&batch=5
+// Optionally skip flag review: &review_flags=false
 app.get("/api/enrich", async (req, res) => {
   const secret = req.query.secret;
   if (!secret || secret !== process.env.ENRICH_SECRET) {
@@ -2310,13 +2660,41 @@ app.get("/api/enrich", async (req, res) => {
   }
 
   const batchSize = Math.min(parseInt(req.query.batch || "5", 10), 20);
+  const skipFlagReview = req.query.review_flags === "false";
 
   try {
-    const result = await processEnrichmentBatch(batchSize);
-    console.log(`[enrich] batch complete → ${result.processed}/${result.total} enriched`);
-    res.json(result);
+    const enrichResult = await processEnrichmentBatch(batchSize);
+    console.log(`[enrich] batch complete → ${enrichResult.processed}/${enrichResult.total} enriched`);
+
+    let flagResult = { reviewed: 0, fixed: 0, skipped: skipFlagReview };
+    if (!skipFlagReview) {
+      // Run flag review after enrichment. Max 2 contexts per cron run to
+      // avoid timeout — each context makes 2 Claude calls + Spotify lookups.
+      flagResult = await processFlaggedTracks(2);
+    }
+
+    res.json({ enrich: enrichResult, flagReview: flagResult });
   } catch (err) {
     console.error("[enrich] batch error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Manual flag review endpoint ───────────────────────────
+// Trigger on-demand: GET /api/review-flags?secret=...&contexts=5
+app.get("/api/review-flags", async (req, res) => {
+  const secret = req.query.secret;
+  if (!secret || secret !== process.env.ENRICH_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const maxContexts = Math.min(parseInt(req.query.contexts || "5", 10), 10);
+
+  try {
+    const result = await processFlaggedTracks(maxContexts);
+    res.json(result);
+  } catch (err) {
+    console.error("[review-flags] error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
