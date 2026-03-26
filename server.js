@@ -427,11 +427,42 @@ async function reviewGenreSpotlightContext({ country, genre, flags }, apiKey) {
   for (const service of services) {
     const cacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
     const cached = await getCached(cacheKey);
-    if (!cached?.result?.tracks?.length) continue;
 
-    const currentTracks = cached.result.tracks;
     const flagComments = flags.filter(f => f.comment).map(f => `"${f.comment}"`).join(", ");
     const flaggedSummary = [...new Set(flags.map(f => `"${f.track_title}" by ${f.track_artist || "Unknown"}`))].join(", ");
+
+    // No cached tracks — verify just the flagged ones to decide whether to bust
+    if (!cached?.result?.tracks?.length) {
+      const noCache = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 300,
+          system: "You are a world music fact-checker. Return ONLY valid JSON — no markdown, no backticks.",
+          messages: [{
+            role: "user",
+            content: `Expert testers flagged these tracks as wrong for the genre "${genre}" from ${country}:\n${flaggedSummary}\nTester comments: ${flagComments || "none"}\n\nAre any of these tracks genuinely problematic (wrong country of origin or wrong genre)? Return: {"any_problematic": true, "reason": "one-line explanation"} or {"any_problematic": false, "reason": "..."}`,
+          }],
+        }),
+      });
+      const noCacheData = await noCache.json();
+      if (!noCacheData.error) {
+        let verdict;
+        try { verdict = JSON.parse((noCacheData.content[0].text || "").replace(/```json|```/g, "").trim()); } catch { /* skip */ }
+        if (verdict?.any_problematic) {
+          await supabase.from("recommendation_cache").delete().eq("cache_key", cacheKey);
+          console.log(`[flag-review] ✓ Cache busted (was empty) for ${genre}/${country} (${service}): ${verdict.reason}`);
+          anyFixed = true;
+          totalRejected += flags.length;
+        } else {
+          console.log(`[flag-review] No issues found for ${genre}/${country} (${service}) — no cache, flags appear legitimate`);
+        }
+      }
+      continue;
+    }
+
+    const currentTracks = cached.result.tracks;
 
     // Ask Claude to audit every track in the cached result
     const verifyResponse = await fetch("https://api.anthropic.com/v1/messages", {
@@ -997,6 +1028,75 @@ async function mbArtistCountry(artistName) {
     await setMbArtistCached(artistName, country);
     return country;
   } catch { return null; }
+}
+
+// ── ListenBrainz fallback for artist tracks ───────────────
+const LB_BASE = "https://api.listenbrainz.org/1";
+const LB_TIMEOUT_MS = 8000;
+
+async function lbFetch(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LB_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": MB_UA },
+      signal: controller.signal,
+    });
+    return r;
+  } catch (e) {
+    if (e.name === "AbortError") {
+      console.warn(`[LB] Request timed out: ${url}`);
+      return { ok: false, status: 408 };
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Simple in-memory cache for artist MBIDs
+const mbidCache = new Map(); // artistName → { mbid, at }
+const MBID_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+async function getMbArtistMBID(artistName) {
+  const cached = mbidCache.get(artistName);
+  if (cached && Date.now() - cached.at < MBID_CACHE_TTL) return cached.mbid;
+  try {
+    const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(artistName)}&limit=3&fmt=json`;
+    const r = await mbFetch(url);
+    if (!r.ok) { mbidCache.set(artistName, { mbid: null, at: Date.now() }); return null; }
+    const d = await r.json();
+    const top = (d.artists || []).find(a => (a.score || 0) >= 80);
+    const mbid = top?.id ?? null;
+    mbidCache.set(artistName, { mbid, at: Date.now() });
+    return mbid;
+  } catch { return null; }
+}
+
+async function fetchArtistTracksFromLB(artistName) {
+  try {
+    const mbid = await getMbArtistMBID(artistName);
+    if (!mbid) {
+      console.log(`  [LB] No MBID found for "${artistName}"`);
+      return [];
+    }
+    const r = await lbFetch(`${LB_BASE}/popularity/top-recordings-for-artist/${mbid}`);
+    if (!r.ok) {
+      console.warn(`  [LB] popularity fetch failed for "${artistName}": ${r.status}`);
+      return [];
+    }
+    const data = await r.json();
+    const recordings = Array.isArray(data) ? data : (data.recordings || []);
+    const tracks = recordings.slice(0, 3).map(rec => ({
+      title: rec.recording_name,
+      artist: rec.artist_name,
+    }));
+    console.log(`  [LB] Got ${tracks.length} tracks for "${artistName}" via ListenBrainz`);
+    return tracks;
+  } catch (err) {
+    console.error(`  [LB] Error fetching tracks for "${artistName}":`, err.message);
+    return [];
+  }
 }
 
 // Filter a track list to only those whose artist is actually from isoCode.
@@ -1810,8 +1910,8 @@ async function _fetchArtistTracksImpl(artistName) {
     }
 
     if (!searchData.artists?.items?.length) {
-      console.log(`  No artists found for "${artistName}"`);
-      return [];
+      console.log(`  No artists found for "${artistName}" on Spotify → trying ListenBrainz`);
+      return fetchArtistTracksFromLB(artistName);
     }
 
     const foundName = searchData.artists.items[0].name;
@@ -1832,22 +1932,30 @@ async function _fetchArtistTracksImpl(artistName) {
 
     const pool = matched.length >= 2 ? matched : allTracks;
 
-    const tracks = pool.slice(0, 3).map(track => ({
+    let tracks = pool.slice(0, 3).map(track => ({
       title: track.name,
       spotifyId: track.id,
       previewUrl: track.preview_url || null,
       spotifyUrl: `https://open.spotify.com/track/${track.id}`,
     }));
 
-    // Store in memory + Supabase
-    artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-    storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
-    console.log(`  [artist-tracks] cached ${tracks.length} tracks → ${artistName}`);
+    // Fall back to ListenBrainz if Spotify returned nothing
+    if (tracks.length === 0) {
+      console.log(`  [artist-tracks] Spotify empty → trying ListenBrainz for "${artistName}"`);
+      tracks = await fetchArtistTracksFromLB(artistName);
+    }
+
+    if (tracks.length > 0) {
+      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
+      console.log(`  [artist-tracks] cached ${tracks.length} tracks → ${artistName}`);
+    }
 
     return tracks;
   } catch (err) {
     console.error(`  Error fetching tracks for ${artistName}:`, err);
-    return [];
+    console.log(`  [artist-tracks] Spotify error → trying ListenBrainz for "${artistName}"`);
+    return fetchArtistTracksFromLB(artistName);
   }
 }
 
