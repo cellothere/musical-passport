@@ -1895,7 +1895,7 @@ When the local scene is small, use the explanation to honestly describe the coun
 
 Return exactly this JSON:
 {
-  "explanation": "1–2 sentences: what defines this genre in ${country}, its roots, local context, and why it matters",
+  "explanation": "1 sentence: what defines this genre in ${country}, its roots, local context, and why it matters",
   "tracks": [
     { "title": "exact track title", "artist": "exact artist name" }
   ]

@@ -208,7 +208,7 @@ app.post("/api/time-machine", async (req, res) => {
           content: `Spotlight an important or influential music genre from ${country} in the ${decade}. It can be either a popular genre or a niche one. Return exactly this JSON:
 {
   "genre": "genre name",
-  "description": "2 sentences about why this genre was important in ${country} in the ${decade} and what made it distinctive",
+  "description": "1 sentence about why this genre was important in ${country} in the ${decade} and what made it distinctive",
   "tracks": [
     { "title": "track title", "artist": "artist name" }
   ]
