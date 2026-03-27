@@ -276,6 +276,8 @@ async function getCached(cacheKey) {
     .eq("cache_key", cacheKey)
     .single();
   if (error || !data) return null;
+  // Treat expired rows as cache misses
+  if (data.expires_at && new Date(data.expires_at) < new Date()) return null;
   supabase.from("recommendation_cache")
     .update({ hit_count: data.hit_count + 1, last_accessed_at: new Date().toISOString() })
     .eq("cache_key", cacheKey)
@@ -958,13 +960,17 @@ async function getMbArtistCached(artistName) {
   const mem = mbArtistCache.get(key);
   if (mem && Date.now() - mem.at < MB_ARTIST_CACHE_TTL) return mem.country;
 
-  // Check Supabase for persistence across restarts
+  // Check dedicated artist_countries table (permanent reference data, no TTL)
   if (supabase) {
-    const dbKey = makeCacheKey(["mb-artist", key]);
-    const row = await getCached(dbKey);
-    if (row?.result?.country !== undefined) {
-      mbArtistCache.set(key, { country: row.result.country, at: Date.now() });
-      return row.result.country;
+    const slug = makeCacheKey([key]);
+    const { data } = await supabase
+      .from("artist_countries")
+      .select("country_code")
+      .eq("artist_slug", slug)
+      .single();
+    if (data) {
+      mbArtistCache.set(key, { country: data.country_code, at: Date.now() });
+      return data.country_code;
     }
   }
   return undefined; // cache miss
@@ -974,8 +980,11 @@ async function setMbArtistCached(artistName, country) {
   const key = artistName.toLowerCase().trim();
   mbArtistCache.set(key, { country, at: Date.now() });
   if (supabase) {
-    const dbKey = makeCacheKey(["mb-artist", key]);
-    await storeCache(dbKey, "mb-artist", { country });
+    const slug = makeCacheKey([key]);
+    await supabase.from("artist_countries").upsert(
+      { artist_slug: slug, country_code: country, source: "musicbrainz" },
+      { onConflict: "artist_slug" }
+    );
   }
 }
 
