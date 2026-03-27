@@ -1034,12 +1034,13 @@ async function mbArtistCountry(artistName) {
 const LB_BASE = "https://api.listenbrainz.org/1";
 const LB_TIMEOUT_MS = 8000;
 
-async function lbFetch(url) {
+async function lbFetch(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), LB_TIMEOUT_MS);
   try {
     const r = await fetch(url, {
-      headers: { "User-Agent": MB_UA },
+      ...options,
+      headers: { "User-Agent": MB_UA, ...(options.headers || {}) },
       signal: controller.signal,
     });
     return r;
@@ -1051,6 +1052,59 @@ async function lbFetch(url) {
     throw e;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// ── LB popular-recordings-by-country ─────────────────────
+const areaMbidCache = new Map(); // countryName → { mbid, at }
+const AREA_MBID_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+async function getAreaMBID(countryName) {
+  const cached = areaMbidCache.get(countryName);
+  if (cached && Date.now() - cached.at < AREA_MBID_CACHE_TTL) return cached.mbid;
+  try {
+    const url = `${MB_BASE}/area?query=area:${encodeURIComponent(countryName)}&limit=5&fmt=json`;
+    const r = await mbFetch(url);
+    if (!r.ok) { areaMbidCache.set(countryName, { mbid: null, at: Date.now() }); return null; }
+    const d = await r.json();
+    const areas = d.areas || [];
+    const top = areas.find(a => (a.score || 0) >= 80 && a.type === "Country")
+             ?? areas.find(a => (a.score || 0) >= 80);
+    const mbid = top?.id ?? null;
+    areaMbidCache.set(countryName, { mbid, at: Date.now() });
+    return mbid;
+  } catch { return null; }
+}
+
+async function lbPopularRecordingsByCountry(countryName, decade) {
+  const areaMbid = await getAreaMBID(countryName);
+  if (!areaMbid) {
+    console.log(`[LB] No area MBID found for "${countryName}"`);
+    return [];
+  }
+  const range = parseDecade(decade);
+  if (!range) return [];
+  try {
+    const r = await lbFetch("https://datasets.listenbrainz.org/popular-recordings-by-country/json", {
+      method: "POST",
+      body: JSON.stringify([{ "[area_mbid]": areaMbid }]),
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!r.ok) {
+      console.warn(`[LB] popular-recordings-by-country failed for "${countryName}": ${r.status}`);
+      return [];
+    }
+    const data = await r.json();
+    const tracks = (Array.isArray(data) ? data : [])
+      .filter(rec => rec.year && rec.year >= range.start && rec.year <= range.end)
+      .sort((a, b) => (b.listen_count || 0) - (a.listen_count || 0))
+      .slice(0, 30)
+      .map(rec => ({ title: rec.recording_name, artist: rec.artist_credit_name, year: rec.year }));
+    console.log(`[LB] Got ${tracks.length} popular recordings for "${countryName}" ${decade} (area: ${areaMbid})`);
+    return tracks;
+  } catch (err) {
+    console.error(`[LB] popular-recordings-by-country error for "${countryName}":`, err.message);
+    return [];
   }
 }
 
@@ -1503,23 +1557,40 @@ app.post("/api/time-machine", async (req, res) => {
     return res.json({ country, decade, ...tmCached.result });
   }
 
+  const isoCode = COUNTRY_ISO[country];
+
   try {
-    // ── Attempt MusicBrainz for real verified tracks first ──
-    const isoCode = COUNTRY_ISO[country];
+    // ── 1. ListenBrainz popular-recordings-by-country (primary) ──
+    // Real listen-count ranked data with year field for accurate decade filtering.
+    console.log(`[LB] Fetching popular recordings for ${country} ${decade}`);
+    const lbTracks = await lbPopularRecordingsByCountry(country, decade);
+    if (lbTracks.length >= 5) {
+      const lbFiltered = isoCode ? await filterTracksByArtistOrigin(lbTracks, isoCode) : lbTracks;
+      console.log(`[LB] ${lbTracks.length} → ${lbFiltered.length} after origin filter`);
+      const pool = lbFiltered.length >= 5 ? lbFiltered : lbTracks;
+      const resolved = await resolveRealTracks(pool, country, decade, service, apiKey, "listenbrainz");
+      if (resolved) {
+        const tmResult = { country, decade, ...resolved };
+        await storeCache(tmCacheKey, "time-machine", tmResult);
+        console.log(`[LB] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
+        return res.json(tmResult);
+      }
+      console.log(`[LB] Not enough tracks found on streaming, trying MusicBrainz`);
+    }
+
+    // ── 2. MusicBrainz recordings (strong for historical, fills LB gaps) ──
+    // Filter by artist origin to avoid release-country false positives (e.g. Western
+    // albums pressed for USSR distribution showing up for Uzbekistan, Kazakhstan, etc.)
     let mbTracks = [];
     if (isoCode) {
       console.log(`[MB] Fetching recordings for ${country} (${isoCode}) ${decade}`);
       mbTracks = await mbRecordingsForCountryDecade(isoCode, decade);
       console.log(`[MB] Got ${mbTracks.length} recordings`);
     }
-
-    // ── Try MusicBrainz ──
-    // Filter by artist origin to avoid release-country false positives (e.g. Western
-    // albums pressed for USSR distribution showing up for Uzbekistan, Kazakhstan, etc.)
     if (mbTracks.length >= 8) {
-      const filteredTracks = await filterTracksByArtistOrigin(mbTracks, isoCode);
-      console.log(`[MB] ${mbTracks.length} recordings → ${filteredTracks.length} after origin filter`);
-      const resolved = await resolveRealTracks(filteredTracks, country, decade, service, apiKey, "musicbrainz");
+      const mbFiltered = await filterTracksByArtistOrigin(mbTracks, isoCode);
+      console.log(`[MB] ${mbTracks.length} → ${mbFiltered.length} after origin filter`);
+      const resolved = await resolveRealTracks(mbFiltered, country, decade, service, apiKey, "musicbrainz");
       if (resolved) {
         const tmResult = { country, decade, ...resolved };
         await storeCache(tmCacheKey, "time-machine", tmResult);
@@ -1529,8 +1600,9 @@ app.post("/api/time-machine", async (req, res) => {
       console.log(`[MB] Not enough tracks found on streaming, trying Discogs`);
     }
 
-    // ── Try Discogs (better coverage for non-Western music) ──
+    // ── 3. Discogs (better coverage for non-Western and obscure releases) ──
     const discogsTracks = await discogsTracksForCountryDecade(country, decade);
+    console.log(`[Discogs] Got ${discogsTracks.length} tracks for ${country} ${decade}`);
     if (discogsTracks.length >= 5) {
       const resolved = await resolveRealTracks(discogsTracks, country, decade, service, apiKey, "discogs");
       if (resolved) {
@@ -1539,8 +1611,30 @@ app.post("/api/time-machine", async (req, res) => {
         console.log(`[Discogs] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
         return res.json(tmResult);
       }
-      console.log(`[Discogs] Not enough tracks found on streaming, falling back to Claude`);
+      console.log(`[Discogs] Not enough tracks on streaming, trying merged pool`);
     }
+
+    // ── 4. Merge all three sources and try again ──
+    // Handles cases where each individual source has partial coverage.
+    const seen = new Set();
+    const mergedTracks = [...lbTracks, ...mbTracks, ...discogsTracks].filter(t => {
+      const key = `${t.title.toLowerCase()}||${t.artist.toLowerCase()}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (mergedTracks.length >= 5) {
+      console.log(`[time-machine] Trying merged pool (${mergedTracks.length} tracks) for ${country} ${decade}`);
+      const resolved = await resolveRealTracks(mergedTracks, country, decade, service, apiKey, "merged");
+      if (resolved) {
+        const tmResult = { country, decade, ...resolved };
+        await storeCache(tmCacheKey, "time-machine", tmResult);
+        console.log(`[merged] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
+        return res.json(tmResult);
+      }
+    }
+
+    console.log(`[time-machine] All real sources exhausted for ${country} ${decade}, falling back to Claude`);
 
     // ── Fallback: Claude picks all tracks ──
     // Ask Claude for a genre spotlight + 5 track recommendations
@@ -1559,13 +1653,25 @@ app.post("/api/time-machine", async (req, res) => {
           role: "user",
           content: `Spotlight a music genre connecting "${country}" and the "${decade}".
 
-IMPORTANT RULES FOR UNUSUAL COMBINATIONS:
-- If the country is a historical or defunct civilization (e.g. Byzantine Empire, Yugoslavia, Soviet Union, Ottoman Empire, Ancient Rome), find music that genuinely connects both:
-  * If the decade falls within that civilization's existence → spotlight its authentic music of that era.
-  * If the decade is AFTER the civilization ended (e.g. "1960s" + "Byzantine Empire") → get creative and educational: spotlight scholarly recordings of that tradition made during the decade, 20th-century revivals or compositions inspired by it, music from the geographic region that descends from or pays homage to that tradition, or ethnomusicological field recordings. Never refuse — always find a real angle.
-- If the combination is geographically or temporally unusual for any other reason, find the most interesting real musical connection you can. Be a curious historian, not a gatekeeper.
-- Always pick real tracks that are very likely to exist on Spotify or major streaming platforms.
-- Use the exact track title and artist name as they would appear on Spotify.
+CRITICAL AUTHENTICITY RULE: Every track must be by an artist genuinely FROM or rooted in ${country} (or the predecessor region if the country didn't exist yet). Never recommend Western or globally popular music simply because it was popular in ${country} during that period — that is not authentic local music.
+
+HANDLING SPARSE RECORDING HISTORY (very common before the 1960s):
+If ${country} had little formal recorded output in the ${decade}, do NOT substitute Western music. Instead, choose one of these honest approaches:
+- Recommend traditional or folk music from that era — including ethnomusicological field recordings made of that tradition, even if recorded later
+- Recommend artists active in the region during that period whose recordings survive
+- Recommend modern artists from ${country} who authentically revive or perform music from that era
+Never fill the gap with internationally popular artists who happened to be famous globally in that decade.
+
+HANDLING COUNTRY EXISTENCE ISSUES:
+- Country didn't yet exist in the ${decade} (e.g. Zimbabwe didn't exist until 1980): use the predecessor territory's people and musical culture of that period. Be historically precise.
+- Country ceased to exist before the ${decade} (e.g. Rhodesia + 2000s, Rhodesia became Zimbabwe in 1980): spotlight the living successor tradition, diaspora artists, or revival recordings honestly.
+- Country existed but had almost no recording industry: apply the sparse recording history rules above.
+
+HISTORICAL/DEFUNCT CIVILIZATIONS (Byzantine Empire, Ottoman Empire, Ancient Rome, etc.):
+- If the decade falls within that civilization's existence → authentic music of that era.
+- If the decade is after the civilization ended → scholarly recordings of that tradition, ethnomusicological field recordings, or modern artists from the successor region who revive that specific tradition. Be geographically and culturally precise — not just any music from the broader region.
+
+Always find a real, honest musical angle rooted in the actual people and culture of ${country}.
 
 Return exactly this JSON:
 {
@@ -1574,7 +1680,7 @@ Return exactly this JSON:
     { "title": "track title", "artist": "artist name" }
   ]
 }
-Include exactly 8 tracks emblematic of this genre/connection. Prioritize real historical significance and discoverability on streaming platforms.`,
+Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${country} or its predecessor region. Prioritize discoverability on major streaming platforms.`,
         }],
       }),
     });
