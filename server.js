@@ -2998,6 +2998,13 @@ app.get("/api/enrich", async (req, res) => {
     const enrichResult = await processEnrichmentBatch(batchSize);
     console.log(`[enrich] batch complete → ${enrichResult.processed}/${enrichResult.total} enriched`);
 
+    // Purge expired cache rows
+    const { count: purged } = await supabase
+      .from("recommendation_cache")
+      .delete()
+      .lt("expires_at", new Date().toISOString());
+    if (purged) console.log(`[enrich] purged ${purged} expired cache rows`);
+
     let flagResult = { reviewed: 0, fixed: 0, skipped: skipFlagReview };
     if (!skipFlagReview) {
       // Run flag review after enrichment. Max 2 contexts per cron run to
@@ -3005,7 +3012,7 @@ app.get("/api/enrich", async (req, res) => {
       flagResult = await processFlaggedTracks(2);
     }
 
-    res.json({ enrich: enrichResult, flagReview: flagResult });
+    res.json({ enrich: enrichResult, flagReview: flagResult, purged: purged ?? 0 });
   } catch (err) {
     console.error("[enrich] batch error:", err.message);
     res.status(500).json({ error: err.message });
