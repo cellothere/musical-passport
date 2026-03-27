@@ -880,6 +880,7 @@ async function discogsTracksForCountryDecade(country, decade) {
         const releaseArtist = (masterData.artists || []).map(a => a.name).join(", ")
           || master.title.split(" - ")[0]?.trim()
           || "Unknown";
+        console.log(`[Discogs] Master: "${masterData.title}" by ${releaseArtist} (id:${master.id}, year:${masterData.year})`);
         for (const track of (masterData.tracklist || []).slice(0, 4)) {
           if (!track.title || track.type_ === "heading") continue;
           // Some tracks have their own artist credits
@@ -887,6 +888,7 @@ async function discogsTracksForCountryDecade(country, decade) {
             ? track.artists.map(a => a.name).join(", ")
             : releaseArtist;
           tracks.push({ title: track.title, artist: trackArtist });
+          console.log(`[Discogs]   → "${track.title}" by ${trackArtist}`);
         }
       } catch { continue; }
     }
@@ -1491,7 +1493,7 @@ async function resolveRealTracks(sourceTracks, country, decade, service, apiKey,
       model: "claude-sonnet-4-20250514",
       max_tokens: 300,
       system: "You are a world music historian. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
-      messages: [{ role: "user", content: `These are real recordings from ${country} in the ${decade}:\n${trackList}\n\nReturn JSON: {"genre": "the dominant genre or style that connects these tracks (be specific)", "picks": ["track title 1", "track title 2", "track title 3", "track title 4", "track title 5", "track title 6", "track title 7", "track title 8"]} — pick the 8 most representative tracks from the list above.` }],
+      messages: [{ role: "user", content: `These recordings were found in music databases for ${country} in the ${decade}. Many are FALSE POSITIVES — international releases that were pressed or distributed in ${country} but are by artists from other countries.\n\n${trackList}\n\nReturn JSON: {"genre": "the dominant genre or style (be specific, name the actual local genre)", "picks": ["track title 1", "track title 2", ...]} — pick ONLY tracks by artists who were BORN IN or FORMED IN ${country}. Rules:\n1. HARD REJECT: any artist you know to be from a different country, even if they were popular in ${country}. When in doubt, reject.\n2. MAX 2 tracks per artist — the picks must span multiple different artists.\n3. Return only what you are confident about. If you cannot find 3+ authentic local artists in this list, return an empty picks array rather than guessing.` }],
     }),
   });
   const genreData = await genreResponse.json();
@@ -1500,8 +1502,19 @@ async function resolveRealTracks(sourceTracks, country, decade, service, apiKey,
   const genreRaw = (genreData.content[0].text || "").replace(/```json|```/g, "").trim();
   const genreParsed = JSON.parse(genreRaw);
   const pickedTitles = new Set((genreParsed.picks || []).map(t => t.toLowerCase()));
-  const pickedTracks = sourceTracks.filter(t => pickedTitles.has(t.title.toLowerCase())).slice(0, 8);
-  const tracksToSearch = pickedTracks.length >= 5 ? pickedTracks : sourceTracks.slice(0, 8);
+  const pickedTracksRaw = sourceTracks.filter(t => pickedTitles.has(t.title.toLowerCase()));
+  // Enforce max 2 tracks per artist
+  const artistCount = new Map();
+  const pickedTracks = pickedTracksRaw.filter(t => {
+    const key = t.artist.toLowerCase();
+    const count = artistCount.get(key) || 0;
+    if (count >= 2) return false;
+    artistCount.set(key, count + 1);
+    return true;
+  }).slice(0, 8);
+  // Always use Claude's picks — never fall back to raw sourceTracks which has no artist diversity.
+  // If Claude found zero authentic picks, there's nothing valid to search.
+  const tracksToSearch = pickedTracks;
 
   let validTracks;
   if (service === "apple-music") {
@@ -1517,7 +1530,14 @@ async function resolveRealTracks(sourceTracks, country, decade, service, apiKey,
                  : { ...track, appleId: null };
       } catch { return { ...track, appleId: null }; }
     }));
-    validTracks = results.filter(t => t.appleId).slice(0, 5);
+    const appleArtistCount = new Map();
+    validTracks = results.filter(t => t.appleId).filter(t => {
+      const key = t.artist.toLowerCase();
+      const count = appleArtistCount.get(key) || 0;
+      if (count >= 2) return false;
+      appleArtistCount.set(key, count + 1);
+      return true;
+    }).slice(0, 5);
   } else {
     const accessToken = await getClientAccessToken();
     const results = await Promise.all(tracksToSearch.map(async (track) => {
@@ -1531,11 +1551,42 @@ async function resolveRealTracks(sourceTracks, country, decade, service, apiKey,
                      : { ...track, spotifyId: null };
       } catch { return { ...track, spotifyId: null }; }
     }));
-    validTracks = results.filter(t => t.spotifyId).slice(0, 5);
+    const spotifyArtistCount = new Map();
+    validTracks = results.filter(t => t.spotifyId).filter(t => {
+      const key = t.artist.toLowerCase();
+      const count = spotifyArtistCount.get(key) || 0;
+      if (count >= 2) return false;
+      spotifyArtistCount.set(key, count + 1);
+      return true;
+    }).slice(0, 5);
   }
 
-  if (validTracks.length < 3) return null;
-  return { genre: genreParsed.genre, tracks: validTracks, source };
+  const missedTracks = tracksToSearch.filter(t => {
+    return !validTracks.find(v => v.title === t.title && v.artist === t.artist);
+  });
+  if (missedTracks.length > 0) {
+    console.log(`[${source}] Not found on ${service}: ${missedTracks.map(t => `"${t.title}" by ${t.artist}`).join(", ")}`);
+  }
+  if (validTracks.length >= 3) {
+    return { genre: genreParsed.genre, tracks: validTracks, source };
+  }
+
+  // Streaming verification failed but Claude authenticated real picks from a trusted source.
+  // Return tracks without streaming IDs — the mobile app renders them with a disabled play button.
+  if (pickedTracks.length >= 3) {
+    console.log(`[${source}] Streaming not available for ${pickedTracks.length} authentic tracks — returning without streaming IDs`);
+    const unverifiedTracks = pickedTracks.map(t => ({
+      ...t,
+      appleId: null,
+      spotifyId: null,
+      previewUrl: null,
+      spotifyUrl: null,
+      embedUrl: null,
+    }));
+    return { genre: genreParsed.genre, tracks: unverifiedTracks, source };
+  }
+
+  return null;
 }
 
 // ── Time Machine endpoint ────────────────────────────────
@@ -1579,17 +1630,20 @@ app.post("/api/time-machine", async (req, res) => {
     }
 
     // ── 2. MusicBrainz recordings (strong for historical, fills LB gaps) ──
-    // Filter by artist origin to avoid release-country false positives (e.g. Western
-    // albums pressed for USSR distribution showing up for Uzbekistan, Kazakhstan, etc.)
+    // MB queries by release country, which returns Western albums pressed on local labels —
+    // always filter by artist origin before using results anywhere (including the merged pool).
     let mbTracks = [];
+    let mbFiltered = [];
     if (isoCode) {
       console.log(`[MB] Fetching recordings for ${country} (${isoCode}) ${decade}`);
       mbTracks = await mbRecordingsForCountryDecade(isoCode, decade);
       console.log(`[MB] Got ${mbTracks.length} recordings`);
+      if (mbTracks.length > 0) {
+        mbFiltered = await filterTracksByArtistOrigin(mbTracks, isoCode);
+        console.log(`[MB] ${mbTracks.length} → ${mbFiltered.length} after origin filter`);
+      }
     }
-    if (mbTracks.length >= 8) {
-      const mbFiltered = await filterTracksByArtistOrigin(mbTracks, isoCode);
-      console.log(`[MB] ${mbTracks.length} → ${mbFiltered.length} after origin filter`);
+    if (mbFiltered.length >= 5) {
       const resolved = await resolveRealTracks(mbFiltered, country, decade, service, apiKey, "musicbrainz");
       if (resolved) {
         const tmResult = { country, decade, ...resolved };
@@ -1615,9 +1669,9 @@ app.post("/api/time-machine", async (req, res) => {
     }
 
     // ── 4. Merge all three sources and try again ──
-    // Handles cases where each individual source has partial coverage.
+    // Uses mbFiltered (origin-verified) not raw mbTracks to keep Western false-positives out.
     const seen = new Set();
-    const mergedTracks = [...lbTracks, ...mbTracks, ...discogsTracks].filter(t => {
+    const mergedTracks = [...lbTracks, ...mbFiltered, ...discogsTracks].filter(t => {
       const key = `${t.title.toLowerCase()}||${t.artist.toLowerCase()}`;
       if (seen.has(key)) return false;
       seen.add(key);
@@ -1636,8 +1690,19 @@ app.post("/api/time-machine", async (req, res) => {
 
     console.log(`[time-machine] All real sources exhausted for ${country} ${decade}, falling back to Claude`);
 
+    // Build context from all real tracks found — even those that didn't land on streaming.
+    // This anchors Claude to artists we know are genuinely from this country/decade.
+    const allRealTracks = [...lbTracks, ...mbTracks, ...discogsTracks];
+    const seenArtists = new Set();
+    const knownArtists = allRealTracks
+      .filter(t => { if (seenArtists.has(t.artist)) return false; seenArtists.add(t.artist); return true; })
+      .slice(0, 15)
+      .map(t => `- ${t.artist} ("${t.title}")`);
+    const knownArtistContext = knownArtists.length > 0
+      ? `\n\nKNOWN REAL ARTISTS FROM ${country.toUpperCase()} IN THE ${decade} (verified from MusicBrainz, ListenBrainz, and Discogs):\n${knownArtists.join("\n")}\nPrioritize these artists. You may supplement with additional artists you know to be genuinely from ${country}, but every artist must be from ${country} or its predecessor region.`
+      : "";
+
     // ── Fallback: Claude picks all tracks ──
-    // Ask Claude for a genre spotlight + 5 track recommendations
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -1671,7 +1736,7 @@ HISTORICAL/DEFUNCT CIVILIZATIONS (Byzantine Empire, Ottoman Empire, Ancient Rome
 - If the decade falls within that civilization's existence → authentic music of that era.
 - If the decade is after the civilization ended → scholarly recordings of that tradition, ethnomusicological field recordings, or modern artists from the successor region who revive that specific tradition. Be geographically and culturally precise — not just any music from the broader region.
 
-Always find a real, honest musical angle rooted in the actual people and culture of ${country}.
+Always find a real, honest musical angle rooted in the actual people and culture of ${country}.${knownArtistContext}
 
 Return exactly this JSON:
 {
@@ -1680,7 +1745,7 @@ Return exactly this JSON:
     { "title": "track title", "artist": "artist name" }
   ]
 }
-Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${country} or its predecessor region. Prioritize discoverability on major streaming platforms.`,
+Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${country} or its predecessor region. MAX 2 tracks per artist — the list must span at least 4 different artists. Prioritize discoverability on major streaming platforms.`,
         }],
       }),
     });
@@ -1730,7 +1795,14 @@ Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${cou
           }
         })
       );
-      validTracks = tracksWithIds.filter(t => t.appleId).slice(0, 5);
+      const appleArtistCount2 = new Map();
+      validTracks = tracksWithIds.filter(t => t.appleId).filter(t => {
+        const k = t.artist.toLowerCase();
+        const n = appleArtistCount2.get(k) || 0;
+        if (n >= 2) return false;
+        appleArtistCount2.set(k, n + 1);
+        return true;
+      }).slice(0, 5);
     } else {
       // Spotify: two-pass search
       const accessToken = await getClientAccessToken();
@@ -1764,7 +1836,14 @@ Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${cou
           }
         })
       );
-      validTracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
+      const spotifyArtistCount2 = new Map();
+      validTracks = tracksWithIds.filter(t => t.spotifyId).filter(t => {
+        const k = t.artist.toLowerCase();
+        const n = spotifyArtistCount2.get(k) || 0;
+        if (n >= 2) return false;
+        spotifyArtistCount2.set(k, n + 1);
+        return true;
+      }).slice(0, 5);
     }
 
     const tmResult = { country, decade, genre: spotlight.genre, tracks: validTracks };
