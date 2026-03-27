@@ -283,10 +283,18 @@ async function getCached(cacheKey) {
   return data;
 }
 
+const CACHE_TTL = {
+  'recommend':       7  * 24 * 60 * 60 * 1000,
+  'genre-spotlight': 30 * 24 * 60 * 60 * 1000,
+  'time-machine':    14 * 24 * 60 * 60 * 1000,
+};
+
 async function storeCache(cacheKey, endpoint, result, artistPool = null) {
   if (!supabase) return;
+  const ttlMs = CACHE_TTL[endpoint];
+  const expires_at = ttlMs ? new Date(Date.now() + ttlMs).toISOString() : null;
   await supabase.from("recommendation_cache").upsert(
-    { cache_key: cacheKey, endpoint, result, artist_pool: artistPool },
+    { cache_key: cacheKey, endpoint, result, artist_pool: artistPool, expires_at },
     { onConflict: "cache_key" }
   );
 }
@@ -2341,23 +2349,45 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
   if (!token) return res.status(503).json({ error: "Apple Music not configured." });
 
   try {
-    const r = await fetch(
-      `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=songs&limit=5`,
+    // Step 1: search for the artist by name
+    const artistSearch = await fetch(
+      `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
-    if (!r.ok) return res.json({ tracks: [] });
-    const data = await r.json();
-    const songs = (data.results?.songs?.data || []).slice(0, 3);
-    const tracks = songs.map(s => ({
-      title:      s.attributes.name,
-      artist:     s.attributes.artistName,
-      appleId:    s.id,
-      previewUrl: s.attributes.previews?.[0]?.url || null,
-      embedUrl:   s.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
-    }));
+    if (!artistSearch.ok) return res.json({ tracks: [] });
+    const artistData = await artistSearch.json();
+    const artists = artistData.results?.artists?.data || [];
+
+    // Find the best-matching artist (name must closely match)
+    const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const target = normalise(artistName);
+    const matchedArtist = artists.find(a => normalise(a.attributes?.name || "") === target)
+      ?? artists.find(a => normalise(a.attributes?.name || "").includes(target) || target.includes(normalise(a.attributes?.name || "")));
+
+    let tracks = [];
+    if (matchedArtist) {
+      // Step 2: fetch top songs for the matched artist
+      const artistId = matchedArtist.id;
+      const songsRes = await fetch(
+        `https://api.music.apple.com/v1/catalog/us/artists/${artistId}/view/top-songs?limit=5`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (songsRes.ok) {
+        const songsData = await songsRes.json();
+        const songs = (songsData.data || []).slice(0, 3);
+        tracks = songs.map(s => ({
+          title:      s.attributes.name,
+          artist:     s.attributes.artistName,
+          appleId:    s.id,
+          previewUrl: s.attributes.previews?.[0]?.url || null,
+          embedUrl:   s.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
+        }));
+      }
+    }
+
     artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
     storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
-    console.log(`  [artist-tracks-apple] cached ${tracks.length} tracks → ${artistName}`);
+    console.log(`  [artist-tracks-apple] cached ${tracks.length} tracks → ${artistName}${matchedArtist ? "" : " (artist not found)"}`);
     res.json({ tracks });
   } catch (err) {
     res.status(500).json({ error: err.message });
