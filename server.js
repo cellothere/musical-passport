@@ -304,6 +304,89 @@ async function storeCache(cacheKey, endpoint, result, artistPool = null) {
   );
 }
 
+// Remove artists from a pool whose artist-tracks cache is flagged empty.
+async function filterOutFlaggedArtists(artistPool) {
+  if (!supabase || !artistPool?.length) return artistPool || [];
+  const slugs = artistPool.map(a => makeCacheKey(["artist-tracks-apple", a.name]));
+  const { data } = await supabase
+    .from("recommendation_cache")
+    .select("cache_key, result")
+    .in("cache_key", slugs);
+  const flaggedKeys = new Set(
+    (data || []).filter(r => r.result?.flagged && r.result?.tracks?.length === 0).map(r => r.cache_key)
+  );
+  return artistPool.filter(a => !flaggedKeys.has(makeCacheKey(["artist-tracks-apple", a.name])));
+}
+
+// For each artist in a fresh Claude recommendation, verify they have playable tracks.
+// Checks Apple Music + Spotify + LB in parallel and caches results immediately.
+// Returns only artists that have at least 1 track.
+async function verifyArtistTracksForRecommend(artists, country) {
+  const appleToken = generateAppleMusicToken();
+  const results = await Promise.all(artists.map(async (artist) => {
+    const cacheKey = makeCacheKey(["artist-tracks-apple", artist.name]);
+
+    // Skip verification if already cached with real tracks
+    const existing = artistTracksMemCache.get(cacheKey);
+    if (existing && existing.tracks.length > 0) return { artist, tracks: existing.tracks };
+    const dbCached = await getCached(cacheKey);
+    if (dbCached?.result?.tracks?.length > 0) return { artist, tracks: dbCached.result.tracks };
+
+    // Try Apple Music → LB
+    const tracks = await proactiveArtistTracks(artist.name, [], appleToken);
+
+    if (tracks.length > 0) {
+      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
+    } else {
+      // Also try Spotify before giving up
+      const spotifyTracks = await spotifyEnqueue(async () => {
+        const token = await getClientAccessToken();
+        if (!token) return [];
+        const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+        const target = norm(artist.name);
+        const r = await spotifyFetch(
+          `https://api.spotify.com/v1/search?q=${encodeURIComponent(artist.name)}&type=artist&limit=5&market=US`,
+          { headers: { Authorization: "Bearer " + token } }
+        );
+        if (!r.ok) return [];
+        const d = await r.json();
+        const matched = (d.artists?.items || []).find(a => {
+          const n = norm(a.name);
+          return n === target || n.includes(target) || target.includes(n);
+        });
+        if (!matched) return [];
+        const tr = await spotifyFetch(
+          `https://api.spotify.com/v1/artists/${matched.id}/top-tracks?market=US`,
+          { headers: { Authorization: "Bearer " + token } }
+        );
+        if (!tr.ok) return [];
+        const td = await tr.json();
+        return (td.tracks || []).slice(0, 3).map(t => ({
+          title: t.name, spotifyId: t.id, previewUrl: t.preview_url || null,
+          spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+        }));
+      });
+
+      if (spotifyTracks.length > 0) {
+        const spKey = makeCacheKey(["artist-tracks", artist.name]);
+        artistTracksMemCache.set(spKey, { tracks: spotifyTracks, cachedAt: Date.now() });
+        storeCache(spKey, "artist-tracks", { tracks: spotifyTracks }).catch(() => {});
+        return { artist, tracks: spotifyTracks };
+      }
+
+      // Genuinely no tracks — flag it
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: [], flagged: true }).catch(() => {});
+      console.log(`  [recommend-verify] no tracks for "${artist.name}" (${country}) — flagged`);
+      return { artist, tracks: [] };
+    }
+
+    return { artist, tracks };
+  }));
+
+  return results.filter(r => r.tracks.length > 0).map(r => r.artist);
+}
+
 // ── Flag review ───────────────────────────────────────────
 
 /**
@@ -1312,11 +1395,17 @@ app.post("/api/recommend", async (req, res) => {
     const cached = await getCached(cacheKey);
     if (cached && cached.artist_pool && cached.artist_pool.length >= 4) {
       console.log(`[recommend] cache hit (anon) → ${country}`);
-      return res.json({
-        genres: cached.result.genres,
-        artists: pickDiverseByEra(cached.artist_pool, 4),
-        didYouKnow: cached.result.didYouKnow,
-      });
+      // Filter out artists whose track cache is flagged empty so users never see them
+      const pool = await filterOutFlaggedArtists(cached.artist_pool);
+      if (pool.length >= 4) {
+        return res.json({
+          genres: cached.result.genres,
+          artists: pickDiverseByEra(pool, 4),
+          didYouKnow: cached.result.didYouKnow,
+        });
+      }
+      // Too many flagged — fall through to regenerate
+      console.log(`[recommend] pool shrank to ${pool.length} after filtering flagged — regenerating`);
     }
   }
 
@@ -1338,11 +1427,15 @@ app.post("/api/recommend", async (req, res) => {
       const personalCached = await getCached(personalKey);
       if (personalCached && personalCached.artist_pool && personalCached.artist_pool.length >= 4) {
         console.log(`[recommend] cache hit (user:${userId}) → ${country}`);
-        return res.json({
-          genres: personalCached.result.genres,
-          artists: pickDiverseByEra(personalCached.artist_pool, 4),
-          didYouKnow: personalCached.result.didYouKnow,
-        });
+        const pool = await filterOutFlaggedArtists(personalCached.artist_pool);
+        if (pool.length >= 4) {
+          return res.json({
+            genres: personalCached.result.genres,
+            artists: pickDiverseByEra(pool, 4),
+            didYouKnow: personalCached.result.didYouKnow,
+          });
+        }
+        console.log(`[recommend] personal pool shrank to ${pool.length} — regenerating`);
       }
     }
   }
@@ -1474,27 +1567,31 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
       .trim();
     const rec = JSON.parse(raw);
 
-    const keysToVerify = [];
+    console.log(`[recommend] Claude → ${country} (${rec.artists.length} artists, ${rec.genres.length} genres)`);
+
+    // Verify all artists have playable tracks before storing — run in parallel
+    const verifiedPool = await verifyArtistTracksForRecommend(rec.artists, country);
+    console.log(`[recommend] verified ${verifiedPool.length}/${rec.artists.length} artists have tracks for ${country}`);
+
+    // Use verified pool if large enough, otherwise fall back to full Claude pool
+    // (better to show something than nothing while cron fixes it)
+    const artistPool = verifiedPool.length >= 4 ? verifiedPool : rec.artists;
+
     if (accessToken && userId) {
       const personalKey = makeCacheKey(["recommend", userId, country]);
-      await storeCache(personalKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
-      keysToVerify.push(personalKey);
+      await storeCache(personalKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
+      verifyArtistPoolWithMB(artistPool, country, [personalKey]).catch(() => {});
     } else if (!accessToken) {
       const cacheKey = makeCacheKey(["recommend", country]);
-      await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, rec.artists);
-      keysToVerify.push(cacheKey);
+      await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
+      verifyArtistPoolWithMB(artistPool, country, [cacheKey]).catch(() => {});
     }
 
-    console.log(`[recommend] Claude → ${country} (${rec.artists.length} artists, ${rec.genres.length} genres)`);
-    res.json({ genres: rec.genres, artists: pickDiverseByEra(rec.artists, 4), didYouKnow: rec.didYouKnow });
+    res.json({ genres: rec.genres, artists: pickDiverseByEra(artistPool, 4), didYouKnow: rec.didYouKnow });
 
-    // Background: verify artist origins via MusicBrainz, update cache for next request
-    if (keysToVerify.length) {
-      verifyArtistPoolWithMB(rec.artists, country, keysToVerify).catch(() => {});
-    }
-
-    // Background: queue all artists for track enrichment
-    addToEnrichmentQueue(rec.artists, country).catch(() => {});
+    // Queue any unverified artists for deep enrich in background
+    const unverified = rec.artists.filter(a => !verifiedPool.find(v => v.name === a.name));
+    if (unverified.length) addToEnrichmentQueue(unverified, country).catch(() => {});
   } catch (err) {
     console.error("Error:", err);
     res.status(500).json({ error: err.message });
