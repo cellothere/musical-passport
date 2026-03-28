@@ -2329,10 +2329,10 @@ app.post("/api/genre-deeper", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
 
-  const { genre, country, service = "spotify" } = req.body;
+  const { genre, country, service = "spotify", visited = [] } = req.body;
   if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
 
-  const cacheKey = makeCacheKey(["genre-deeper", genre, country]);
+  const cacheKey = makeCacheKey(["genre-deeper", genre, country, ...(visited.length ? [visited.slice().sort().join(",")] : [])]);
   const cached = await getCached(cacheKey);
   if (cached) {
     console.log(`[genre-deeper] cache hit → ${genre} / ${country}`);
@@ -2354,6 +2354,7 @@ app.post("/api/genre-deeper", async (req, res) => {
         messages: [{
           role: "user",
           content: `A listener just explored "${genre}" from ${country} and wants to discover something new.
+${visited.length > 0 ? `\nGenres already visited in this session (DO NOT suggest any of these or anything that is essentially the same genre under a different name): ${visited.map(g => `"${g}"`).join(", ")}\n` : ""}
 
 Suggest ONE genre for them to explore next. Good moves include:
 - A more specific subgenre (e.g. Rock → Shoegaze, Soul → Southern Soul)
