@@ -2353,23 +2353,26 @@ app.post("/api/genre-deeper", async (req, res) => {
         system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks.",
         messages: [{
           role: "user",
-          content: `A listener is exploring "${genre}" from ${country} and wants to go deeper into the rabbit hole.
+          content: `A listener just explored "${genre}" from ${country} and wants to discover something new.
 
-Suggest ONE more specific, niche subgenre they should discover next.
+Suggest ONE genre for them to explore next. Good moves include:
+- A more specific subgenre (e.g. Rock → Shoegaze, Soul → Southern Soul)
+- A closely related genre that shares roots, era, or audience (e.g. Reggae → Dub, Highlife → Jùjú)
+- A regional or diaspora variant with a strong scene in a different country
 
 Rules:
-- The result MUST be a direct descendant or regional variant of "${genre}" — do NOT suggest a loosely related genre. A listener of Highlife should get Burger Highlife or Afro-Highlife, NOT Afrobeats. A listener of Flamenco should get Flamenco Nuevo or Palos Flamencos, NOT Latin Jazz.
-- Must be MORE specific/niche than "${genre}" — not the same genre with different words
-- Stay within the same genre family. Only suggest something from outside the family if "${genre}" is already extremely niche with no meaningful subgenres left.
-- If the deeper subgenre has a stronger home in a different country (e.g. a diaspora variation), return THAT country — but the genre must still be a variation of "${genre}"
-- The subgenre name must be specific enough to find real tracks (e.g. "Berlin Minimal Techno" not "Techno", "Shōwa-era Kayōkyoku" not "Japanese Pop")
+- MOST IMPORTANT: The suggestion must be MEANINGFULLY DIFFERENT from "${genre}" — not the same genre under a different name or label. Example failures: suggesting "Copperbelt Rock" when the input is "Zamrock", suggesting "Afro-Pop" when the input is "Afrobeats". The listener should feel like they are stepping somewhere genuinely new.
+- Must be a real genre with a genuine music scene and real recordings — not an invented mashup of words
+- Prefer genres that have actual tracks available on Spotify, Apple Music, or YouTube
+- If "${genre}" is already extremely niche with no meaningful subgenres, suggest a related sibling or parent genre instead — do NOT suggest a synonym or rename
+- Be specific enough to find real tracks (e.g. "Desert Blues" not "African Blues", "Lovers Rock" not "Reggae Pop")
 - Keep the reason to one engaging sentence that makes the listener excited to explore
 
 Return exactly:
 {
-  "genre": "specific subgenre name",
-  "country": "best country for this subgenre",
-  "reason": "one sentence explaining why this is the next step deeper"
+  "genre": "specific genre name",
+  "country": "best country for this genre",
+  "reason": "one sentence explaining why this is a great next discovery"
 }`,
         }],
       }),
