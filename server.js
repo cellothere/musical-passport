@@ -3037,6 +3037,21 @@ app.get("/api/country-of-day", async (req, res) => {
   res.json({ date: dateStr, country });
 });
 
+// Returns the next N days of country-of-day entries, creating any that don't exist yet.
+// Used by the mobile app to pre-schedule accurate push notifications.
+app.get("/api/country-of-day/upcoming", async (req, res) => {
+  const days = Math.min(parseInt(req.query.days || "7", 10), 30);
+  const results = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    const dateStr = d.toISOString().slice(0, 10);
+    const country = await getOrCreateCountryOfDay(dateStr);
+    results.push({ date: dateStr, country });
+  }
+  res.json(results);
+});
+
 app.post("/api/country-of-day/hit", async (req, res) => {
   if (!supabase) return res.json({ ok: true });
   const { date } = req.body;
