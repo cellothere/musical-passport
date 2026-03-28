@@ -2108,14 +2108,14 @@ app.post("/api/genre-spotlight", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 800,
+        max_tokens: 1000,
         system: `You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.
 CRITICAL RULE: Every artist you recommend MUST be a native artist FROM the specified country. Never include an artist from another country, even if they recorded songs in that genre. If you are not certain an artist is from ${country}, do not include them. It is better to return fewer tracks than to include an artist from the wrong country.`,
         messages: [{
           role: "user",
           content: `Give a short spotlight on the genre "${genre}" as it originated and developed in "${country}".
 
-STRICT REQUIREMENT: Every track must be by an artist who was born in or is from ${country}. Do NOT include any artist from another country, regardless of how famous they are or how well they fit the genre. If ${country} has a small or limited scene for this genre, return only as many tracks as genuinely exist — returning 1 or 2 tracks (or even an empty list) is far better than including foreign artists to fill a quota.
+STRICT REQUIREMENT: Every track and every artist must be from ${country}. Do NOT include any artist from another country, regardless of how famous they are or how well they fit the genre. If ${country} has a small or limited scene for this genre, return only as many as genuinely exist.
 
 When the local scene is small, use the explanation to honestly describe the country's relationship to the genre — its influences, radio history, or cultural context — rather than pretending it has more local artists than it does.
 
@@ -2124,9 +2124,11 @@ Return exactly this JSON:
   "explanation": "1 sentence: what defines this genre in ${country}, its roots, local context, and why it matters",
   "tracks": [
     { "title": "exact track title", "artist": "exact artist name" }
-  ]
+  ],
+  "artists": ["Artist Name 1", "Artist Name 2", "Artist Name 3"]
 }
-Include between 1 and 6 tracks — only genuine artists from ${country}. Use exact titles and artist names as they appear on streaming platforms.`,
+- "tracks": 1–6 specific tracks by artists from ${country}. Use exact titles and artist names as they appear on streaming platforms.
+- "artists": up to 6 key artists from ${country} known for this genre (may overlap with track artists). These are used as a fallback to discover more tracks on streaming platforms.`,
         }],
       }),
     });
@@ -2136,6 +2138,7 @@ Include between 1 and 6 tracks — only genuine artists from ${country}. Use exa
 
     const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
     const spotlight = JSON.parse(raw);
+    const suggestedArtists = spotlight.artists || [];
 
     // Search streaming catalog for each track
     let tracks;
@@ -2171,6 +2174,8 @@ Include between 1 and 6 tracks — only genuine artists from ${country}. Use exa
       tracks = tracksWithIds.filter(t => t.appleId).slice(0, 5);
     } else {
       const accessToken = await getClientAccessToken();
+
+      // Phase 1: search for each Claude-suggested track directly
       const tracksWithIds = await Promise.all(
         (spotlight.tracks || []).map(async (track) => {
           if (!accessToken) return { ...track, spotifyId: null };
@@ -2198,7 +2203,55 @@ Include between 1 and 6 tracks — only genuine artists from ${country}. Use exa
           } catch { return { ...track, spotifyId: null }; }
         })
       );
-      tracks = tracksWithIds.filter(t => t.spotifyId).slice(0, 5);
+      tracks = tracksWithIds.filter(t => t.spotifyId);
+
+      // Phase 2: if we have fewer than 4 tracks, search by artist name to fill gaps
+      if (tracks.length < 4 && accessToken && suggestedArtists.length > 0) {
+        console.log(`[genre-spotlight] only ${tracks.length} tracks found, trying artist-based fallback for ${suggestedArtists.length} artists`);
+        const seenIds = new Set(tracks.map(t => t.spotifyId));
+
+        const artistFallbackTracks = await Promise.all(
+          suggestedArtists.map(async (artistName) => {
+            try {
+              // Find the artist on Spotify
+              const ar = await fetch(
+                `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5&market=US`,
+                { headers: { Authorization: "Bearer " + accessToken } }
+              );
+              const ad = await ar.json();
+              const artist = (ad.artists?.items || []).find(a => artistNamesMatch(artistName, a.name));
+              if (!artist) return [];
+
+              // Get their top tracks
+              const tr = await fetch(
+                `https://api.spotify.com/v1/artists/${artist.id}/top-tracks?market=US`,
+                { headers: { Authorization: "Bearer " + accessToken } }
+              );
+              const td = await tr.json();
+              return (td.tracks || []).slice(0, 3).map(t => ({
+                title: t.name,
+                artist: t.artists?.[0]?.name || artistName,
+                spotifyId: t.id,
+                previewUrl: t.preview_url || null,
+                spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+              }));
+            } catch { return []; }
+          })
+        );
+
+        for (const artistTracks of artistFallbackTracks) {
+          for (const t of artistTracks) {
+            if (!seenIds.has(t.spotifyId)) {
+              seenIds.add(t.spotifyId);
+              tracks.push(t);
+            }
+          }
+          if (tracks.length >= 5) break;
+        }
+        console.log(`[genre-spotlight] after artist fallback: ${tracks.length} tracks`);
+      }
+
+      tracks = tracks.slice(0, 5);
     }
 
     const gsResult = { genre, country, explanation: spotlight.explanation, tracks };
