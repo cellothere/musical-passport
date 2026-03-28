@@ -286,10 +286,12 @@ async function getCached(cacheKey) {
 }
 
 const CACHE_TTL = {
-  'recommend':       7  * 24 * 60 * 60 * 1000,
-  'genre-spotlight': 30 * 24 * 60 * 60 * 1000,
-  'genre-deeper':    30 * 24 * 60 * 60 * 1000,
-  'time-machine':    14 * 24 * 60 * 60 * 1000,
+  'recommend':          7  * 24 * 60 * 60 * 1000,
+  'genre-spotlight':    30 * 24 * 60 * 60 * 1000,
+  'genre-deeper':       30 * 24 * 60 * 60 * 1000,
+  'time-machine':       14 * 24 * 60 * 60 * 1000,
+  'artist-tracks':      90 * 24 * 60 * 60 * 1000,
+  'artist-tracks-apple':90 * 24 * 60 * 60 * 1000,
 };
 
 async function storeCache(cacheKey, endpoint, result, artistPool = null) {
@@ -2155,62 +2157,59 @@ async function _fetchArtistTracksImpl(artistName) {
   try {
     console.log(`  Searching Spotify for: "${artistName}"`);
 
-    // Get client access token
     const accessToken = await getClientAccessToken();
     if (!accessToken) {
       console.error(`  Failed to get access token`);
       return [];
     }
 
-    // Single search call for both artist + tracks (halves Spotify API usage)
-    const searchResponse = await spotifyFetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist,track&limit=10&market=US`,
+    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const target = normalize(artistName);
+
+    // Step 1: search for the artist by name and verify it matches
+    const artistSearch = await spotifyFetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5&market=US`,
       { headers: { Authorization: "Bearer " + accessToken } }
     );
 
-    console.log(`  Search response status: ${searchResponse.status}`);
-
-    if (!searchResponse.ok) {
-      console.error(`  Spotify search failed: ${searchResponse.status} ${searchResponse.statusText}`);
-      return [];
-    }
-
-    const searchData = await searchResponse.json();
-
-    if (searchData.error) {
-      console.error(`  Spotify API error:`, searchData.error);
-      return [];
-    }
-
-    if (!searchData.artists?.items?.length) {
-      console.log(`  No artists found for "${artistName}" on Spotify → trying ListenBrainz`);
+    if (!artistSearch.ok) {
+      console.error(`  Spotify artist search failed: ${artistSearch.status}`);
       return fetchArtistTracksFromLB(artistName);
     }
 
-    const foundName = searchData.artists.items[0].name;
-    console.log(`  Found artist: "${foundName}"`);
+    const artistData = await artistSearch.json();
+    const artists = artistData.artists?.items || [];
 
-    const allTracks = searchData.tracks?.items || [];
-    console.log(`  Found ${allTracks.length} tracks via search`);
-
-    // Filter to tracks where at least one credited artist matches the searched name
-    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const searchedNorm = normalize(foundName);
-    const matched = allTracks.filter(track =>
-      track.artists.some(a => {
+    // Require the artist name to actually match — prevents "Oraz Tagan" matching Polish children's music
+    const matchedArtist = artists.find(a => normalize(a.name) === target)
+      ?? artists.find(a => {
         const n = normalize(a.name);
-        return n.includes(searchedNorm) || searchedNorm.includes(n);
-      })
+        return n.includes(target) || target.includes(n);
+      });
+
+    if (!matchedArtist) {
+      console.log(`  No matching artist found for "${artistName}" on Spotify → trying ListenBrainz`);
+      return fetchArtistTracksFromLB(artistName);
+    }
+
+    console.log(`  Found artist: "${matchedArtist.name}" (id: ${matchedArtist.id})`);
+
+    // Step 2: fetch top tracks for the verified artist ID
+    const topTracksRes = await spotifyFetch(
+      `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks?market=US`,
+      { headers: { Authorization: "Bearer " + accessToken } }
     );
 
-    const pool = matched.length >= 2 ? matched : allTracks;
-
-    let tracks = pool.slice(0, 3).map(track => ({
-      title: track.name,
-      spotifyId: track.id,
-      previewUrl: track.preview_url || null,
-      spotifyUrl: `https://open.spotify.com/track/${track.id}`,
-    }));
+    let tracks = [];
+    if (topTracksRes.ok) {
+      const topData = await topTracksRes.json();
+      tracks = (topData.tracks || []).slice(0, 3).map(track => ({
+        title: track.name,
+        spotifyId: track.id,
+        previewUrl: track.preview_url || null,
+        spotifyUrl: `https://open.spotify.com/track/${track.id}`,
+      }));
+    }
 
     // Fall back to ListenBrainz if Spotify returned nothing
     if (tracks.length === 0) {
