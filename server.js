@@ -1213,6 +1213,103 @@ async function lbPopularRecordingsByCountry(countryName, decade) {
   }
 }
 
+// Returns unique artists for a country from LB (no decade filter), sorted by total listen count.
+async function lbTopArtistsForCountry(countryName) {
+  const areaMbid = await getAreaMBID(countryName);
+  if (!areaMbid) return [];
+  try {
+    const r = await lbFetch("https://datasets.listenbrainz.org/popular-recordings-by-country/json", {
+      method: "POST",
+      body: JSON.stringify([{ "[area_mbid]": areaMbid }]),
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!r.ok) return [];
+    const data = await r.json();
+    // Aggregate listen counts per artist
+    const artistMap = new Map();
+    for (const rec of Array.isArray(data) ? data : []) {
+      const name = rec.artist_credit_name;
+      if (!name) continue;
+      const prev = artistMap.get(name) || { name, listenCount: 0 };
+      prev.listenCount += rec.listen_count || 0;
+      artistMap.set(name, prev);
+    }
+    const artists = [...artistMap.values()]
+      .sort((a, b) => b.listenCount - a.listenCount)
+      .slice(0, 40);
+    console.log(`[LB] ${artists.length} unique artists for "${countryName}"`);
+    return artists;
+  } catch (err) {
+    console.error(`[LB] lbTopArtistsForCountry error for "${countryName}":`, err.message);
+    return [];
+  }
+}
+
+// Returns artists MB has linked to a country/area, with genre tags for context.
+async function mbArtistsByCountry(country, isoCode) {
+  try {
+    const url = `${MB_BASE}/artist?query=area:${encodeURIComponent(country)}&limit=50&fmt=json`;
+    const r = await mbFetch(url);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return (d.artists || [])
+      .filter(a => (a.score || 0) >= 70 && (!a.country || a.country === isoCode))
+      .map(a => ({
+        name: a.name,
+        country: a.country || null,
+        tags: (a.tags || []).map(t => t.name).slice(0, 5),
+      }));
+  } catch (err) {
+    console.error(`[MB] mbArtistsByCountry error for "${country}":`, err.message);
+    return [];
+  }
+}
+
+// Cross-references LB and MB to build a pool of verified real artists for a country.
+// Artists in BOTH sources = high confidence. Single source = medium confidence.
+// Returns up to 20 artists sorted by confidence then listen count.
+async function buildRealArtistPool(country, isoCode) {
+  const [lbArtists, mbArtists] = await Promise.all([
+    lbTopArtistsForCountry(country),
+    mbArtistsByCountry(country, isoCode),
+  ]);
+
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const mbByNorm = new Map(mbArtists.map(a => [norm(a.name), a]));
+  const lbByNorm = new Map(lbArtists.map(a => [norm(a.name), a]));
+
+  const seen = new Set();
+  const pool = [];
+
+  // High confidence: artists in both LB and MB
+  for (const lbArtist of lbArtists) {
+    const key = norm(lbArtist.name);
+    if (seen.has(key)) continue;
+    if (mbByNorm.has(key)) {
+      seen.add(key);
+      pool.push({ name: lbArtist.name, confidence: "high", listenCount: lbArtist.listenCount, tags: mbByNorm.get(key).tags });
+    }
+  }
+  // Medium confidence: LB only
+  for (const lbArtist of lbArtists) {
+    const key = norm(lbArtist.name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pool.push({ name: lbArtist.name, confidence: "medium-lb", listenCount: lbArtist.listenCount, tags: [] });
+  }
+  // Medium confidence: MB only
+  for (const mbArtist of mbArtists) {
+    const key = norm(mbArtist.name);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pool.push({ name: mbArtist.name, confidence: "medium-mb", listenCount: 0, tags: mbArtist.tags });
+  }
+
+  const result = pool.slice(0, 20);
+  console.log(`[real-pool] ${country}: ${result.filter(a => a.confidence === "high").length} high-conf, ${result.filter(a => a.confidence !== "high").length} medium-conf artists`);
+  return result;
+}
+
 // Simple in-memory cache for artist MBIDs
 const mbidCache = new Map(); // artistName → { mbid, at }
 const MBID_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -1440,6 +1537,10 @@ app.post("/api/recommend", async (req, res) => {
     }
   }
 
+  // Kick off real-data pool lookup in parallel with Spotify personalization
+  const isoCode = COUNTRY_ISO[country];
+  const realPoolPromise = isoCode ? buildRealArtistPool(country, isoCode) : Promise.resolve([]);
+
   // Get user's top artists (with genres) and liked songs if authenticated
   let topArtists = [];
   let topGenreTags = [];
@@ -1508,6 +1609,14 @@ app.post("/api/recommend", async (req, res) => {
     ? `\n\nPersonalization context for this user:${artistNote}${genreNote}${songsNote}\nUse this to: (1) personalize the "similarTo" comparisons to artists and styles they will recognize, and (2) lean toward subgenres of ${country}'s music that share sonic DNA with their genre preferences above — prioritize styles they are most likely to enjoy.`
     : "";
 
+  // Await real artist pool (was running in parallel with Spotify fetch above)
+  const realPool = await realPoolPromise;
+  const realPoolNote = realPool.length > 0
+    ? `\n\nVERIFIED ARTISTS from MusicBrainz + ListenBrainz databases for ${country}:\n${
+        realPool.map(a => `- ${a.name}${a.confidence === "high" ? " [verified in both MB+LB]" : ""}${a.tags.length ? ` (${a.tags.slice(0, 3).join(", ")})` : ""}`).join("\n")
+      }\n\nThese artists are confirmed to be from ${country} by music databases. Your 12 artists MUST include as many of these as fit the era/genre mix. You may add artists NOT in this list only if you are certain they are from ${country} — and you must include their name exactly as known. Do NOT invent or misattribute artists.`
+    : "";
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -1546,7 +1655,7 @@ Return exactly this JSON:
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
 }
-era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.${personalizationNote}`,
+era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.${realPoolNote}${personalizationNote}`,
           },
         ],
       }),
