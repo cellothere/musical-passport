@@ -2780,10 +2780,10 @@ app.get("/api/find-artist", async (req, res) => {
     const token = await getClientAccessToken();
     if (!token) return res.status(503).json({ error: "Spotify unavailable." });
 
-    // Use the artist: field filter so Spotify searches artist names specifically,
-    // not track/album titles that happen to match the query.
+    // Plain query with type=artist — the artist: field filter is designed for track searches
+    // and silently returns 0 results for short/all-caps names (e.g. DMX, ABBA, MF DOOM).
     const r = await fetch(
-      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(q)}&type=artist&limit=5`,
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=artist&limit=5`,
       { headers: { Authorization: "Bearer " + token } }
     );
     const data = await r.json();
@@ -2840,7 +2840,7 @@ app.post("/api/similar-artists", async (req, res) => {
 
     // Step 1: Look up artist on Spotify for genres
     const artistSearch = await fetch(
-      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(artistName)}&type=artist&limit=5`,
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
       { headers: { Authorization: "Bearer " + token } }
     );
     const artistData = await artistSearch.json();
