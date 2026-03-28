@@ -3031,6 +3031,281 @@ async function getOrCreateCountryOfDay(dateStr) {
   return country;
 }
 
+// ── Country data enrichment ───────────────────────────────
+// Finds countries with missing or weak music data and proactively
+// researches and stores tracks so users never hit an empty screen.
+
+const ALL_ENRICHABLE_COUNTRIES = [
+  'Brazil','Japan','Nigeria','Cuba','Ethiopia','Colombia','Jamaica','Iran','Mali',
+  'South Korea','Portugal','Iceland','Greece','Algeria','India','Senegal','Vietnam',
+  'Argentina','Ghana','Turkey','Lebanon','Morocco','Peru','Georgia','Mongolia',
+  'Cambodia','Cape Verde','Trinidad & Tobago','Armenia','Azerbaijan','Laos',
+  'Papua New Guinea','Togo','Benin','Burkina Faso','Niger','Chad','Sudan','Eritrea',
+  'Djibouti','Somalia','Mozambique','Zambia','Malawi','Rwanda','Burundi','Uganda',
+  'Tanzania','Cameroon','Congo','DR Congo','Ivory Coast','Sierra Leone','Guinea',
+  'Guinea-Bissau','Gambia','Mauritania','Liberia','Equatorial Guinea','Gabon',
+  'Central African Republic','Angola','Namibia','Botswana','Zimbabwe','Lesotho',
+  'Eswatini','Madagascar','Comoros','Seychelles','Mauritius','Réunion',
+  'Kazakhstan','Uzbekistan','Turkmenistan','Tajikistan','Kyrgyzstan','Afghanistan',
+  'Pakistan','Bangladesh','Nepal','Sri Lanka','Myanmar','Thailand','Philippines',
+  'Indonesia','Malaysia','Brunei','East Timor','Papua New Guinea',
+  'Fiji','Tonga','Samoa','Vanuatu','Solomon Islands','Kiribati','Palau',
+  'Bolivia','Paraguay','Uruguay','Ecuador','Venezuela','Guyana','Suriname',
+  'Honduras','El Salvador','Guatemala','Nicaragua','Costa Rica','Panama',
+  'Dominican Republic','Haiti','Barbados','Trinidad & Tobago','Martinique','Guadeloupe',
+  'Tunisia','Libya','Egypt','Jordan','Iraq','Syria','Yemen','Oman','Kuwait',
+  'Qatar','Bahrain','UAE','Saudi Arabia','Palestine','Cyprus','Malta',
+  'Albania','Bosnia','North Macedonia','Kosovo','Moldova','Belarus',
+  'Latvia','Lithuania','Estonia','Slovenia','Croatia','Serbia','Montenegro',
+  'Slovakia','Czech Republic','Hungary','Romania','Bulgaria','Ukraine',
+  'New Zealand','Australia','Canada','Mexico',
+];
+
+async function findWeakCountries(limit = 2) {
+  if (!supabase) return ALL_ENRICHABLE_COUNTRIES.slice(0, limit);
+
+  // Get all existing recommend cache keys
+  const { data: cached } = await supabase
+    .from("recommendation_cache")
+    .select("cache_key")
+    .eq("endpoint", "recommend");
+
+  const cachedKeys = new Set((cached || []).map(r => r.cache_key));
+
+  // Countries with zero recommend data get highest priority
+  const uncached = ALL_ENRICHABLE_COUNTRIES.filter(
+    c => !cachedKeys.has(makeCacheKey(["recommend", c]))
+  );
+
+  if (uncached.length >= limit) {
+    return uncached.sort(() => Math.random() - 0.5).slice(0, limit);
+  }
+
+  // Among cached countries, find those where many artists failed enrichment
+  const { data: failed } = await supabase
+    .from("enrichment_queue")
+    .select("country")
+    .gte("attempts", 3)
+    .is("completed_at", null);
+
+  const failCounts = {};
+  for (const r of failed || []) {
+    failCounts[r.country] = (failCounts[r.country] || 0) + 1;
+  }
+
+  const weakCached = ALL_ENRICHABLE_COUNTRIES
+    .filter(c => cachedKeys.has(makeCacheKey(["recommend", c])) && (failCounts[c] || 0) >= 4)
+    .sort((a, b) => (failCounts[b] || 0) - (failCounts[a] || 0));
+
+  return [...uncached, ...weakCached].slice(0, limit);
+}
+
+// Fetch tracks for one artist using Apple Music (2-step: artist search → top songs)
+// Falls back to ListenBrainz if Apple Music doesn't carry the artist.
+async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
+  const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const target = normalise(artistName);
+
+  // 1. Apple Music: search for the artist
+  if (appleToken) {
+    try {
+      const r = await fetch(
+        `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
+        { headers: { Authorization: `Bearer ${appleToken}` } }
+      );
+      if (r.ok) {
+        const d = await r.json();
+        const artists = d.results?.artists?.data || [];
+        const matched = artists.find(a => normalise(a.attributes?.name || "") === target)
+          ?? artists.find(a => {
+            const n = normalise(a.attributes?.name || "");
+            return n.includes(target) || target.includes(n);
+          });
+
+        if (matched) {
+          const songsRes = await fetch(
+            `https://api.music.apple.com/v1/catalog/us/artists/${matched.id}/view/top-songs?limit=5`,
+            { headers: { Authorization: `Bearer ${appleToken}` } }
+          );
+          if (songsRes.ok) {
+            const sd = await songsRes.json();
+            const songs = sd.data || [];
+            if (songs.length > 0) {
+              return songs.slice(0, 3).map(s => ({
+                title: s.attributes.name,
+                artist: s.attributes.artistName,
+                appleId: s.id,
+                previewUrl: s.attributes.previews?.[0]?.url || null,
+                embedUrl: s.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
+              }));
+            }
+          }
+        }
+
+        // Artist not found on Apple Music — try searching for their known tracks directly
+        if (knownTracks.length > 0) {
+          const results = [];
+          for (const trackTitle of knownTracks.slice(0, 2)) {
+            const q = `${trackTitle} ${artistName}`;
+            const tr = await fetch(
+              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=3`,
+              { headers: { Authorization: `Bearer ${appleToken}` } }
+            );
+            if (!tr.ok) continue;
+            const td = await tr.json();
+            const songs = td.results?.songs?.data || [];
+            const match = songs.find(s =>
+              normalise(s.attributes.artistName).includes(target) ||
+              target.includes(normalise(s.attributes.artistName))
+            );
+            if (match) results.push({
+              title: match.attributes.name,
+              artist: match.attributes.artistName,
+              appleId: match.id,
+              previewUrl: match.attributes.previews?.[0]?.url || null,
+              embedUrl: match.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
+            });
+          }
+          if (results.length > 0) return results;
+        }
+      }
+    } catch { /* fall through to LB */ }
+  }
+
+  // 2. ListenBrainz fallback — returns title+artist without streaming IDs
+  const lbTracks = await fetchArtistTracksFromLB(artistName);
+  return lbTracks; // may be []
+}
+
+async function deepEnrichCountry(country, apiKey) {
+  console.log(`[country-enrich] Researching ${country}...`);
+  const appleToken = generateAppleMusicToken();
+
+  // Step 1: Claude researches the country's music scene in depth
+  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: "claude-opus-4-5-20251101",
+      max_tokens: 3500,
+      system: "You are a world music ethnomusicologist with encyclopedic knowledge of music from every country. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+      messages: [{
+        role: "user",
+        content: `Deep music research for "${country}".
+
+Every artist MUST be genuinely from ${country} — born there or the group formed there. No exceptions.
+
+Return exactly this JSON:
+{
+  "genres": ["main genre", "secondary genre", "tertiary genre"],
+  "didYouKnow": "one genuinely surprising fact about ${country}'s music history",
+  "artists": [
+    {
+      "name": "Artist Name",
+      "genre": "specific local genre",
+      "era": "Contemporary",
+      "similarTo": "one well-known comparison artist name only",
+      "knownTracks": ["Exact Song Title 1", "Exact Song Title 2"],
+      "likelyOnStreaming": true
+    }
+  ]
+}
+
+era must be exactly one of: Contemporary, Golden Era, Pioneer.
+Include 12 artists — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
+knownTracks: real specific song titles this artist is known for (used to find them on Spotify/Apple Music).
+likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.`
+      }]
+    }),
+  });
+
+  const claudeData = await claudeRes.json();
+  if (claudeData.error) throw new Error(`Claude error: ${claudeData.error.message}`);
+  const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
+  const research = JSON.parse(raw);
+
+  console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
+
+  // Step 2: Store recommendation cache with this fresh research
+  const cacheKey = makeCacheKey(["recommend", country]);
+  await storeCache(cacheKey, "recommend",
+    { genres: research.genres, didYouKnow: research.didYouKnow },
+    research.artists
+  );
+
+  // Step 3: Proactively fetch and cache tracks for each artist
+  let withTracks = 0;
+  let withoutTracks = 0;
+
+  for (const artist of research.artists) {
+    const artistCacheKey = makeCacheKey(["artist-tracks-apple", artist.name]);
+
+    // Skip if already cached
+    const existing = await getCached(artistCacheKey);
+    if (existing?.result?.tracks?.length > 0) {
+      withTracks++;
+      continue;
+    }
+
+    const tracks = await proactiveArtistTracks(artist.name, artist.knownTracks || [], appleToken);
+
+    if (tracks.length > 0) {
+      // Store in mem cache + Supabase
+      artistTracksMemCache.set(artistCacheKey, { tracks, cachedAt: Date.now() });
+      await storeCache(artistCacheKey, "artist-tracks-apple", { tracks });
+      console.log(`  [country-enrich] ✓ ${artist.name} → ${tracks.length} tracks${tracks[0]?.appleId ? " (Apple Music)" : " (LB)"}`);
+      withTracks++;
+    } else {
+      console.log(`  [country-enrich] – ${artist.name} → no tracks found`);
+      // Mark as attempted in enrichment queue so we don't keep retrying
+      await addToEnrichmentQueue([artist], country);
+      withoutTracks++;
+    }
+
+    // Small delay to avoid rate-limiting
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  console.log(`[country-enrich] ${country} done: ${withTracks} with tracks, ${withoutTracks} without`);
+  return { country, artists: research.artists.length, withTracks, withoutTracks };
+}
+
+// GET /api/enrich-countries?secret=...&count=2
+app.get("/api/enrich-countries", async (req, res) => {
+  if (!req.query.secret || req.query.secret !== process.env.ENRICH_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
+
+  const count = Math.min(parseInt(req.query.count || "2", 10), 5);
+
+  try {
+    const weak = await findWeakCountries(count);
+    if (weak.length === 0) {
+      return res.json({ message: "All countries have sufficient data", enriched: [] });
+    }
+
+    console.log(`[country-enrich] Weak countries to enrich: ${weak.join(", ")}`);
+    const results = [];
+    for (const country of weak) {
+      try {
+        const result = await deepEnrichCountry(country, apiKey);
+        results.push(result);
+      } catch (err) {
+        console.error(`[country-enrich] Error enriching ${country}:`, err.message);
+        results.push({ country, error: err.message });
+      }
+    }
+
+    res.json({ enriched: results });
+  } catch (err) {
+    console.error("[country-enrich] Fatal error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/country-of-day", async (req, res) => {
   const dateStr = req.query.date || new Date().toISOString().slice(0, 10);
   const country = await getOrCreateCountryOfDay(dateStr);
