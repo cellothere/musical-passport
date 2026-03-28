@@ -2251,6 +2251,66 @@ Return exactly this JSON:
         console.log(`[genre-spotlight] after artist fallback: ${tracks.length} tracks`);
       }
 
+      // Phase 3: MusicBrainz tag search — supplement when still sparse
+      // MB coverage is skewed toward western music, so this is best-effort only
+      if (tracks.length < 4 && accessToken) {
+        try {
+          const mbTag = genre.toLowerCase().replace(/[^\w\s\-']/g, "").trim();
+          const mbUrl = `${MB_BASE}/recording?query=tag:"${encodeURIComponent(mbTag)}"&limit=25&fmt=json`;
+          const mbResp = await mbFetch(mbUrl);
+          if (mbResp.ok) {
+            const mbData = await mbResp.json();
+            const mbRecordings = (mbData.recordings || []).slice(0, 15);
+            console.log(`[genre-spotlight] MB tag "${mbTag}" → ${mbRecordings.length} candidates`);
+
+            const seenIds = new Set(tracks.map(t => t.spotifyId));
+            const isoCode = COUNTRY_ISO[country] ?? null;
+
+            // For each MB recording, attempt a Spotify lookup
+            const mbSpotifyResults = await Promise.all(
+              mbRecordings.map(async (rec) => {
+                const recTitle = rec.title;
+                const recArtist = rec["artist-credit"]?.[0]?.artist?.name;
+                if (!recTitle || !recArtist) return null;
+
+                // If we have an ISO code, filter out MB recordings whose artist
+                // country is known and doesn't match — skip ambiguous (null) ones
+                const recArtistCountry = rec["artist-credit"]?.[0]?.artist?.country ?? null;
+                if (isoCode && recArtistCountry && recArtistCountry !== isoCode) return null;
+
+                try {
+                  const sq = `track:${recTitle} artist:${recArtist}`;
+                  const sr = await fetch(
+                    `https://api.spotify.com/v1/search?q=${encodeURIComponent(sq)}&type=track&limit=3&market=US`,
+                    { headers: { Authorization: "Bearer " + accessToken } }
+                  );
+                  const sd = await sr.json();
+                  const found = (sd.tracks?.items || []).find(t => artistNamesMatch(recArtist, t.artists?.[0]?.name || ""));
+                  if (!found) return null;
+                  return {
+                    title: found.name,
+                    artist: found.artists?.[0]?.name || recArtist,
+                    spotifyId: found.id,
+                    previewUrl: found.preview_url || null,
+                    spotifyUrl: `https://open.spotify.com/track/${found.id}`,
+                  };
+                } catch { return null; }
+              })
+            );
+
+            for (const t of mbSpotifyResults) {
+              if (!t || seenIds.has(t.spotifyId)) continue;
+              seenIds.add(t.spotifyId);
+              tracks.push(t);
+              if (tracks.length >= 5) break;
+            }
+            console.log(`[genre-spotlight] after MB fallback: ${tracks.length} tracks`);
+          }
+        } catch (mbErr) {
+          console.warn(`[genre-spotlight] MB fallback error:`, mbErr.message);
+        }
+      }
+
       tracks = tracks.slice(0, 5);
     }
 
