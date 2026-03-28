@@ -288,6 +288,7 @@ async function getCached(cacheKey) {
 const CACHE_TTL = {
   'recommend':       7  * 24 * 60 * 60 * 1000,
   'genre-spotlight': 30 * 24 * 60 * 60 * 1000,
+  'genre-deeper':    30 * 24 * 60 * 60 * 1000,
   'time-machine':    14 * 24 * 60 * 60 * 1000,
 };
 
@@ -1998,6 +1999,76 @@ Include between 1 and 6 tracks — only genuine artists from ${country}. Use exa
     res.json(gsResult);
   } catch (err) {
     console.error("Genre spotlight error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Take Me Deeper: suggest a niche subgenre ─────────────
+app.post("/api/genre-deeper", async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
+
+  const { genre, country, service = "spotify" } = req.body;
+  if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
+
+  const cacheKey = makeCacheKey(["genre-deeper", genre, country]);
+  const cached = await getCached(cacheKey);
+  if (cached) {
+    console.log(`[genre-deeper] cache hit → ${genre} / ${country}`);
+    return res.json(cached.result);
+  }
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 400,
+        system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks.",
+        messages: [{
+          role: "user",
+          content: `A listener is exploring "${genre}" from ${country} and wants to go deeper into the rabbit hole.
+
+Suggest ONE more specific, niche subgenre they should discover next.
+
+Rules:
+- The result MUST be a direct descendant or regional variant of "${genre}" — do NOT suggest a loosely related genre. A listener of Highlife should get Burger Highlife or Afro-Highlife, NOT Afrobeats. A listener of Flamenco should get Flamenco Nuevo or Palos Flamencos, NOT Latin Jazz.
+- Must be MORE specific/niche than "${genre}" — not the same genre with different words
+- Stay within the same genre family. Only suggest something from outside the family if "${genre}" is already extremely niche with no meaningful subgenres left.
+- If the deeper subgenre has a stronger home in a different country (e.g. a diaspora variation), return THAT country — but the genre must still be a variation of "${genre}"
+- The subgenre name must be specific enough to find real tracks (e.g. "Berlin Minimal Techno" not "Techno", "Shōwa-era Kayōkyoku" not "Japanese Pop")
+- Keep the reason to one engaging sentence that makes the listener excited to explore
+
+Return exactly:
+{
+  "genre": "specific subgenre name",
+  "country": "best country for this subgenre",
+  "reason": "one sentence explaining why this is the next step deeper"
+}`,
+        }],
+      }),
+    });
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ error: data.error.message });
+
+    let result;
+    try {
+      result = JSON.parse((data.content[0].text || "").replace(/```json|```/g, "").trim());
+    } catch {
+      return res.status(500).json({ error: "Failed to parse Claude response" });
+    }
+
+    await storeCache(cacheKey, "genre-deeper", result);
+    console.log(`[genre-deeper] Claude → "${result.genre}" / ${result.country} (from ${genre} / ${country})`);
+    res.json(result);
+  } catch (err) {
+    console.error("[genre-deeper] error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
