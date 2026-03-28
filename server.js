@@ -2149,7 +2149,13 @@ async function _fetchArtistTracksImpl(artistName) {
   // 2. Supabase cache
   const cached = await getCached(cacheKey);
   if (cached?.result?.tracks) {
-    console.log(`  [artist-tracks] db cache hit → ${artistName}`);
+    // If cached as empty+flagged, re-queue for deep enrich without blocking the response
+    if (cached.result.tracks.length === 0 && cached.result.flagged) {
+      console.log(`  [artist-tracks] cached empty (flagged) → re-queuing deep enrich for "${artistName}"`);
+      reQueueForDeepEnrich(artistName).catch(() => {});
+    } else {
+      console.log(`  [artist-tracks] db cache hit → ${artistName}`);
+    }
     artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
     return cached.result.tracks;
   }
@@ -2217,10 +2223,14 @@ async function _fetchArtistTracksImpl(artistName) {
       tracks = await fetchArtistTracksFromLB(artistName);
     }
 
+    artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
     if (tracks.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
       storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
       console.log(`  [artist-tracks] cached ${tracks.length} tracks → ${artistName}`);
+    } else {
+      // Store flagged empty result — cron will deep-enrich this artist
+      storeCache(cacheKey, "artist-tracks", { tracks: [], flagged: true }).catch(() => {});
+      console.log(`  [artist-tracks] no tracks found — flagged for deep enrich: "${artistName}"`);
     }
 
     return tracks;
@@ -2419,7 +2429,12 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
   // Supabase cache
   const cached = await getCached(cacheKey);
   if (cached?.result?.tracks) {
-    console.log(`  [artist-tracks-apple] db cache hit → ${artistName}`);
+    if (cached.result.tracks.length === 0 && cached.result.flagged) {
+      console.log(`  [artist-tracks-apple] cached empty (flagged) → re-queuing deep enrich for "${artistName}"`);
+      reQueueForDeepEnrich(artistName).catch(() => {});
+    } else {
+      console.log(`  [artist-tracks-apple] db cache hit → ${artistName}`);
+    }
     artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
     return res.json({ tracks: cached.result.tracks });
   }
@@ -2465,8 +2480,13 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
     }
 
     artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-    storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
-    console.log(`  [artist-tracks-apple] cached ${tracks.length} tracks → ${artistName}${matchedArtist ? "" : " (artist not found)"}`);
+    if (tracks.length > 0) {
+      storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
+      console.log(`  [artist-tracks-apple] cached ${tracks.length} tracks → ${artistName}`);
+    } else {
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: [], flagged: true }).catch(() => {});
+      console.log(`  [artist-tracks-apple] no tracks found — flagged for deep enrich: "${artistName}"`);
+    }
     res.json({ tracks });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -3176,6 +3196,120 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
   return lbTracks; // may be []
 }
 
+// Reset an artist's enrichment_queue entry so the next cron run retries it with deep search.
+async function reQueueForDeepEnrich(artistName) {
+  if (!supabase) return;
+  await supabase.from("enrichment_queue")
+    .update({ attempts: 0, completed_at: null, last_attempted_at: null })
+    .eq("artist", artistName)
+    .is("completed_at", null);
+}
+
+// Find all artist-tracks cache entries flagged as empty, then try much harder to find tracks.
+// Uses Claude to surface specific song titles, then searches Apple Music + Spotify + LB.
+async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
+  if (!supabase) return { processed: 0 };
+
+  // Find flagged empty entries across both track endpoints
+  const { data: flagged } = await supabase
+    .from("recommendation_cache")
+    .select("cache_key, endpoint")
+    .in("endpoint", ["artist-tracks", "artist-tracks-apple"])
+    .eq("result->>flagged", "true")
+    .limit(limit * 2); // fetch extra — some may fail
+
+  if (!flagged?.length) return { processed: 0 };
+
+  // Deduplicate by artist name (same artist may be flagged in both endpoints)
+  const seen = new Set();
+  const toEnrich = [];
+  for (const row of flagged) {
+    const prefix = row.endpoint === "artist-tracks-apple" ? "artist-tracks-apple_" : "artist-tracks_";
+    const slug = row.cache_key.replace(prefix, "");
+    if (!seen.has(slug)) { seen.add(slug); toEnrich.push({ slug, endpoint: row.endpoint, cacheKey: row.cache_key }); }
+    if (toEnrich.length >= limit) break;
+  }
+
+  console.log(`[deep-enrich] ${toEnrich.length} flagged artists to retry`);
+  const appleToken = generateAppleMusicToken();
+  let processed = 0;
+
+  for (const { slug, endpoint, cacheKey } of toEnrich) {
+    // Reconstruct artist name from slug (hyphens back to spaces, best effort)
+    const artistName = slug.replace(/-/g, " ");
+
+    // Step 1: ask Claude for the artist's 3 most famous specific song titles
+    let knownTitles = [];
+    try {
+      const cr = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 150,
+          system: "Return ONLY valid JSON — no markdown, no preamble.",
+          messages: [{ role: "user", content: `What are 3 real, specific song titles that the artist "${artistName}" is best known for? If you don't know this artist, return an empty list. JSON: {"titles": ["Title 1", "Title 2", "Title 3"]}` }],
+        }),
+      });
+      const cd = await cr.json();
+      const raw = (cd.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
+      knownTitles = JSON.parse(raw).titles || [];
+    } catch { /* proceed without Claude titles */ }
+
+    // Step 2: search for the artist + known titles across Apple Music and Spotify
+    const isApple = endpoint === "artist-tracks-apple";
+    let tracks = await proactiveArtistTracks(artistName, knownTitles, appleToken);
+
+    // Step 3: if Apple Music returned nothing, try Spotify directly
+    if (tracks.length === 0) {
+      tracks = await (async () => {
+        const token = await getClientAccessToken();
+        if (!token) return [];
+        // Try each known title with artist name on Spotify
+        const results = [];
+        for (const title of knownTitles) {
+          const r = await spotifyFetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:${title} artist:${artistName}`)}&type=track&limit=3&market=US`,
+            { headers: { Authorization: "Bearer " + token } }
+          );
+          if (!r.ok) continue;
+          const d = await r.json();
+          const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+          const match = (d.tracks?.items || []).find(t =>
+            t.artists.some(a => norm(a.name).includes(norm(artistName)) || norm(artistName).includes(norm(a.name)))
+          );
+          if (match) results.push({ title: match.name, spotifyId: match.id, previewUrl: match.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${match.id}` });
+        }
+        return results;
+      })();
+    }
+
+    // Step 4: ListenBrainz final fallback
+    if (tracks.length === 0) tracks = await fetchArtistTracksFromLB(artistName);
+
+    if (tracks.length > 0) {
+      // Clear flag — we found tracks
+      const storeEndpoint = isApple ? "artist-tracks-apple" : "artist-tracks";
+      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
+      await storeCache(cacheKey, storeEndpoint, { tracks });
+      // Mark as complete in enrichment queue
+      if (supabase) {
+        await supabase.from("enrichment_queue")
+          .update({ completed_at: new Date().toISOString() })
+          .eq("artist", artistName);
+      }
+      console.log(`[deep-enrich] ✓ "${artistName}" → ${tracks.length} tracks`);
+      processed++;
+    } else {
+      console.log(`[deep-enrich] – "${artistName}" still no tracks — keeping flagged`);
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  return { processed, total: toEnrich.length };
+}
+
 async function deepEnrichCountry(country, apiKey) {
   console.log(`[country-enrich] Researching ${country}...`);
   const appleToken = generateAppleMusicToken();
@@ -3355,6 +3489,13 @@ app.get("/api/enrich", async (req, res) => {
   const skipFlagReview = req.query.review_flags === "false";
 
   try {
+    // Priority 1: deep-enrich artists that returned 0 tracks (flagged in cache)
+    const deepResult = await deepEnrichFlaggedArtists(apiKey, 5);
+    if (deepResult.total > 0) {
+      console.log(`[enrich] deep-enrich: ${deepResult.processed}/${deepResult.total} flagged artists resolved`);
+    }
+
+    // Priority 2: regular enrichment queue
     const enrichResult = await processEnrichmentBatch(batchSize);
     console.log(`[enrich] batch complete → ${enrichResult.processed}/${enrichResult.total} enriched`);
 
@@ -3372,7 +3513,7 @@ app.get("/api/enrich", async (req, res) => {
       flagResult = await processFlaggedTracks(2);
     }
 
-    res.json({ enrich: enrichResult, flagReview: flagResult, purged: purged ?? 0 });
+    res.json({ enrich: enrichResult, deepEnrich: deepResult, flagReview: flagResult, purged: purged ?? 0 });
   } catch (err) {
     console.error("[enrich] batch error:", err.message);
     res.status(500).json({ error: err.message });
