@@ -2519,7 +2519,31 @@ async function _fetchArtistTracksImpl(artistName) {
       }));
     }
 
-    // Fall back to ListenBrainz if Spotify returned nothing
+    // top-tracks?market=US returns empty for artists not licensed in the US (e.g. German, Latin).
+    // Fall back to a track search by artist ID — no market restriction.
+    if (tracks.length === 0) {
+      console.log(`  [artist-tracks] top-tracks empty for "${artistName}", trying search fallback`);
+      const searchRes = await spotifyFetch(
+        `https://api.spotify.com/v1/search?q=${encodeURIComponent(`artist:${artistName}`)}&type=track&limit=5`,
+        { headers: { Authorization: "Bearer " + accessToken } }
+      );
+      if (searchRes.ok) {
+        const sd = await searchRes.json();
+        const items = (sd.tracks?.items || []).filter(t =>
+          t.artists?.some(a => normalize(a.name) === target || normalize(a.name).includes(target) || target.includes(normalize(a.name)))
+        );
+        tracks = items.slice(0, 3).map(t => ({
+          title: t.name,
+          artist: t.artists?.[0]?.name,
+          spotifyId: t.id,
+          previewUrl: t.preview_url || null,
+          spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+        }));
+        if (tracks.length > 0) console.log(`  [artist-tracks] search fallback found ${tracks.length} tracks for "${artistName}"`);
+      }
+    }
+
+    // Last resort: ListenBrainz
     if (tracks.length === 0) {
       console.log(`  [artist-tracks] Spotify empty → trying ListenBrainz for "${artistName}"`);
       tracks = await fetchArtistTracksFromLB(artistName);
@@ -3539,19 +3563,44 @@ async function proactiveSpotifyTracks(artistName) {
       { headers: { Authorization: "Bearer " + accessToken } }
     );
 
+    let proTracks = [];
     if (topTracksRes.ok) {
       const topData = await topTracksRes.json();
-      const tracks = (topData.tracks || []).slice(0, 3).map(t => ({
+      proTracks = (topData.tracks || []).slice(0, 3).map(t => ({
         title: t.name,
         artist: t.artists?.[0]?.name,
         spotifyId: t.id,
         previewUrl: t.preview_url || null,
         spotifyUrl: `https://open.spotify.com/track/${t.id}`,
       }));
-      if (tracks.length > 0) return tracks;
     }
 
-    // If global top-tracks returned nothing, fall back to LB
+    // top-tracks?market=US misses non-US licensed artists — try track search fallback
+    if (proTracks.length === 0) {
+      console.log(`  [proactive-spotify] top-tracks empty for "${artistName}", trying search fallback`);
+      const searchRes = await spotifyFetch(
+        `https://api.spotify.com/v1/search?q=${encodeURIComponent(`artist:${artistName}`)}&type=track&limit=5`,
+        { headers: { Authorization: "Bearer " + accessToken } }
+      );
+      if (searchRes.ok) {
+        const sd = await searchRes.json();
+        const items = (sd.tracks?.items || []).filter(t =>
+          t.artists?.some(a => normalize(a.name) === target || normalize(a.name).includes(target) || target.includes(normalize(a.name)))
+        );
+        proTracks = items.slice(0, 3).map(t => ({
+          title: t.name,
+          artist: t.artists?.[0]?.name,
+          spotifyId: t.id,
+          previewUrl: t.preview_url || null,
+          spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+        }));
+        if (proTracks.length > 0) console.log(`  [proactive-spotify] search fallback found ${proTracks.length} tracks for "${artistName}"`);
+      }
+    }
+
+    if (proTracks.length > 0) return proTracks;
+
+    // Last resort: ListenBrainz
     console.log(`  [proactive-spotify] no tracks from Spotify for "${artistName}" → LB fallback`);
     return fetchArtistTracksFromLB(artistName);
   } catch (err) {
