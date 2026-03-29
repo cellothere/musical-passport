@@ -332,56 +332,35 @@ async function verifyArtistTracksForRecommend(artists, country) {
     const dbCached = await getCached(cacheKey);
     if (dbCached?.result?.tracks?.length > 0) return { artist, tracks: dbCached.result.tracks };
 
-    // Try Apple Music → LB
-    const tracks = await proactiveArtistTracks(artist.name, [], appleToken);
+    // Try Apple Music and Spotify in parallel — don't serialise through Spotify queue here
+    const [appleTracks, spotifyTracks] = await Promise.all([
+      proactiveArtistTracks(artist.name, [], appleToken),
+      proactiveSpotifyTracks(artist.name),
+    ]);
 
-    if (tracks.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
-    } else {
-      // Also try Spotify before giving up
-      const spotifyTracks = await spotifyEnqueue(async () => {
-        const token = await getClientAccessToken();
-        if (!token) return [];
-        const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-        const target = norm(artist.name);
-        const r = await spotifyFetch(
-          `https://api.spotify.com/v1/search?q=${encodeURIComponent(artist.name)}&type=artist&limit=5&market=US`,
-          { headers: { Authorization: "Bearer " + token } }
-        );
-        if (!r.ok) return [];
-        const d = await r.json();
-        const matched = (d.artists?.items || []).find(a => {
-          const n = norm(a.name);
-          return n === target || n.includes(target) || target.includes(n);
-        });
-        if (!matched) return [];
-        const tr = await spotifyFetch(
-          `https://api.spotify.com/v1/artists/${matched.id}/top-tracks?market=US`,
-          { headers: { Authorization: "Bearer " + token } }
-        );
-        if (!tr.ok) return [];
-        const td = await tr.json();
-        return (td.tracks || []).slice(0, 3).map(t => ({
-          title: t.name, spotifyId: t.id, previewUrl: t.preview_url || null,
-          spotifyUrl: `https://open.spotify.com/track/${t.id}`,
-        }));
-      });
-
+    if (appleTracks.length > 0) {
+      artistTracksMemCache.set(cacheKey, { tracks: appleTracks, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: appleTracks }).catch(() => {});
+      // Also cache spotify result if we got one
       if (spotifyTracks.length > 0) {
         const spKey = makeCacheKey(["artist-tracks", artist.name]);
         artistTracksMemCache.set(spKey, { tracks: spotifyTracks, cachedAt: Date.now() });
         storeCache(spKey, "artist-tracks", { tracks: spotifyTracks }).catch(() => {});
-        return { artist, tracks: spotifyTracks };
       }
-
-      // Genuinely no tracks — flag it
-      storeCache(cacheKey, "artist-tracks-apple", { tracks: [], flagged: true }).catch(() => {});
-      console.log(`  [recommend-verify] no tracks for "${artist.name}" (${country}) — flagged`);
-      return { artist, tracks: [] };
+      return { artist, tracks: appleTracks };
     }
 
-    return { artist, tracks };
+    if (spotifyTracks.length > 0) {
+      const spKey = makeCacheKey(["artist-tracks", artist.name]);
+      artistTracksMemCache.set(spKey, { tracks: spotifyTracks, cachedAt: Date.now() });
+      storeCache(spKey, "artist-tracks", { tracks: spotifyTracks }).catch(() => {});
+      return { artist, tracks: spotifyTracks };
+    }
+
+    // Genuinely no tracks — flag it
+    storeCache(cacheKey, "artist-tracks-apple", { tracks: [], flagged: true }).catch(() => {});
+    console.log(`  [recommend-verify] no tracks for "${artist.name}" (${country}) — flagged`);
+    return { artist, tracks: [] };
   }));
 
   return results.filter(r => r.tracks.length > 0).map(r => r.artist);
@@ -2495,9 +2474,9 @@ async function _fetchArtistTracksImpl(artistName) {
     const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
     const target = normalize(artistName);
 
-    // Step 1: search for the artist by name and verify it matches
+    // Step 1: search for the artist by name — no market restriction for non-Western artists
     const artistSearch = await spotifyFetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5&market=US`,
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
       { headers: { Authorization: "Bearer " + accessToken } }
     );
 
@@ -2523,9 +2502,9 @@ async function _fetchArtistTracksImpl(artistName) {
 
     console.log(`  Found artist: "${matchedArtist.name}" (id: ${matchedArtist.id})`);
 
-    // Step 2: fetch top tracks for the verified artist ID
+    // Step 2: fetch top tracks — no market restriction so global releases are included
     const topTracksRes = await spotifyFetch(
-      `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks?market=US`,
+      `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks`,
       { headers: { Authorization: "Bearer " + accessToken } }
     );
 
@@ -3517,6 +3496,68 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
   // 2. ListenBrainz fallback — returns title+artist without streaming IDs
   const lbTracks = await fetchArtistTracksFromLB(artistName);
   return lbTracks; // may be []
+}
+
+// Fetch tracks for one artist using Spotify (2-step: artist search → top tracks).
+// Does NOT restrict to market=US so non-Western artists are found globally.
+// Falls back to ListenBrainz if Spotify doesn't carry the artist.
+async function proactiveSpotifyTracks(artistName) {
+  const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const target = normalize(artistName);
+
+  try {
+    const accessToken = await getClientAccessToken();
+    if (!accessToken) return [];
+
+    // Step 1: search for the artist without market restriction
+    const artistSearch = await spotifyFetch(
+      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
+      { headers: { Authorization: "Bearer " + accessToken } }
+    );
+    if (!artistSearch.ok) return fetchArtistTracksFromLB(artistName);
+
+    const artistData = await artistSearch.json();
+    const artists = artistData.artists?.items || [];
+
+    // Require name match to prevent false positives (e.g. "Oraz Tagan" → Polish children's music)
+    const matched = artists.find(a => normalize(a.name) === target)
+      ?? artists.find(a => {
+        const n = normalize(a.name);
+        return n.includes(target) || target.includes(n);
+      });
+
+    if (!matched) {
+      console.log(`  [proactive-spotify] no artist match for "${artistName}" → LB fallback`);
+      return fetchArtistTracksFromLB(artistName);
+    }
+
+    console.log(`  [proactive-spotify] matched "${matched.name}" (${matched.id})`);
+
+    // Step 2: fetch top tracks — try without market first (global availability)
+    const topTracksRes = await spotifyFetch(
+      `https://api.spotify.com/v1/artists/${matched.id}/top-tracks`,
+      { headers: { Authorization: "Bearer " + accessToken } }
+    );
+
+    if (topTracksRes.ok) {
+      const topData = await topTracksRes.json();
+      const tracks = (topData.tracks || []).slice(0, 3).map(t => ({
+        title: t.name,
+        artist: t.artists?.[0]?.name,
+        spotifyId: t.id,
+        previewUrl: t.preview_url || null,
+        spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+      }));
+      if (tracks.length > 0) return tracks;
+    }
+
+    // If global top-tracks returned nothing, fall back to LB
+    console.log(`  [proactive-spotify] no tracks from Spotify for "${artistName}" → LB fallback`);
+    return fetchArtistTracksFromLB(artistName);
+  } catch (err) {
+    console.error(`  [proactive-spotify] error for "${artistName}":`, err.message);
+    return fetchArtistTracksFromLB(artistName);
+  }
 }
 
 // Reset an artist's enrichment_queue entry so the next cron run retries it with deep search.
