@@ -2502,9 +2502,9 @@ async function _fetchArtistTracksImpl(artistName) {
 
     console.log(`  Found artist: "${matchedArtist.name}" (id: ${matchedArtist.id})`);
 
-    // Step 2: fetch top tracks — no market restriction so global releases are included
+    // Step 2: fetch top tracks — market=US required with client credentials (no user market)
     const topTracksRes = await spotifyFetch(
-      `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks`,
+      `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks?market=US`,
       { headers: { Authorization: "Bearer " + accessToken } }
     );
 
@@ -3533,9 +3533,9 @@ async function proactiveSpotifyTracks(artistName) {
 
     console.log(`  [proactive-spotify] matched "${matched.name}" (${matched.id})`);
 
-    // Step 2: fetch top tracks — try without market first (global availability)
+    // Step 2: fetch top tracks — market=US required with client credentials (no user market)
     const topTracksRes = await spotifyFetch(
-      `https://api.spotify.com/v1/artists/${matched.id}/top-tracks`,
+      `https://api.spotify.com/v1/artists/${matched.id}/top-tracks?market=US`,
       { headers: { Authorization: "Bearer " + accessToken } }
     );
 
