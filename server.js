@@ -333,52 +333,66 @@ async function filterOutFlaggedArtists(artistPool) {
 }
 
 // For each artist in a fresh Claude recommendation, verify they have playable tracks.
-// Checks Apple Music + Spotify + LB in parallel and caches results immediately.
+// Only checks up to VERIFY_LIMIT uncached artists to keep Spotify API usage low.
+// Uses Apple Music for the verify pass; Spotify search fallback runs lazily on card flip.
 // Returns only artists that have at least 1 track.
+const VERIFY_LIMIT = 5;
 async function verifyArtistTracksForRecommend(artists, country) {
   const appleToken = generateAppleMusicToken();
+
   const results = await Promise.all(artists.map(async (artist) => {
     const cacheKey = makeCacheKey(["artist-tracks-apple", artist.name]);
 
-    // Skip verification if already cached with real tracks
+    // Always pass through artists already cached with real tracks — no API call needed
     const existing = artistTracksMemCache.get(cacheKey);
-    if (existing && existing.tracks.length > 0) return { artist, tracks: existing.tracks };
+    if (existing && existing.tracks.length > 0) return { artist, tracks: existing.tracks, cached: true };
     const dbCached = await getCached(cacheKey);
-    if (dbCached?.result?.tracks?.length > 0) return { artist, tracks: dbCached.result.tracks };
+    if (dbCached?.result?.tracks?.length > 0) return { artist, tracks: dbCached.result.tracks, cached: true };
 
-    // Try Apple Music and Spotify in parallel — don't serialise through Spotify queue here
-    const [appleTracks, spotifyTracks] = await Promise.all([
-      proactiveArtistTracks(artist.name, [], appleToken),
-      proactiveSpotifyTracks(artist.name),
-    ]);
+    return { artist, tracks: null, cached: false };
+  }));
 
-    const uniqueAppleTracks = appleTracks.filter((t, i, a) => a.findIndex(x => x.title.toLowerCase() === t.title.toLowerCase()) === i);
-    if (uniqueAppleTracks.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks: uniqueAppleTracks, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks-apple", { tracks: uniqueAppleTracks }).catch(() => {});
-      // Also cache spotify result if we got one
-      if (spotifyTracks.length > 0) {
-        const spKey = makeCacheKey(["artist-tracks", artist.name]);
-        artistTracksMemCache.set(spKey, { tracks: spotifyTracks, cachedAt: Date.now() });
-        storeCache(spKey, "artist-tracks", { tracks: spotifyTracks }).catch(() => {});
-      }
-      return { artist, tracks: uniqueAppleTracks };
+  // Split: already verified vs needs a live check
+  const verified = results.filter(r => r.cached);
+  const needsCheck = results.filter(r => !r.cached);
+
+  // Only verify up to VERIFY_LIMIT uncached artists — rest pass through (Spotify handles on card flip)
+  const toCheck = needsCheck.slice(0, VERIFY_LIMIT);
+  const passThrough = needsCheck.slice(VERIFY_LIMIT);
+
+  console.log(`  [recommend-verify] ${verified.length} cached, checking ${toCheck.length}/${needsCheck.length} uncached (${passThrough.length} deferred)`);
+
+  const checked = await Promise.all(toCheck.map(async ({ artist }) => {
+    const cacheKey = makeCacheKey(["artist-tracks-apple", artist.name]);
+
+    // Apple Music only for the verify pass — Spotify fallback happens lazily on card flip
+    const appleTracks = await proactiveArtistTracks(artist.name, [], appleToken);
+    const uniqueTracks = appleTracks.filter((t, i, a) =>
+      a.findIndex(x => x.title.toLowerCase() === t.title.toLowerCase()) === i
+    );
+
+    if (uniqueTracks.length > 0) {
+      artistTracksMemCache.set(cacheKey, { tracks: uniqueTracks, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: uniqueTracks }).catch(() => {});
+      return { artist, tracks: uniqueTracks };
     }
 
-    if (spotifyTracks.length > 0) {
-      const spKey = makeCacheKey(["artist-tracks", artist.name]);
-      artistTracksMemCache.set(spKey, { tracks: spotifyTracks, cachedAt: Date.now() });
-      storeCache(spKey, "artist-tracks", { tracks: spotifyTracks }).catch(() => {});
-      return { artist, tracks: spotifyTracks };
-    }
-
-    // Genuinely no tracks — flag it
+    // Flag it — cron will deep-enrich; Spotify check runs when user taps the card
     storeCache(cacheKey, "artist-tracks-apple", { tracks: [], flagged: true }).catch(() => {});
     console.log(`  [recommend-verify] no tracks for "${artist.name}" (${country}) — flagged`);
     return { artist, tracks: [] };
   }));
 
-  return results.filter(r => r.tracks.length > 0).map(r => r.artist);
+  const allResults = [
+    ...verified,
+    ...checked,
+    ...passThrough.map(r => ({ ...r, tracks: [] })), // deferred artists pass through as unverified
+  ];
+
+  // Keep artists with tracks OR deferred ones (they get a chance on card flip)
+  return allResults
+    .filter(r => r.tracks === null || r.tracks.length > 0 || passThrough.some(p => p.artist.name === r.artist.name))
+    .map(r => r.artist);
 }
 
 // ── Flag review ───────────────────────────────────────────
