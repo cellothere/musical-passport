@@ -88,16 +88,20 @@ async function drainSpotifyQueue() {
 const MAX_RETRY_WAIT_S = 30;
 async function spotifyFetch(url, options = {}, retries = 2) {
   const res = await fetch(url, options);
-  if (res.status === 429 && retries > 0) {
-    const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
-    if (retryAfter > MAX_RETRY_WAIT_S) {
-      console.warn(`  [Spotify] 429 with Retry-After ${retryAfter}s – long-term limit hit, not retrying`);
-      return res; // caller sees 429, returns []
+  if (res.status === 429) {
+    const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
+    if (retries > 0 && retryAfter <= MAX_RETRY_WAIT_S) {
+      const wait = (retryAfter + 1) * 1000;
+      console.log(`  [Spotify] 429 – waiting ${wait}ms before retry`);
+      await new Promise(r => setTimeout(r, wait));
+      return spotifyFetch(url, options, retries - 1);
     }
-    const wait = (retryAfter + 1) * 1000;
-    console.log(`  [Spotify] 429 – waiting ${wait}ms before retry`);
-    await new Promise(r => setTimeout(r, wait));
-    return spotifyFetch(url, options, retries - 1);
+    // Can't retry (daily limit or too long a wait) — return a safe JSON-parseable 429 response
+    console.warn(`  [Spotify] 429 rate-limited (Retry-After ${retryAfter}s) – returning error response`);
+    return new Response(JSON.stringify({ error: "rate_limited", retryAfter }), {
+      status: 429,
+      headers: { "Content-Type": "application/json" },
+    });
   }
   return res;
 }
@@ -3004,10 +3008,11 @@ app.post("/api/similar-artists", async (req, res) => {
     if (!token) return res.status(503).json({ error: "Could not authenticate with Spotify." });
 
     // Step 1: Look up artist on Spotify for genres
-    const artistSearch = await fetch(
+    const artistSearch = await spotifyFetch(
       `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
       { headers: { Authorization: "Bearer " + token } }
     );
+    if (!artistSearch.ok) return res.status(503).json({ error: "Spotify search unavailable, please try again later." });
     const artistData = await artistSearch.json();
     const candidates = artistData.artists?.items || [];
     if (candidates.length === 0) return res.status(404).json({ error: "Artist not found on Spotify." });
