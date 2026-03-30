@@ -5,7 +5,7 @@ const fetch = require("node-fetch");
 const path = require("path");
 const session = require("express-session");
 const querystring = require("querystring");
-const { createSign } = require("crypto");
+const { createSign, createHash } = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -85,8 +85,8 @@ async function drainSpotifyQueue() {
 // Wraps fetch with retry-on-429 logic.
 // If Retry-After > MAX_RETRY_WAIT_S we don't retry — Spotify issued a long-term
 // ban (up to 24h on some endpoints). Waiting that long blocks the whole queue.
-const MAX_RETRY_WAIT_S = 5;
-async function spotifyFetch(url, options = {}, retries = 1) {
+const MAX_RETRY_WAIT_S = 30;
+async function spotifyFetch(url, options = {}, retries = 2) {
   const res = await fetch(url, options);
   if (res.status === 429 && retries > 0) {
     const retryAfter = parseInt(res.headers.get("Retry-After") || "0", 10);
@@ -263,9 +263,17 @@ const formatFavorite = (row) => ({
 });
 
 function makeCacheKey(parts) {
-  return parts.filter(Boolean).join("_").toLowerCase()
+  const joined = parts.filter(Boolean).join("_").toLowerCase();
+  const hasNonLatin = /[^\u0000-\u007f]/.test(joined);
+  const normalized = joined
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // ó→o, ú→u, ø→o, etc.
     .replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
+  if (hasNonLatin) {
+    // Append an 8-char hash so non-Latin scripts get a unique, stable key
+    const hash = createHash("md5").update(joined).digest("hex").slice(0, 8);
+    return (normalized || "x") + "_" + hash;
+  }
+  return normalized;
 }
 
 async function getCached(cacheKey) {
@@ -340,16 +348,17 @@ async function verifyArtistTracksForRecommend(artists, country) {
       proactiveSpotifyTracks(artist.name),
     ]);
 
-    if (appleTracks.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks: appleTracks, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks-apple", { tracks: appleTracks }).catch(() => {});
+    const uniqueAppleTracks = appleTracks.filter((t, i, a) => a.findIndex(x => x.title.toLowerCase() === t.title.toLowerCase()) === i);
+    if (uniqueAppleTracks.length > 0) {
+      artistTracksMemCache.set(cacheKey, { tracks: uniqueAppleTracks, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: uniqueAppleTracks }).catch(() => {});
       // Also cache spotify result if we got one
       if (spotifyTracks.length > 0) {
         const spKey = makeCacheKey(["artist-tracks", artist.name]);
         artistTracksMemCache.set(spKey, { tracks: spotifyTracks, cachedAt: Date.now() });
         storeCache(spKey, "artist-tracks", { tracks: spotifyTracks }).catch(() => {});
       }
-      return { artist, tracks: appleTracks };
+      return { artist, tracks: uniqueAppleTracks };
     }
 
     if (spotifyTracks.length > 0) {
@@ -1093,6 +1102,34 @@ const COUNTRY_ISO = {
   "Djibouti":"DJ","Kuwait":"KW","Bahrain":"BH",
 };
 
+// Reverse map: ISO-2 → canonical country name (built once from COUNTRY_ISO)
+const ISO_TO_COUNTRY = Object.fromEntries(
+  Object.entries(COUNTRY_ISO)
+    .filter(([name]) => !["Wales","Scotland"].includes(name)) // keep canonical UK names
+    .map(([name, code]) => [code, name])
+);
+// Patch a few names MusicBrainz uses that differ from our display names
+ISO_TO_COUNTRY["US"] = "United States";
+ISO_TO_COUNTRY["GB"] = "United Kingdom";
+ISO_TO_COUNTRY["KR"] = "South Korea";
+ISO_TO_COUNTRY["TW"] = "Taiwan";
+ISO_TO_COUNTRY["VN"] = "Vietnam";
+ISO_TO_COUNTRY["IR"] = "Iran";
+ISO_TO_COUNTRY["CI"] = "Ivory Coast";
+
+// Verify and correct country info for each artist in a pool using MusicBrainz.
+// Runs lookups in the existing MB queue (rate-limited to 1/sec), so it's slow but accurate.
+async function verifyPoolCountries(pool) {
+  return Promise.all(pool.map(async (artist) => {
+    const mbCode = await mbArtistCountry(artist.name);
+    if (!mbCode || mbCode === artist.countryCode) return artist; // no change needed
+    const mbName = ISO_TO_COUNTRY[mbCode];
+    if (!mbName) return artist; // unknown ISO code, keep Claude's answer
+    console.log(`[verify-country] ${artist.name}: ${artist.countryCode}(${artist.country}) → ${mbCode}(${mbName})`);
+    return { ...artist, country: mbName, countryCode: mbCode };
+  }));
+}
+
 // Parse "1960s" → { start: 1960, end: 1969 }
 function parseDecade(decade) {
   const yr = parseInt(decade, 10);
@@ -1103,14 +1140,14 @@ function parseDecade(decade) {
 // Look up an artist on MusicBrainz; returns their ISO country code or null
 async function mbArtistCountry(artistName) {
   const cached = await getMbArtistCached(artistName);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return cached?.trim() ?? null;
   try {
     const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(artistName)}&limit=3&fmt=json`;
     const r = await mbFetch(url);
     if (!r.ok) { await setMbArtistCached(artistName, null); return null; }
     const d = await r.json();
     const top = (d.artists || []).find(a => (a.score || 0) >= 80);
-    const country = top?.country ?? null;
+    const country = top?.country?.trim() ?? null;
     await setMbArtistCached(artistName, country);
     return country;
   } catch { return null; }
@@ -1328,6 +1365,18 @@ async function fetchArtistTracksFromLB(artistName) {
       title: rec.recording_name,
       artist: rec.artist_name,
     }));
+    // Validate that the returned tracks actually belong to the requested artist.
+    // MusicBrainz fuzzy search can match the wrong MBID (e.g. "George Boe" → Alfie Boe).
+    const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const target = normalise(artistName);
+    const anyMatch = tracks.some(t => {
+      const n = normalise(t.artist || "");
+      return n.includes(target) || (n.length >= 6 && target.includes(n));
+    });
+    if (tracks.length > 0 && !anyMatch) {
+      console.log(`  [LB] Rejected "${artistName}" tracks — artist mismatch (got: ${tracks[0]?.artist})`);
+      return [];
+    }
     console.log(`  [LB] Got ${tracks.length} tracks for "${artistName}" via ListenBrainz`);
     return tracks;
   } catch (err) {
@@ -1447,6 +1496,10 @@ app.use(
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+// In-flight request coalescing — prevents cache stampedes when two requests
+// for the same country arrive simultaneously before either has been cached.
+const recommendInFlight = new Map(); // cacheKey → Promise
+
 // Proxy endpoint for Anthropic API (with personalization)
 app.post("/api/recommend", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -1462,135 +1515,45 @@ app.post("/api/recommend", async (req, res) => {
     return res.status(400).json({ error: "Missing country in request body." });
   }
 
-  const authHeader = req.headers.authorization;
-  const accessToken = (authHeader && authHeader.startsWith("Bearer "))
-    ? authHeader.slice(7)
-    : req.session.accessToken;
-
-  // Cache-first for unauthenticated requests
-  if (!accessToken) {
-    const cacheKey = makeCacheKey(["recommend", country]);
-    const cached = await getCached(cacheKey);
-    if (cached && cached.artist_pool && cached.artist_pool.length >= 4) {
-      console.log(`[recommend] cache hit (anon) → ${country}`);
-      // Filter out artists whose track cache is flagged empty so users never see them
-      const pool = await filterOutFlaggedArtists(cached.artist_pool);
-      if (pool.length >= 4) {
-        return res.json({
-          genres: cached.result.genres,
-          artists: pickDiverseByEra(pool, 4),
-          didYouKnow: cached.result.didYouKnow,
-        });
-      }
-      // Too many flagged — fall through to regenerate
-      console.log(`[recommend] pool shrank to ${pool.length} after filtering flagged — regenerating`);
-    }
-  }
-
-  // Cache-first for authenticated requests (personal pool keyed by user+country)
-  let userId = null;
-  if (accessToken) {
-    try {
-      const meRes = await fetch("https://api.spotify.com/v1/me", {
-        headers: { Authorization: "Bearer " + accessToken },
+  // Single shared cache per country — recommendations are not personalized
+  const cacheKey = makeCacheKey(["recommend", country]);
+  const cached = await getCached(cacheKey);
+  if (cached && cached.artist_pool && cached.artist_pool.length >= 4) {
+    console.log(`[recommend] cache hit → ${country}`);
+    const pool = await filterOutFlaggedArtists(cached.artist_pool);
+    if (pool.length >= 4) {
+      return res.json({
+        genres: cached.result.genres,
+        artists: pickDiverseByEra(pool, 4),
+        didYouKnow: cached.result.didYouKnow,
       });
-      if (meRes.ok) {
-        const meData = await meRes.json();
-        userId = meData.id;
-      }
-    } catch (e) { /* non-fatal */ }
-
-    if (userId) {
-      const personalKey = makeCacheKey(["recommend", userId, country]);
-      const personalCached = await getCached(personalKey);
-      if (personalCached && personalCached.artist_pool && personalCached.artist_pool.length >= 4) {
-        console.log(`[recommend] cache hit (user:${userId}) → ${country}`);
-        const pool = await filterOutFlaggedArtists(personalCached.artist_pool);
-        if (pool.length >= 4) {
-          return res.json({
-            genres: personalCached.result.genres,
-            artists: pickDiverseByEra(pool, 4),
-            didYouKnow: personalCached.result.didYouKnow,
-          });
-        }
-        console.log(`[recommend] personal pool shrank to ${pool.length} — regenerating`);
-      }
     }
+    console.log(`[recommend] pool shrank to ${pool.length} after filtering flagged — regenerating`);
   }
 
-  // Kick off real-data pool lookup in parallel with Spotify personalization
+  // Coalescing: if another request for this country is already in-flight,
+  // piggyback on it instead of launching a duplicate Claude pipeline.
+  const _inflightKey = cacheKey;
+  let _resolveInFlight = null;
+  let _rejectInFlight = null;
+  if (recommendInFlight.has(_inflightKey)) {
+    console.log(`[recommend] coalescing → ${country}`);
+    try {
+      return res.json(await recommendInFlight.get(_inflightKey));
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+  const inflightPromise = new Promise((resolve, reject) => {
+    _resolveInFlight = resolve;
+    _rejectInFlight = reject;
+  });
+  recommendInFlight.set(_inflightKey, inflightPromise);
+
+  // Kick off real-data pool lookup
   const isoCode = COUNTRY_ISO[country];
   const realPoolPromise = isoCode ? buildRealArtistPool(country, isoCode) : Promise.resolve([]);
 
-  // Get user's top artists (with genres) and liked songs if authenticated
-  let topArtists = [];
-  let topGenreTags = [];
-  let likedSongs = [];
-
-  if (accessToken) {
-    // Fetch top artists (with genre tags) and a random sample of liked songs in parallel
-    await Promise.all([
-      // Top 10 artists — keep full objects for genre extraction
-      fetch(
-        "https://api.spotify.com/v1/me/top/artists?limit=10&time_range=medium_term",
-        { headers: { Authorization: "Bearer " + accessToken } }
-      ).then(async (r) => {
-        if (r.ok) {
-          const d = await r.json();
-          if (d.items) {
-            topArtists = d.items.map((a) => a.name);
-            // Aggregate unique genre tags across all top artists
-            const allTags = d.items.flatMap((a) => a.genres || []);
-            const tagCounts = {};
-            for (const t of allTags) tagCounts[t] = (tagCounts[t] || 0) + 1;
-            topGenreTags = Object.entries(tagCounts)
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 8)
-              .map(([tag]) => tag);
-          }
-        }
-      }).catch((err) => console.error("Error fetching top artists:", err)),
-
-      // Random sample of liked songs — first fetch total, then grab a random page
-      fetch(
-        "https://api.spotify.com/v1/me/tracks?limit=1",
-        { headers: { Authorization: "Bearer " + accessToken } }
-      ).then(async (r) => {
-        if (!r.ok) return;
-        const { total } = await r.json();
-        if (!total) return;
-        // Pick a random offset so we get variety across the whole library
-        const maxOffset = Math.max(0, Math.min(total - 10, total - 1));
-        const offset = Math.floor(Math.random() * maxOffset);
-        const tracksRes = await fetch(
-          `https://api.spotify.com/v1/me/tracks?limit=10&offset=${offset}`,
-          { headers: { Authorization: "Bearer " + accessToken } }
-        );
-        if (tracksRes.ok) {
-          const tracksData = await tracksRes.json();
-          likedSongs = tracksData.items
-            ? tracksData.items.map((i) => `${i.track.name} by ${i.track.artists[0].name}`)
-            : [];
-        }
-      }).catch((err) => console.error("Error fetching liked songs:", err)),
-    ]);
-  }
-
-  // Build personalization context
-  const artistNote = topArtists.length > 0
-    ? `\nTop artists they listen to: ${topArtists.join(", ")}.`
-    : "";
-  const genreNote = topGenreTags.length > 0
-    ? `\nTheir genre preferences (from Spotify listening data): ${topGenreTags.join(", ")}.`
-    : "";
-  const songsNote = likedSongs.length > 0
-    ? `\nSome songs from their liked songs library: ${likedSongs.join("; ")}.`
-    : "";
-  const personalizationNote = (artistNote || songsNote)
-    ? `\n\nPersonalization context for this user:${artistNote}${genreNote}${songsNote}\nUse this to: (1) personalize the "similarTo" comparisons to artists and styles they will recognize, and (2) lean toward subgenres of ${country}'s music that share sonic DNA with their genre preferences above — prioritize styles they are most likely to enjoy.`
-    : "";
-
-  // Await real artist pool (was running in parallel with Spotify fetch above)
   const realPool = await realPoolPromise;
   const realPoolNote = realPool.length > 0
     ? `\n\nVERIFIED ARTISTS from MusicBrainz + ListenBrainz databases for ${country}:\n${
@@ -1636,7 +1599,7 @@ Return exactly this JSON:
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
 }
-era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.${realPoolNote}${personalizationNote}`,
+era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.${realPoolNote}`,
           },
         ],
       }),
@@ -1667,22 +1630,18 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
     // (better to show something than nothing while cron fixes it)
     const artistPool = verifiedPool.length >= 4 ? verifiedPool : rec.artists;
 
-    if (accessToken && userId) {
-      const personalKey = makeCacheKey(["recommend", userId, country]);
-      await storeCache(personalKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
-      verifyArtistPoolWithMB(artistPool, country, [personalKey]).catch(() => {});
-    } else if (!accessToken) {
-      const cacheKey = makeCacheKey(["recommend", country]);
-      await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
-      verifyArtistPoolWithMB(artistPool, country, [cacheKey]).catch(() => {});
-    }
+    await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
+    verifyArtistPoolWithMB(artistPool, country, [cacheKey]).catch(() => {});
 
-    res.json({ genres: rec.genres, artists: pickDiverseByEra(artistPool, 4), didYouKnow: rec.didYouKnow });
+    const _result = { genres: rec.genres, artists: pickDiverseByEra(artistPool, 4), didYouKnow: rec.didYouKnow };
+    if (_resolveInFlight) { _resolveInFlight(_result); recommendInFlight.delete(_inflightKey); }
+    res.json(_result);
 
     // Queue any unverified artists for deep enrich in background
     const unverified = rec.artists.filter(a => !verifiedPool.find(v => v.name === a.name));
     if (unverified.length) addToEnrichmentQueue(unverified, country).catch(() => {});
   } catch (err) {
+    if (_rejectInFlight) { _rejectInFlight(err); recommendInFlight.delete(_inflightKey); }
     console.error("Error:", err);
     res.status(500).json({ error: err.message });
   }
@@ -2232,8 +2191,59 @@ Return exactly this JSON:
         console.log(`[genre-spotlight] after artist fallback: ${tracks.length} tracks`);
       }
 
-      // Phase 3: MusicBrainz tag search — supplement when still sparse
-      // MB coverage is skewed toward western music, so this is best-effort only
+      // Phase 3: Last.fm tag.getTopTracks — better genre coverage than MusicBrainz for niche genres
+      if (tracks.length < 4 && accessToken) {
+        try {
+          const lfKey = process.env.LASTFM_API_KEY;
+          if (lfKey) {
+            const lfTag = genre.toLowerCase().replace(/[^a-z0-9\s\-]/g, "").trim();
+            const lfRes = await fetch(
+              `https://ws.audioscrobbler.com/2.0/?method=tag.getTopTracks&tag=${encodeURIComponent(lfTag)}&limit=20&api_key=${lfKey}&format=json`
+            );
+            const lfData = await lfRes.json();
+            const lfTracks = (lfData.tracks?.track || []).slice(0, 20);
+            console.log(`[genre-spotlight] Last.fm tag "${lfTag}" → ${lfTracks.length} candidates`);
+
+            const seenIds = new Set(tracks.map(t => t.spotifyId));
+            const lfSpotifyResults = await Promise.all(
+              lfTracks.map(async (lt) => {
+                const title = lt.name;
+                const artist = lt.artist?.name;
+                if (!title || !artist) return null;
+                try {
+                  const sq = `track:${title} artist:${artist}`;
+                  const sr = await fetch(
+                    `https://api.spotify.com/v1/search?q=${encodeURIComponent(sq)}&type=track&limit=3&market=US`,
+                    { headers: { Authorization: "Bearer " + accessToken } }
+                  );
+                  const sd = await sr.json();
+                  const found = (sd.tracks?.items || []).find(t => artistNamesMatch(artist, t.artists?.[0]?.name || ""));
+                  if (!found) return null;
+                  return {
+                    title: found.name,
+                    artist: found.artists?.[0]?.name || artist,
+                    spotifyId: found.id,
+                    previewUrl: found.preview_url || null,
+                    spotifyUrl: `https://open.spotify.com/track/${found.id}`,
+                  };
+                } catch { return null; }
+              })
+            );
+
+            for (const t of lfSpotifyResults) {
+              if (!t || seenIds.has(t.spotifyId)) continue;
+              seenIds.add(t.spotifyId);
+              tracks.push(t);
+              if (tracks.length >= 5) break;
+            }
+            console.log(`[genre-spotlight] after Last.fm fallback: ${tracks.length} tracks`);
+          }
+        } catch (lfErr) {
+          console.warn(`[genre-spotlight] Last.fm fallback error:`, lfErr.message);
+        }
+      }
+
+      // Phase 4: MusicBrainz tag search — last resort, skewed toward western music
       if (tracks.length < 4 && accessToken) {
         try {
           const mbTag = genre.toLowerCase().replace(/[^\w\s\-']/g, "").trim();
@@ -3088,7 +3098,28 @@ Return ONLY valid JSON:
     const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
     const result = JSON.parse(raw);
 
-    const simPool = result.artists || [];
+    const rawPool = result.artists || [];
+
+    // Validate artists exist on Last.fm — filters hallucinations before caching
+    const lastfmKey2 = process.env.LASTFM_API_KEY;
+    const validatedPool = lastfmKey2
+      ? (await Promise.all(rawPool.map(async (artist) => {
+          try {
+            const r = await fetch(
+              `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artist.name)}&autocorrect=0&api_key=${lastfmKey2}&format=json`
+            );
+            const d = await r.json();
+            if (d.error || !d.artist?.name) {
+              console.log(`[similar-artists] filtered hallucination: ${artist.name}`);
+              return null;
+            }
+            return artist;
+          } catch { return artist; } // network error → keep, don't over-filter
+        }))).filter(Boolean)
+      : rawPool;
+    console.log(`[similar-artists] validation: ${rawPool.length} → ${validatedPool.length} artists`);
+
+    const simPool = await verifyPoolCountries(validatedPool);
     await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, simPool);
     // Write reverse-index entries for every artist in the pool
     await storeSimilarIndex(simPool, simCacheKey);
@@ -3440,29 +3471,56 @@ async function findWeakCountries(limit = 2) {
 
 // Fetch tracks for one artist using Apple Music (2-step: artist search → top songs)
 // Falls back to ListenBrainz if Apple Music doesn't carry the artist.
+// Search Apple Music across storefronts for a song query, returning the first match.
+// Tries 'us' first, then 'gb' for artists not in the US catalog.
+async function appleSongSearch(query, artistTarget, appleToken) {
+  const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const target = normalise(artistTarget);
+  for (const sf of ['us', 'gb']) {
+    try {
+      const r = await fetch(
+        `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(query)}&types=songs&limit=3`,
+        { headers: { Authorization: `Bearer ${appleToken}` } }
+      );
+      if (!r.ok) continue;
+      const d = await r.json();
+      const songs = d.results?.songs?.data || [];
+      const match = songs.find(s => {
+        const n = normalise(s.attributes.artistName);
+        // Only allow reverse inclusion if the found name is long enough to avoid
+        // short substrings (e.g. "strings") falsely matching within the target ("vanuastrings")
+        return n.includes(target) || (n.length >= 6 && target.includes(n));
+      });
+      if (match) return match;
+    } catch { /* try next storefront */ }
+  }
+  return null;
+}
+
 async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
   const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
   const target = normalise(artistName);
 
-  // 1. Apple Music: search for the artist
+  // 1. Apple Music: search for the artist (try us then gb)
   if (appleToken) {
     try {
-      const r = await fetch(
-        `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
-        { headers: { Authorization: `Bearer ${appleToken}` } }
-      );
-      if (r.ok) {
+      for (const sf of ['us', 'gb']) {
+        const r = await fetch(
+          `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
+          { headers: { Authorization: `Bearer ${appleToken}` } }
+        );
+        if (!r.ok) continue;
         const d = await r.json();
         const artists = d.results?.artists?.data || [];
         const matched = artists.find(a => normalise(a.attributes?.name || "") === target)
           ?? artists.find(a => {
             const n = normalise(a.attributes?.name || "");
-            return n.includes(target) || target.includes(n);
+            return n.includes(target) || (n.length >= 6 && target.includes(n));
           });
 
         if (matched) {
           const songsRes = await fetch(
-            `https://api.music.apple.com/v1/catalog/us/artists/${matched.id}/view/top-songs?limit=5`,
+            `https://api.music.apple.com/v1/catalog/${sf}/artists/${matched.id}/view/top-songs?limit=5`,
             { headers: { Authorization: `Bearer ${appleToken}` } }
           );
           if (songsRes.ok) {
@@ -3479,46 +3537,57 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
             }
           }
         }
+      }
 
-        // Artist not found on Apple Music — try searching for their known tracks directly
-        if (knownTracks.length > 0) {
-          const results = [];
-          for (const trackTitle of knownTracks.slice(0, 2)) {
-            const q = `${trackTitle} ${artistName}`;
-            const tr = await fetch(
-              `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(q)}&types=songs&limit=3`,
-              { headers: { Authorization: `Bearer ${appleToken}` } }
-            );
-            if (!tr.ok) continue;
-            const td = await tr.json();
-            const songs = td.results?.songs?.data || [];
-            const match = songs.find(s =>
-              normalise(s.attributes.artistName).includes(target) ||
-              target.includes(normalise(s.attributes.artistName))
-            );
-            if (match) results.push({
-              title: match.attributes.name,
-              artist: match.attributes.artistName,
-              appleId: match.id,
-              previewUrl: match.attributes.previews?.[0]?.url || null,
-              embedUrl: match.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
-            });
-          }
-          if (results.length > 0) return results;
+      // Artist not found on Apple Music — try searching for their known tracks directly
+      if (knownTracks.length > 0) {
+        const results = [];
+        for (const trackTitle of knownTracks.slice(0, 2)) {
+          const match = await appleSongSearch(`${trackTitle} ${artistName}`, artistName, appleToken);
+          if (match) results.push({
+            title: match.attributes.name,
+            artist: match.attributes.artistName,
+            appleId: match.id,
+            previewUrl: match.attributes.previews?.[0]?.url || null,
+            embedUrl: match.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
+          });
         }
+        if (results.length > 0) return results;
       }
     } catch { /* fall through to LB */ }
   }
 
   // 2. ListenBrainz fallback — returns title+artist without streaming IDs
   const lbTracks = await fetchArtistTracksFromLB(artistName);
+  if (lbTracks.length > 0 && appleToken) {
+    // Enrich LB tracks with Apple Music IDs via per-track song search (us then gb)
+    const enriched = await Promise.all(lbTracks.slice(0, 3).map(async (track) => {
+      try {
+        const match = await appleSongSearch(`${track.title} ${artistName}`, artistName, appleToken);
+        if (match) {
+          return {
+            ...track,
+            appleId: match.id,
+            previewUrl: match.attributes.previews?.[0]?.url || track.previewUrl || null,
+            embedUrl: match.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
+          };
+        }
+      } catch { /* keep as-is */ }
+      return track;
+    }));
+    return enriched;
+  }
   return lbTracks; // may be []
 }
 
 // Fetch tracks for one artist using Spotify (2-step: artist search → top tracks).
 // Does NOT restrict to market=US so non-Western artists are found globally.
 // Falls back to ListenBrainz if Spotify doesn't carry the artist.
-async function proactiveSpotifyTracks(artistName) {
+// Routes through spotifyEnqueue so parallel callers don't flood the API.
+function proactiveSpotifyTracks(artistName) {
+  return spotifyEnqueue(() => _proactiveSpotifyTracksImpl(artistName));
+}
+async function _proactiveSpotifyTracksImpl(artistName) {
   const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
   const target = normalize(artistName);
 
