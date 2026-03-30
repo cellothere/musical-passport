@@ -292,6 +292,8 @@ const CACHE_TTL = {
   'time-machine':       14 * 24 * 60 * 60 * 1000,
   'artist-tracks':      90 * 24 * 60 * 60 * 1000,
   'artist-tracks-apple':90 * 24 * 60 * 60 * 1000,
+  'similar-artists':    60 * 24 * 60 * 60 * 1000,
+  'similar-of':         60 * 24 * 60 * 60 * 1000,
 };
 
 async function storeCache(cacheKey, endpoint, result, artistPool = null) {
@@ -2936,6 +2938,22 @@ app.get("/api/find-artist", async (req, res) => {
 });
 
 // ── Similar artists from around the world ────────────────
+
+// Store reverse-index entries so pool members can find each other's pools
+async function storeSimilarIndex(poolMembers, poolKey) {
+  if (!supabase || !poolMembers?.length) return;
+  const ttlMs = CACHE_TTL["similar-artists"];
+  const expires_at = ttlMs ? new Date(Date.now() + ttlMs).toISOString() : null;
+  const rows = poolMembers.map(a => ({
+    cache_key: makeCacheKey(["similar-of", a.name]),
+    endpoint: "similar-of",
+    result: { poolKey },
+    artist_pool: null,
+    expires_at,
+  }));
+  await supabase.from("recommendation_cache").upsert(rows, { onConflict: "cache_key" });
+}
+
 app.post("/api/similar-artists", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
@@ -2944,14 +2962,31 @@ app.post("/api/similar-artists", async (req, res) => {
   if (!artistName) return res.status(400).json({ error: "Missing artistName." });
 
   const simCacheKey = makeCacheKey(["similar", artistName]);
+
+  // 1. Direct cache hit
   const simCached = await getCached(simCacheKey);
   if (simCached && simCached.artist_pool && simCached.artist_pool.length >= 4) {
     console.log(`[similar-artists] cache hit → ${artistName}`);
     return res.json({
       baseArtist: simCached.result.baseArtist,
-      sonicSummary: simCached.result.sonicSummary,
-      artists: pickDiverse(simCached.artist_pool, 4),
+      artists: pickDiverse(simCached.artist_pool, 6),
     });
+  }
+
+  // 2. Reverse-index hit — this artist appeared in someone else's pool
+  const reverseEntry = await getCached(makeCacheKey(["similar-of", artistName]));
+  if (reverseEntry?.result?.poolKey) {
+    const sourcePool = await getCached(reverseEntry.result.poolKey);
+    if (sourcePool?.artist_pool?.length >= 4) {
+      console.log(`[similar-artists] reverse-index hit → ${artistName} from pool ${reverseEntry.result.poolKey}`);
+      // Filter out the original base artist, then pick diverse results
+      const filtered = sourcePool.artist_pool.filter(
+        a => makeCacheKey([a.name]) !== makeCacheKey([sourcePool.result.baseArtist])
+      );
+      // Store a direct cache entry for future hits
+      await storeCache(simCacheKey, "similar-artists", { baseArtist: artistName }, filtered);
+      return res.json({ baseArtist: artistName, artists: pickDiverse(filtered, 6) });
+    }
   }
 
   try {
@@ -2980,90 +3015,47 @@ app.post("/api/similar-artists", async (req, res) => {
     const foundName = artist.name;
     const genres = artist.genres?.slice(0, 5) || [];
 
-    // Step 2: Get some track IDs for audio features
-    const tracksSearch = await fetch(
-      `https://api.spotify.com/v1/search?q=artist:${encodeURIComponent(foundName)}&type=track&limit=5&market=US`,
-      { headers: { Authorization: "Bearer " + token } }
-    );
-    const tracksData = await tracksSearch.json();
-    const trackIds = (tracksData.tracks?.items || [])
-      .filter(t => artistNamesMatch(foundName, t.artists?.[0]?.name || ""))
-      .slice(0, 5)
-      .map(t => t.id);
-
-    // Step 3: Try audio features (optional enrichment, may fail on newer API tiers)
-    let audioProfile = null;
-    if (trackIds.length > 0) {
+    // Step 2: Last.fm similar artists
+    let lastfmSimilar = [];
+    const lastfmKey = process.env.LASTFM_API_KEY;
+    if (lastfmKey) {
       try {
-        const featuresRes = await fetch(
-          `https://api.spotify.com/v1/audio-features?ids=${trackIds.join(",")}`,
-          { headers: { Authorization: "Bearer " + token } }
+        const lfRes = await fetch(
+          `https://ws.audioscrobbler.com/2.0/?method=artist.getSimilar&artist=${encodeURIComponent(foundName)}&limit=30&autocorrect=1&api_key=${lastfmKey}&format=json`
         );
-        const featuresData = await featuresRes.json();
-        const features = (featuresData.audio_features || []).filter(Boolean);
-        if (features.length > 0) {
-          const avg = (key) => (features.reduce((s, f) => s + f[key], 0) / features.length).toFixed(2);
-          audioProfile = {
-            danceability: avg("danceability"),
-            energy: avg("energy"),
-            valence: avg("valence"),
-            acousticness: avg("acousticness"),
-            tempo: Math.round(features.reduce((s, f) => s + f.tempo, 0) / features.length),
-          };
-        }
+        const lfData = await lfRes.json();
+        lastfmSimilar = (lfData.similarartists?.artist || [])
+          .map(a => ({ name: a.name, match: parseFloat(a.match) }))
+          .filter(a => a.match > 0.1)
+          .slice(0, 25);
+        console.log(`[similar-artists] Last.fm → ${lastfmSimilar.length} similar artists for ${foundName}`);
       } catch (e) {
-        console.log("Audio features unavailable:", e.message);
+        console.log("Last.fm unavailable:", e.message);
       }
     }
 
-    // Step 4: Fetch Spotify's own related artists for signal
-    let spotifyRelated = [];
-    try {
-      const relatedRes = await fetch(
-        `https://api.spotify.com/v1/artists/${artist.id}/related-artists`,
-        { headers: { Authorization: "Bearer " + token } }
-      );
-      const relatedData = await relatedRes.json();
-      spotifyRelated = (relatedData.artists || []).slice(0, 10).map(a => ({
-        name: a.name,
-        genres: a.genres?.slice(0, 3) || [],
-        country: a.country || null, // Spotify doesn't provide country, Claude will fill this in
-      }));
-    } catch (e) {
-      console.log("Related artists unavailable:", e.message);
-    }
-
-    // Step 5: Build Claude prompt
-    const profileLines = audioProfile
-      ? `Spotify audio profile (averaged across top tracks):
-- Danceability: ${audioProfile.danceability} / 1.0
-- Energy: ${audioProfile.energy} / 1.0
-- Valence (positivity): ${audioProfile.valence} / 1.0
-- Acousticness: ${audioProfile.acousticness} / 1.0
-- Tempo: ${audioProfile.tempo} BPM`
+    // Step 3: Build Claude prompt
+    const lastfmLines = lastfmSimilar.length > 0
+      ? `\nLast.fm similar artists (ranked by listener similarity — use these as your primary sonic reference to find global equivalents):\n${lastfmSimilar.map(a => `- ${a.name} (similarity: ${(a.match * 100).toFixed(0)}%)`).join("\n")}`
       : "";
 
-    const relatedLines = spotifyRelated.length > 0
-      ? `\nSpotify's related artists (use these as sonic reference — include any that are from non-Western or underrepresented countries, otherwise use them as style anchors to find global equivalents):\n${spotifyRelated.map(a => `- ${a.name}${a.genres.length ? ` (${a.genres.join(", ")})` : ""}`).join("\n")}`
-      : "";
-
-    const prompt = `Find 12 artists from different countries around the world who sound similar to ${foundName}.
+    const prompt = `Find 16 artists from different countries around the world who sound similar to ${foundName}.
 
 Their profile:
 - Primary genres: ${genres.length > 0 ? genres.join(", ") : "mainstream pop"}
-${profileLines}${relatedLines}
+${lastfmLines}
 
 Rules:
 - Each artist must be from a DIFFERENT country
-- Spread across at least 5 different continents
+- Spread across at least 6 different continents/regions
 - Mix of contemporary and classic artists
 - Avoid globally mainstream acts (no top-10 global chart artists)
-- If any of Spotify's related artists above are from Africa, Asia, Latin America, Middle East, or Oceania, include them directly
+- If any Last.fm similar artists above are from Africa, Asia, Latin America, Middle East, or Oceania, include them directly
+- For the rest, use the Last.fm list as a sonic fingerprint to find lesser-known global equivalents
 - Focus on capturing the same sonic energy, emotional feel, or stylistic DNA
 
 Return ONLY valid JSON:
 {
-  "sonicSummary": "1 sentence describing what defines their sound and why people love it",
   "artists": [
     {
       "name": "exact artist name as on Spotify",
@@ -3096,11 +3088,12 @@ Return ONLY valid JSON:
     const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
     const result = JSON.parse(raw);
 
-    const simMeta = { baseArtist: foundName, sonicSummary: result.sonicSummary || "" };
     const simPool = result.artists || [];
-    await storeCache(simCacheKey, "similar-artists", simMeta, simPool);
-    console.log(`[similar-artists] Claude → ${artistName} (${simPool.length} matches)`);
-    res.json({ ...simMeta, artists: pickDiverse(simPool, 4) });
+    await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, simPool);
+    // Write reverse-index entries for every artist in the pool
+    await storeSimilarIndex(simPool, simCacheKey);
+    console.log(`[similar-artists] Claude → ${foundName} (${simPool.length} matches)`);
+    res.json({ baseArtist: foundName, artists: pickDiverse(simPool, 6) });
   } catch (err) {
     console.error("Similar artists error:", err);
     res.status(500).json({ error: err.message });
