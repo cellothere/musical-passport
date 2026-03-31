@@ -1640,8 +1640,14 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
 
     console.log(`[recommend] Claude → ${country} (${rec.artists.length} artists, ${rec.genres.length} genres)`);
 
-    // Verify all artists have playable tracks before storing — run in parallel
-    const verifiedPool = await verifyArtistTracksForRecommend(rec.artists, country);
+    // Strip artists already known to be unplayable before verification
+    const unflaggedArtists = await filterOutFlaggedArtists(rec.artists);
+    if (unflaggedArtists.length < rec.artists.length) {
+      console.log(`[recommend] removed ${rec.artists.length - unflaggedArtists.length} pre-flagged artists for ${country}`);
+    }
+
+    // Verify remaining artists have playable tracks before storing
+    const verifiedPool = await verifyArtistTracksForRecommend(unflaggedArtists, country);
     console.log(`[recommend] verified ${verifiedPool.length}/${rec.artists.length} artists have tracks for ${country}`);
 
     // Use verified pool if large enough, otherwise fall back to full Claude pool
