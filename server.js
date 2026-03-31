@@ -2676,8 +2676,35 @@ async function _fetchArtistTracksImpl(artistName) {
         return n.includes(target) || target.includes(n);
       });
 
+    // Helper: search Spotify for specific track+artist, return a track object or null
+    const spotifyTrackSearch = async (title, artistHint) => {
+      const r = await spotifyFetch(
+        `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:"${title}" artist:"${artistHint}"`)}&type=track&limit=3`,
+        { headers: { Authorization: "Bearer " + accessToken } }
+      );
+      if (!r.ok) return null;
+      const d = await r.json();
+      return (d.tracks?.items || []).find(t =>
+        t.artists?.some(a => normalize(a.name) === target || normalize(a.name).includes(target) || target.includes(normalize(a.name)))
+      ) ?? null;
+    };
+
     if (!matchedArtist) {
-      console.log(`  No matching artist found for "${artistName}" on Spotify → trying ListenBrainz`);
+      // Artist not on Spotify by name — try Last.fm seed titles as targeted searches
+      console.log(`  No artist match for "${artistName}" on Spotify → trying Last.fm seeded search`);
+      const lfTitles = await lastfmArtistTopTracks(artistName, 5);
+      const lfResults = [];
+      for (const title of lfTitles) {
+        const match = await spotifyTrackSearch(title, artistName);
+        if (match) lfResults.push({ title: match.name, artist: match.artists?.[0]?.name, spotifyId: match.id, previewUrl: match.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${match.id}` });
+        if (lfResults.length >= 3) break;
+      }
+      if (lfResults.length > 0) {
+        console.log(`  [artist-tracks] LF-seeded search found ${lfResults.length} tracks for "${artistName}"`);
+        artistTracksMemCache.set(cacheKey, { tracks: lfResults, cachedAt: Date.now() });
+        storeCache(cacheKey, "artist-tracks", { tracks: lfResults }).catch(() => {});
+        return lfResults;
+      }
       return fetchArtistTracksFromLB(artistName);
     }
 
@@ -2694,6 +2721,7 @@ async function _fetchArtistTracksImpl(artistName) {
       const topData = await topTracksRes.json();
       tracks = (topData.tracks || []).slice(0, 3).map(track => ({
         title: track.name,
+        artist: track.artists?.[0]?.name,
         spotifyId: track.id,
         previewUrl: track.preview_url || null,
         spotifyUrl: `https://open.spotify.com/track/${track.id}`,
@@ -2701,7 +2729,7 @@ async function _fetchArtistTracksImpl(artistName) {
     }
 
     // top-tracks?market=US returns empty for artists not licensed in the US (e.g. German, Latin).
-    // Fall back to a track search by artist ID — no market restriction.
+    // Fall back to a broad artist track search — no market restriction.
     if (tracks.length === 0) {
       console.log(`  [artist-tracks] top-tracks empty for "${artistName}", trying search fallback`);
       const searchRes = await spotifyFetch(
@@ -2721,6 +2749,20 @@ async function _fetchArtistTracksImpl(artistName) {
           spotifyUrl: `https://open.spotify.com/track/${t.id}`,
         }));
         if (tracks.length > 0) console.log(`  [artist-tracks] search fallback found ${tracks.length} tracks for "${artistName}"`);
+      }
+    }
+
+    // Still empty — try Last.fm seeded targeted searches before giving up
+    if (tracks.length === 0) {
+      const lfTitles = await lastfmArtistTopTracks(artistName, 5);
+      if (lfTitles.length > 0) {
+        console.log(`  [artist-tracks] trying LF-seeded search for "${artistName}" (${lfTitles.length} seed titles)`);
+        for (const title of lfTitles) {
+          const match = await spotifyTrackSearch(title, artistName);
+          if (match) tracks.push({ title: match.name, artist: match.artists?.[0]?.name, spotifyId: match.id, previewUrl: match.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${match.id}` });
+          if (tracks.length >= 3) break;
+        }
+        if (tracks.length > 0) console.log(`  [artist-tracks] LF-seeded search found ${tracks.length} tracks for "${artistName}"`);
       }
     }
 
@@ -3981,7 +4023,7 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
         const results = [];
         for (const title of knownTitles) {
           const r = await spotifyFetch(
-            `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:${title} artist:${artistName}`)}&type=track&limit=3&market=US`,
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:"${title}" artist:"${artistName}"`)}&type=track&limit=3`,
             { headers: { Authorization: "Bearer " + token } }
           );
           if (!r.ok) continue;
