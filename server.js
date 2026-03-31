@@ -773,6 +773,7 @@ async function processEnrichmentBatch(batchSize = 5) {
 
   if (!items?.length) return { processed: 0, total: 0 };
 
+  const appleToken = generateAppleMusicToken();
   let processed = 0;
   for (const item of items) {
     await supabase.from("enrichment_queue")
@@ -780,11 +781,23 @@ async function processEnrichmentBatch(batchSize = 5) {
       .eq("id", item.id);
 
     try {
+      // Last.fm top tracks give us seed titles to search with — much better hit rate
+      const lfTitles = await lastfmArtistTopTracks(item.artist, 5);
+      if (lfTitles.length > 0) console.log(`[enrich] Last.fm → ${lfTitles.length} seed titles for "${item.artist}"`);
+
       const timeout = new Promise((_, reject) =>
         setTimeout(() => reject(new Error('timeout')), 20000)
       );
-      const tracks = await Promise.race([fetchArtistTracks(item.artist), timeout]);
+      // Use Apple Music + LB enriched with Last.fm titles; fall back to Spotify queue
+      const trackPromise = lfTitles.length > 0
+        ? proactiveArtistTracks(item.artist, lfTitles, appleToken)
+        : fetchArtistTracks(item.artist);
+      const tracks = await Promise.race([trackPromise, timeout]);
+
       if (tracks.length > 0) {
+        const cacheKey = makeCacheKey(["artist-tracks-apple", item.artist]);
+        artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
+        storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
         await supabase.from("enrichment_queue")
           .update({ completed_at: new Date().toISOString() })
           .eq("id", item.id);
@@ -3705,8 +3718,40 @@ async function reQueueForDeepEnrich(artistName) {
     .is("completed_at", null);
 }
 
+// ── Last.fm helpers ───────────────────────────────────────
+
+// Returns up to `limit` top track titles for an artist from Last.fm.
+// Excellent coverage for non-Western artists thanks to global scrobbling.
+async function lastfmArtistTopTracks(artistName, limit = 5) {
+  const key = process.env.LASTFM_API_KEY;
+  if (!key) return [];
+  try {
+    const r = await fetch(
+      `https://ws.audioscrobbler.com/2.0/?method=artist.getTopTracks&artist=${encodeURIComponent(artistName)}&limit=${limit}&autocorrect=1&api_key=${key}&format=json`
+    );
+    const d = await r.json();
+    if (d.error) return [];
+    return (d.toptracks?.track || []).map(t => t.name);
+  } catch { return []; }
+}
+
+// Returns top artist names for a country from Last.fm geo.getTopArtists.
+// Uses real scrobble data — much more reliable than Claude alone for country attribution.
+async function lastfmGeoTopArtists(country, limit = 25) {
+  const key = process.env.LASTFM_API_KEY;
+  if (!key) return [];
+  try {
+    const r = await fetch(
+      `https://ws.audioscrobbler.com/2.0/?method=geo.getTopArtists&country=${encodeURIComponent(country)}&limit=${limit}&api_key=${key}&format=json`
+    );
+    const d = await r.json();
+    if (d.error) return [];
+    return (d.topartists?.artist || []).map(a => a.name);
+  } catch { return []; }
+}
+
 // Find all artist-tracks cache entries flagged as empty, then try much harder to find tracks.
-// Uses Claude to surface specific song titles, then searches Apple Music + Spotify + LB.
+// Uses Last.fm to surface specific song titles first, falls back to Claude then LB.
 async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
   if (!supabase) return { processed: 0 };
 
@@ -3738,23 +3783,29 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
     // Reconstruct artist name from slug (hyphens back to spaces, best effort)
     const artistName = slug.replace(/-/g, " ");
 
-    // Step 1: ask Claude for the artist's 3 most famous specific song titles
-    let knownTitles = [];
-    try {
-      const cr = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 150,
-          system: "Return ONLY valid JSON — no markdown, no preamble.",
-          messages: [{ role: "user", content: `What are 3 real, specific song titles that the artist "${artistName}" is best known for? If you don't know this artist, return an empty list. JSON: {"titles": ["Title 1", "Title 2", "Title 3"]}` }],
-        }),
-      });
-      const cd = await cr.json();
-      const raw = (cd.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
-      knownTitles = JSON.parse(raw).titles || [];
-    } catch { /* proceed without Claude titles */ }
+    // Step 1a: Last.fm artist.getTopTracks — fast, free, great non-Western coverage
+    let knownTitles = await lastfmArtistTopTracks(artistName, 5);
+    if (knownTitles.length > 0) {
+      console.log(`[deep-enrich] Last.fm → ${knownTitles.length} known tracks for "${artistName}"`);
+    } else {
+      // Step 1b: Fall back to Claude Haiku only if Last.fm has nothing
+      try {
+        const cr = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 150,
+            system: "Return ONLY valid JSON — no markdown, no preamble.",
+            messages: [{ role: "user", content: `What are 3 real, specific song titles that the artist "${artistName}" is best known for? If you don't know this artist, return an empty list. JSON: {"titles": ["Title 1", "Title 2", "Title 3"]}` }],
+          }),
+        });
+        const cd = await cr.json();
+        const raw = (cd.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
+        knownTitles = JSON.parse(raw).titles || [];
+        if (knownTitles.length > 0) console.log(`[deep-enrich] Claude → ${knownTitles.length} known tracks for "${artistName}"`);
+      } catch { /* proceed without titles */ }
+    }
 
     // Step 2: search for the artist + known titles across Apple Music and Spotify
     const isApple = endpoint === "artist-tracks-apple";
@@ -3814,7 +3865,14 @@ async function deepEnrichCountry(country, apiKey) {
   console.log(`[country-enrich] Researching ${country}...`);
   const appleToken = generateAppleMusicToken();
 
-  // Step 1: Claude researches the country's music scene in depth
+  // Step 1a: Pull Last.fm geo.getTopArtists to ground Claude in real scrobble data
+  const lfArtists = await lastfmGeoTopArtists(country, 25);
+  const lfNote = lfArtists.length > 0
+    ? `\n\nLast.fm top artists for ${country} (verified by global scrobbling data — these artists are genuinely associated with ${country}):\n${lfArtists.join(', ')}\n\nPrioritize these artists in your response. You may add others not on this list only if you are certain they are from ${country}.`
+    : '';
+  if (lfArtists.length > 0) console.log(`[country-enrich] Last.fm → ${lfArtists.length} artists for ${country}`);
+
+  // Step 1b: Claude researches the country's music scene in depth
   const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
@@ -3847,7 +3905,7 @@ Return exactly this JSON:
 era must be exactly one of: Contemporary, Golden Era, Pioneer.
 Include 12 artists — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
 knownTracks: real specific song titles this artist is known for (used to find them on Spotify/Apple Music).
-likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.`
+likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.${lfNote}`
       }]
     }),
   });
