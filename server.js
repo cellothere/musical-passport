@@ -1398,7 +1398,7 @@ async function fetchArtistTracksFromLB(artistName) {
     }));
     // Validate that the returned tracks actually belong to the requested artist.
     // MusicBrainz fuzzy search can match the wrong MBID (e.g. "George Boe" → Alfie Boe).
-    const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const normalise = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
     const target = normalise(artistName);
     const anyMatch = tracks.some(t => {
       const n = normalise(t.artist || "");
@@ -2818,9 +2818,10 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
   if (!token) return res.status(503).json({ error: "Apple Music not configured." });
 
   try {
-    // Step 1: search for the artist by name
+    // Step 1: search for the artist by name (strip ensemble suffixes for better search results)
+    const searchName = primaryArtistName(artistName);
     const artistSearch = await fetch(
-      `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
+      `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(searchName)}&types=artists&limit=5`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
     if (!artistSearch.ok) return res.json({ tracks: [] });
@@ -2828,10 +2829,13 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
     const artists = artistData.results?.artists?.data || [];
 
     // Find the best-matching artist (name must closely match)
-    const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const target = normalise(artistName);
+    const normalise = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const target = normalise(searchName);
     const matchedArtist = artists.find(a => normalise(a.attributes?.name || "") === target)
-      ?? artists.find(a => normalise(a.attributes?.name || "").includes(target) || target.includes(normalise(a.attributes?.name || "")));
+      ?? artists.find(a => {
+        const n = normalise(a.attributes?.name || "");
+        return n.includes(target) || (n.length >= 6 && target.includes(n)) || fuzzyArtistMatch(n, target);
+      });
 
     let tracks = [];
     if (matchedArtist) {
@@ -3510,10 +3514,33 @@ async function findWeakCountries(limit = 2) {
 // Fetch tracks for one artist using Apple Music (2-step: artist search → top songs)
 // Falls back to ListenBrainz if Apple Music doesn't carry the artist.
 // Search Apple Music across storefronts for a song query, returning the first match.
+// Strip ensemble/feat suffixes so "Mulatu Astatqé & His Ethiopian Quintet" → "Mulatu Astatqé"
+// and "Dexter Story feat. Hamelmal Abate" → "Dexter Story".
+// Only strips "& His/Her/The/Their..." (ensemble markers) — preserves "Simon & Garfunkel".
+function primaryArtistName(name) {
+  return name
+    .replace(/\s+(?:feat\.|ft\.|featuring)\s+.*/i, '')
+    .replace(/\s+&\s+(?:his|her|the|their)\b.*/i, '')
+    .trim() || name;
+}
+
+// Allow 1-character difference for names of similar length — handles transliteration
+// variants like "Beqele" vs "Bekele" (Amharic q/k) without risking false positives.
+function fuzzyArtistMatch(a, b) {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > 1 || a.length < 7) return false;
+  let diffs = 0;
+  const minLen = Math.min(a.length, b.length);
+  for (let i = 0; i < minLen; i++) {
+    if (a[i] !== b[i] && ++diffs > 1) return false;
+  }
+  return diffs <= 1;
+}
+
 // Tries 'us' first, then 'gb' for artists not in the US catalog.
 async function appleSongSearch(query, artistTarget, appleToken) {
-  const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const target = normalise(artistTarget);
+  const normalise = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const target = normalise(primaryArtistName(artistTarget));
   for (const sf of ['us', 'gb']) {
     try {
       const r = await fetch(
@@ -3527,7 +3554,7 @@ async function appleSongSearch(query, artistTarget, appleToken) {
         const n = normalise(s.attributes.artistName);
         // Only allow reverse inclusion if the found name is long enough to avoid
         // short substrings (e.g. "strings") falsely matching within the target ("vanuastrings")
-        return n.includes(target) || (n.length >= 6 && target.includes(n));
+        return n.includes(target) || (n.length >= 6 && target.includes(n)) || fuzzyArtistMatch(n, target);
       });
       if (match) return match;
     } catch { /* try next storefront */ }
@@ -3536,15 +3563,17 @@ async function appleSongSearch(query, artistTarget, appleToken) {
 }
 
 async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
-  const normalise = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const target = normalise(artistName);
+  const normalise = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  // Strip ensemble suffixes for search/matching: "Mulatu Astatqé & His Ethiopian Quintet" → "Mulatu Astatqé"
+  const searchName = primaryArtistName(artistName);
+  const target = normalise(searchName);
 
   // 1. Apple Music: search for the artist (try us then gb)
   if (appleToken) {
     try {
       for (const sf of ['us', 'gb']) {
         const r = await fetch(
-          `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
+          `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(searchName)}&types=artists&limit=5`,
           { headers: { Authorization: `Bearer ${appleToken}` } }
         );
         if (!r.ok) continue;
@@ -3553,7 +3582,7 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
         const matched = artists.find(a => normalise(a.attributes?.name || "") === target)
           ?? artists.find(a => {
             const n = normalise(a.attributes?.name || "");
-            return n.includes(target) || (n.length >= 6 && target.includes(n));
+            return n.includes(target) || (n.length >= 6 && target.includes(n)) || fuzzyArtistMatch(n, target);
           });
 
         if (matched) {
