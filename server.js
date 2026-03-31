@@ -901,25 +901,47 @@ function pickDiverse(arr, n) {
 
 // Pick n artists from pool ensuring era diversity (Contemporary / Golden Era / Pioneer).
 function pickDiverseByEra(arr, n) {
-  const shuffled = [...arr].sort(() => Math.random() - 0.5);
-  const byEra = {};
-  for (const a of shuffled) {
-    const era = a.era || "Other";
-    (byEra[era] = byEra[era] || []).push(a);
-  }
-  const eras = Object.keys(byEra).sort(() => Math.random() - 0.5);
-  const chosen = [];
-  while (chosen.length < n) {
-    let added = false;
-    for (const era of eras) {
-      if (chosen.length >= n) break;
-      if (byEra[era].length === 0) continue;
-      chosen.push(byEra[era].shift());
-      added = true;
+  // Prefer artists with verified tracks; fill remaining slots from unverified
+  const withTracks = arr.filter(a => a.hasVerifiedTracks);
+  const withoutTracks = arr.filter(a => !a.hasVerifiedTracks);
+
+  function pickByEra(pool, limit) {
+    const shuffled = [...pool].sort(() => Math.random() - 0.5);
+    const byEra = {};
+    for (const a of shuffled) {
+      const era = a.era || "Other";
+      (byEra[era] = byEra[era] || []).push(a);
     }
-    if (!added) break;
+    const eras = Object.keys(byEra).sort(() => Math.random() - 0.5);
+    const chosen = [];
+    while (chosen.length < limit) {
+      let added = false;
+      for (const era of eras) {
+        if (chosen.length >= limit) break;
+        if (byEra[era].length === 0) continue;
+        chosen.push(byEra[era].shift());
+        added = true;
+      }
+      if (!added) break;
+    }
+    return chosen;
   }
-  return chosen;
+
+  const fromVerified = pickByEra(withTracks, n);
+  const remaining = n - fromVerified.length;
+  const fromUnverified = remaining > 0 ? pickByEra(withoutTracks, remaining) : [];
+  // Verified artists come first in the returned list
+  return [...fromVerified, ...fromUnverified];
+}
+
+// Annotate each artist with hasVerifiedTracks based on in-memory track cache
+function annotateTrackStatus(artists) {
+  return artists.map(a => {
+    const ck = makeCacheKey(["artist-tracks-apple", a.name]);
+    const mem = artistTracksMemCache.get(ck);
+    const hasVerifiedTracks = !!(mem && mem.tracks.length > 0 && Date.now() - mem.cachedAt < ARTIST_TRACKS_TTL_MS);
+    return { ...a, hasVerifiedTracks };
+  });
 }
 
 // Fuzzy artist-name match: prevents wrong tracks being accepted from catalog search.
@@ -1555,7 +1577,7 @@ app.post("/api/recommend", async (req, res) => {
     if (pool.length >= 4) {
       return res.json({
         genres: cached.result.genres,
-        artists: pickDiverseByEra(pool, 4),
+        artists: pickDiverseByEra(annotateTrackStatus(pool), 4),
         didYouKnow: cached.result.didYouKnow,
       });
     }
@@ -1665,7 +1687,10 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
 
     // Use verified pool if large enough, otherwise fall back to full Claude pool
     // (better to show something than nothing while cron fixes it)
-    const artistPool = verifiedPool.length >= 4 ? verifiedPool : rec.artists;
+    const verifiedNames = new Set(verifiedPool.map(a => a.name));
+    const rawPool = verifiedPool.length >= 4 ? verifiedPool : rec.artists;
+    // Annotate each artist with whether we confirmed they have tracks
+    const artistPool = rawPool.map(a => ({ ...a, hasVerifiedTracks: verifiedNames.has(a.name) }));
 
     await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
     verifyArtistPoolWithMB(artistPool, country, [cacheKey]).catch(() => {});
