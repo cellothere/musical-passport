@@ -2510,7 +2510,8 @@ Return exactly this JSON:
       "name": "Artist Name",
       "genre": "${genre}",
       "era": "Contemporary",
-      "country": "Country name"
+      "country": "Country name",
+      "countryCode": "XX"
     }
   ]
 }
@@ -2521,7 +2522,7 @@ Rules:
 - Include at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
 - Artists should be real, historically significant or culturally important for this genre in their country.
 - Prioritize artists from countries where this genre originated or has a strong tradition.
-- Do NOT include the "country" field in the final output — just name, genre, era.`,
+- countryCode must be the correct ISO 3166-1 alpha-2 two-letter country code (e.g. "NG" for Nigeria, "BR" for Brazil).`,
           },
         ],
       }),
