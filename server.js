@@ -3494,7 +3494,7 @@ app.post("/api/user/sync", async (req, res) => {
 
   const [favResult, stampsResult, insightsResult] = await Promise.all([
     supabase.from("user_favorites").select("*").eq("spotify_id", spotifyId).order("saved_at", { ascending: false }),
-    supabase.from("user_stamps").select("country").eq("spotify_id", spotifyId),
+    supabase.from("user_stamps").select("country, stamped_at, visit_count, genre, source").eq("spotify_id", spotifyId).order("stamped_at", { ascending: false }),
     supabase.from("user_insights").select("*").eq("spotify_id", spotifyId).single(),
   ]);
 
@@ -3506,7 +3506,13 @@ app.post("/api/user/sync", async (req, res) => {
 
   res.json({
     favorites: (favResult.data || []).map(formatFavorite),
-    stamps: (stampsResult.data || []).map(s => s.country),
+    stamps: (stampsResult.data || []).map(s => ({
+      country: s.country,
+      stampedAt: s.stamped_at,
+      visitCount: s.visit_count ?? 1,
+      genre: s.genre ?? null,
+      source: s.source ?? null,
+    })),
     insights: insightsFresh ? insights.data : null,
   });
 });
@@ -3551,8 +3557,14 @@ app.get("/api/user/stamps", async (req, res) => {
   const spotifyId = await resolveSpotifyUser(req.headers.authorization);
   if (!spotifyId) return res.status(401).json({ error: "Unauthorized" });
   if (!supabase) return res.json([]);
-  const { data } = await supabase.from("user_stamps").select("country").eq("spotify_id", spotifyId);
-  res.json((data || []).map(s => s.country));
+  const { data } = await supabase.from("user_stamps").select("country, stamped_at, visit_count, genre, source").eq("spotify_id", spotifyId).order("stamped_at", { ascending: false });
+  res.json((data || []).map(s => ({
+    country: s.country,
+    stampedAt: s.stamped_at,
+    visitCount: s.visit_count ?? 1,
+    genre: s.genre ?? null,
+    source: s.source ?? null,
+  })));
 });
 
 app.post("/api/user/stamps", async (req, res) => {
@@ -3564,8 +3576,28 @@ app.post("/api/user/stamps", async (req, res) => {
     { spotify_id: spotifyId, last_seen_at: new Date().toISOString() },
     { onConflict: "spotify_id" }
   );
-  const { country } = req.body;
-  await supabase.from("user_stamps").upsert({ spotify_id: spotifyId, country }, { onConflict: "spotify_id,country" });
+  const { country, source, genre } = req.body;
+
+  // Check if stamp already exists to increment visit_count
+  const { data: existing } = await supabase
+    .from("user_stamps")
+    .select("visit_count")
+    .eq("spotify_id", spotifyId)
+    .eq("country", country)
+    .single();
+
+  if (existing) {
+    await supabase
+      .from("user_stamps")
+      .update({ visit_count: (existing.visit_count || 1) + 1, source: source || null, genre: genre || null })
+      .eq("spotify_id", spotifyId)
+      .eq("country", country);
+  } else {
+    await supabase
+      .from("user_stamps")
+      .insert({ spotify_id: spotifyId, country, source: source || null, genre: genre || null, visit_count: 1 });
+  }
+
   res.json({ ok: true });
 });
 
