@@ -306,6 +306,7 @@ const CACHE_TTL = {
   'artist-tracks-apple':90 * 24 * 60 * 60 * 1000,
   'similar-artists':    60 * 24 * 60 * 60 * 1000,
   'similar-of':         60 * 24 * 60 * 60 * 1000,
+  'genre-artists':      30 * 24 * 60 * 60 * 1000,
 };
 
 async function storeCache(cacheKey, endpoint, result, artistPool = null) {
@@ -2123,14 +2124,18 @@ When the local scene is small, use the explanation to honestly describe the coun
 
 Return exactly this JSON:
 {
+  "hasLocalScene": true,
   "explanation": "1 sentence: what defines this genre in ${country}, its roots, local context, and why it matters",
   "tracks": [
     { "title": "exact track title", "artist": "exact artist name" }
   ],
-  "artists": ["Artist Name 1", "Artist Name 2", "Artist Name 3"]
+  "artists": ["Artist Name 1", "Artist Name 2", "Artist Name 3"],
+  "suggestedGenres": ["Genre 1", "Genre 2", "Genre 3"]
 }
-- "tracks": 1–6 specific tracks by artists from ${country}. Use exact titles and artist names as they appear on streaming platforms.
-- "artists": up to 6 key artists from ${country} known for this genre (may overlap with track artists). These are used as a fallback to discover more tracks on streaming platforms.`,
+- "hasLocalScene": set to false if ${country} has no meaningful local scene for "${genre}" (fewer than 2 genuine local artists you can confidently name). When false, set tracks and artists to empty arrays — do NOT pad with artists from other countries.
+- "tracks": 1–6 specific tracks by artists who are actually FROM ${country}. If you are not certain an artist is from ${country}, omit them. Return an empty array rather than include a single foreign artist.
+- "artists": up to 6 key artists genuinely FROM ${country} known for this genre. Empty array if hasLocalScene is false.
+- "suggestedGenres": exactly 3 music genres that DO have a genuine, notable scene in ${country}. These must be real genres with actual artists from ${country}.`,
         }],
       }),
     });
@@ -2367,7 +2372,9 @@ Return exactly this JSON:
       tracks = tracks.slice(0, 5);
     }
 
-    const gsResult = { genre, country, explanation: spotlight.explanation, tracks };
+    // If Claude says there's no local scene, discard any tracks it may have hallucinated
+    if (spotlight.hasLocalScene === false) tracks = [];
+    const gsResult = { genre, country, explanation: spotlight.explanation, tracks, suggestedGenres: spotlight.suggestedGenres || [], hasLocalScene: spotlight.hasLocalScene !== false };
     await storeCache(gsCacheKey, "genre-spotlight", gsResult);
     console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${tracks.length} tracks)`);
     res.json(gsResult);
@@ -2447,6 +2454,105 @@ Return exactly:
     res.json(result);
   } catch (err) {
     console.error("[genre-deeper] error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Genre Artists — global artists for a genre ────────────
+app.post("/api/genre-artists", async (req, res) => {
+  const { genre } = req.body;
+  if (!genre) return res.status(400).json({ error: "genre is required" });
+
+  const cacheKey = makeCacheKey(["genre-artists", genre]);
+
+  // Try cache first
+  if (supabase) {
+    const { data } = await supabase
+      .from("recommendation_cache")
+      .select("result, expires_at")
+      .eq("cache_key", cacheKey)
+      .maybeSingle();
+    if (data?.result) {
+      const expired = data.expires_at && new Date(data.expires_at) < new Date();
+      if (!expired) {
+        console.log(`[genre-artists] cache hit → ${genre}`);
+        const artists = pickDiverseByEra(annotateTrackStatus(data.result.artists || []), 8);
+        return res.json({ genre, artists });
+      }
+    }
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "API key not configured" });
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 2000,
+        system:
+          "You are a world music curator with deep knowledge of musical genres across all countries and eras. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [
+          {
+            role: "user",
+            content: `List notable artists worldwide for the genre "${genre}".
+
+Return exactly this JSON:
+{
+  "artists": [
+    {
+      "name": "Artist Name",
+      "genre": "${genre}",
+      "era": "Contemporary",
+      "country": "Country name"
+    }
+  ]
+}
+
+Rules:
+- Include exactly 12 artists from diverse countries — not just English-speaking or Western artists.
+- Each era must be exactly one of: Contemporary, Golden Era, Pioneer.
+- Include at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
+- Artists should be real, historically significant or culturally important for this genre in their country.
+- Prioritize artists from countries where this genre originated or has a strong tradition.
+- Do NOT include the "country" field in the final output — just name, genre, era.`,
+          },
+        ],
+      }),
+    });
+
+    if (response.status === 529) {
+      return res.status(503).json({ error: "Our servers are busy right now. Try again in a moment." });
+    }
+
+    const data = await response.json();
+    if (data.error) return res.status(500).json({ error: data.error.message });
+
+    const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(raw);
+    const artists = parsed.artists || [];
+
+    console.log(`[genre-artists] Claude → ${genre} (${artists.length} artists)`);
+
+    // Store in cache (30 day TTL)
+    if (supabase) {
+      const expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      await supabase.from("recommendation_cache").upsert(
+        { cache_key: cacheKey, endpoint: "genre-artists", result: { artists }, expires_at },
+        { onConflict: "cache_key" }
+      );
+    }
+
+    const annotated = annotateTrackStatus(artists);
+    return res.json({ genre, artists: pickDiverseByEra(annotated, 8) });
+  } catch (err) {
+    console.error("[genre-artists] error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
