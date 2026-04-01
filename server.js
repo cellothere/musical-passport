@@ -4456,5 +4456,5 @@ async function backfillArtistImageUrls() {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎵 Musical Passport running at http://localhost:${PORT}\n`);
   // Delay backfill so it doesn't compete with initial traffic on cold start
-  // setTimeout(() => backfillArtistImageUrls().catch(err => console.error('[image-backfill] error:', err.message)), 15_000);
+  setTimeout(() => backfillArtistImageUrls().catch(err => console.error('[image-backfill] error:', err.message)), 15_000);
 });
