@@ -56,6 +56,72 @@ async function getClientAccessToken() {
   }
 }
 
+// ── Artist image URL fetching (Spotify → Last.fm fallback) ──
+async function fetchArtistImageUrl(artistName, { skipSpotify = false } = {}) {
+  if (!skipSpotify) try {
+    const token = await getClientAccessToken();
+    if (token) {
+      const r = await fetch(
+        `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
+        { headers: { Authorization: 'Bearer ' + token } }
+      );
+      const data = await r.json();
+      const candidates = data.artists?.items || [];
+      if (candidates.length > 0) {
+        const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const qNorm = normalize(artistName);
+        const match = candidates.find(a => normalize(a.name) === qNorm)
+          || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
+          || candidates[0];
+        if (match && (normalize(match.name).includes(qNorm) || qNorm.includes(normalize(match.name)))) {
+          const url = match.images?.[0]?.url;
+          if (url) return url;
+        }
+      }
+    }
+  } catch {}
+
+  try {
+    const appleToken = generateAppleMusicToken();
+    if (appleToken) {
+      const r = await fetch(
+        `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
+        { headers: { Authorization: `Bearer ${appleToken}` } }
+      );
+      if (r.ok) {
+        const data = await r.json();
+        const candidates = data.results?.artists?.data || [];
+        const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const target = normalise(artistName);
+        const match = candidates.find(a => normalise(a.attributes?.name || '') === target)
+          ?? candidates.find(a => {
+            const n = normalise(a.attributes?.name || '');
+            return n.includes(target) || target.includes(n);
+          });
+        const artworkUrl = match?.attributes?.artwork?.url;
+        if (artworkUrl) return artworkUrl.replace('{w}', '600').replace('{h}', '600');
+      }
+    }
+  } catch {}
+
+  try {
+    const lfKey = process.env.LASTFM_API_KEY;
+    if (lfKey) {
+      const r = await fetch(
+        `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artistName)}&autocorrect=1&api_key=${lfKey}&format=json`
+      );
+      const data = await r.json();
+      const images = data.artist?.image || [];
+      const large = images.find(i => i.size === 'extralarge' || i.size === 'mega');
+      const url = (large || images[images.length - 1])?.['#text'];
+      // Last.fm default placeholder hash — skip it
+      if (url && !url.includes('2a96cbd8b46e442fc41c2b86b821562f')) return url;
+    }
+  } catch {}
+
+  return null;
+}
+
 // ── Artist tracks in-memory cache ────────────────────────
 const artistTracksMemCache = new Map(); // key → { tracks, cachedAt }
 const ARTIST_TRACKS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -1691,7 +1757,11 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
     const verifiedNames = new Set(verifiedPool.map(a => a.name));
     const rawPool = verifiedPool.length >= 4 ? verifiedPool : rec.artists;
     // Annotate each artist with whether we confirmed they have tracks
-    const artistPool = rawPool.map(a => ({ ...a, hasVerifiedTracks: verifiedNames.has(a.name) }));
+    const artistPoolBase = rawPool.map(a => ({ ...a, hasVerifiedTracks: verifiedNames.has(a.name) }));
+
+    // Fetch artist image URLs (Spotify → Last.fm fallback) — fire and forget errors
+    const imageUrls = await Promise.all(artistPoolBase.map(a => fetchArtistImageUrl(a.name).catch(() => null)));
+    const artistPool = artistPoolBase.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || undefined }));
 
     await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
     verifyArtistPoolWithMB(artistPool, country, [cacheKey]).catch(() => {});
@@ -2537,9 +2607,13 @@ Rules:
 
     const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
     const parsed = JSON.parse(raw);
-    const artists = parsed.artists || [];
+    const artistsBase = parsed.artists || [];
 
-    console.log(`[genre-artists] Claude → ${genre} (${artists.length} artists)`);
+    console.log(`[genre-artists] Claude → ${genre} (${artistsBase.length} artists)`);
+
+    // Fetch artist image URLs (Spotify → Last.fm fallback)
+    const imageUrls = await Promise.all(artistsBase.map(a => fetchArtistImageUrl(a.name).catch(() => null)));
+    const artists = artistsBase.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || undefined }));
 
     // Store in cache (30 day TTL)
     if (supabase) {
@@ -4332,6 +4406,55 @@ app.get("/api/review-flags", async (req, res) => {
   }
 });
 
+// ── Backfill image URLs for cached artists that don't have one ──────────────
+// Runs once at startup, well after the server is ready. Processes one artist
+// at a time with a delay to stay within Spotify rate limits (~100 req/min).
+async function backfillArtistImageUrls() {
+  if (!supabase) return;
+  console.log('[image-backfill] starting...');
+
+  const { data: rows, error } = await supabase
+    .from('recommendation_cache')
+    .select('cache_key, endpoint, result, artist_pool')
+    .in('endpoint', ['recommend', 'genre-artists']);
+
+  if (error || !rows) { console.log('[image-backfill] could not fetch cache rows:', error?.message); return; }
+
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  for (const row of rows) {
+    // Pick the artists array from whichever column holds it
+    const isRecommend = row.endpoint === 'recommend';
+    const artists = isRecommend ? (row.artist_pool || []) : (row.result?.artists || []);
+
+    const missing = artists.filter(a => !a.imageUrl);
+    if (missing.length === 0) continue;
+
+    console.log(`[image-backfill] ${row.cache_key}: fetching ${missing.length} missing image(s)`);
+
+    let changed = false;
+    for (const artist of missing) {
+      await delay(1500); // Apple Music + Last.fm only — no Spotify to avoid competing with track verification
+      const url = await fetchArtistImageUrl(artist.name, { skipSpotify: true }).catch(() => null);
+      if (url) { artist.imageUrl = url; changed = true; }
+    }
+
+    if (!changed) continue;
+
+    // Write back the updated artists to the correct column
+    const update = isRecommend
+      ? { artist_pool: artists }
+      : { result: { ...row.result, artists } };
+
+    await supabase.from('recommendation_cache').update(update).eq('cache_key', row.cache_key);
+    console.log(`[image-backfill] updated ${row.cache_key}`);
+  }
+
+  console.log('[image-backfill] done');
+}
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎵 Musical Passport running at http://localhost:${PORT}\n`);
+  // Delay backfill so it doesn't compete with initial traffic on cold start
+  // setTimeout(() => backfillArtistImageUrls().catch(err => console.error('[image-backfill] error:', err.message)), 15_000);
 });
