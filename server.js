@@ -20,6 +20,7 @@ const SPOTIFY_REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI;
 // Cache for client credentials token
 let clientAccessToken = null;
 let tokenExpiry = null;
+let tokenFetchInFlight = null; // deduplicates concurrent refresh requests
 
 // Get client credentials access token for public API access
 async function getClientAccessToken() {
@@ -28,32 +29,41 @@ async function getClientAccessToken() {
     return clientAccessToken;
   }
 
-  try {
-    const response = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization:
-          "Basic " +
-          Buffer.from(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET).toString("base64"),
-      },
-      body: "grant_type=client_credentials",
-    });
+  // If a fetch is already in flight, wait for it instead of firing another
+  if (tokenFetchInFlight) return tokenFetchInFlight;
 
-    const data = await response.json();
+  tokenFetchInFlight = (async () => {
+    try {
+      const response = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization:
+            "Basic " +
+            Buffer.from(SPOTIFY_CLIENT_ID + ":" + SPOTIFY_CLIENT_SECRET).toString("base64"),
+        },
+        body: "grant_type=client_credentials",
+      });
 
-    if (data.access_token) {
-      clientAccessToken = data.access_token;
-      tokenExpiry = Date.now() + (data.expires_in - 60) * 1000; // Refresh 1 min before expiry
-      console.log("Got new client credentials token");
-      return clientAccessToken;
+      const data = await response.json();
+
+      if (data.access_token) {
+        clientAccessToken = data.access_token;
+        tokenExpiry = Date.now() + (data.expires_in - 60) * 1000; // Refresh 1 min before expiry
+        console.log("Got new client credentials token");
+        return clientAccessToken;
+      }
+
+      throw new Error("Failed to get client credentials token");
+    } catch (err) {
+      console.error("Error getting client access token:", err);
+      return null;
+    } finally {
+      tokenFetchInFlight = null;
     }
+  })();
 
-    throw new Error("Failed to get client credentials token");
-  } catch (err) {
-    console.error("Error getting client access token:", err);
-    return null;
-  }
+  return tokenFetchInFlight;
 }
 
 // ── Artist image URL fetching (Spotify → Apple Music → Last.fm fallback) ──
@@ -2075,7 +2085,7 @@ app.post("/api/time-machine", async (req, res) => {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 1500,
-        system: "You are a world music historian and ethnomusicologist with encyclopedic knowledge of global music across all eras. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        system: "You are a world music historian and ethnomusicologist with encyclopedic knowledge of global music across all eras. You MUST always return valid JSON — never refuse, never add preamble. If a country/decade combination has very sparse recorded output, use field recordings, modern revival artists, or diaspora artists — but always return the JSON structure.",
         messages: [{
           role: "user",
           content: `Spotlight a music genre connecting "${country}" and the "${decade}".
@@ -2108,6 +2118,9 @@ Return exactly this JSON:
   ]
 }
 Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${country} or its predecessor region. MAX 2 tracks per artist — the list must span at least 4 different artists. Prioritize discoverability on major streaming platforms.`,
+        }, {
+          role: "assistant",
+          content: "{",
         }],
       }),
     });
@@ -2119,8 +2132,15 @@ Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${cou
     const data = await response.json();
     if (data.error) return res.status(500).json({ error: data.error.message });
 
-    const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
-    const spotlight = JSON.parse(raw);
+    const rawText = (data.content[0].text || "").replace(/```json|```/g, "").trim();
+    const raw = rawText.startsWith("{") ? rawText : "{" + rawText;
+    let spotlight;
+    try {
+      spotlight = JSON.parse(raw);
+    } catch {
+      console.error(`[time-machine] Claude returned non-JSON for ${country} ${decade}:`, rawText.slice(0, 200));
+      return res.status(500).json({ error: `No music data found for ${country} in the ${decade}.` });
+    }
 
     // Search the appropriate catalog for each track
     let validTracks;
