@@ -56,11 +56,14 @@ async function getClientAccessToken() {
   }
 }
 
-// ── Artist image URL fetching (Spotify → Last.fm fallback) ──
-async function fetchArtistImageUrl(artistName, { skipSpotify = false } = {}) {
+// ── Artist image URL fetching (Spotify → Apple Music → Last.fm fallback) ──
+async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = null } = {}) {
   if (!skipSpotify) try {
     const token = await getClientAccessToken();
     if (token) {
+      const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const qNorm = normalize(artistName);
+
       const r = await fetch(
         `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
         { headers: { Authorization: 'Bearer ' + token } }
@@ -68,14 +71,27 @@ async function fetchArtistImageUrl(artistName, { skipSpotify = false } = {}) {
       const data = await r.json();
       const candidates = data.artists?.items || [];
       if (candidates.length > 0) {
-        const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const qNorm = normalize(artistName);
         const match = candidates.find(a => normalize(a.name) === qNorm)
           || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
           || candidates[0];
         if (match && (normalize(match.name).includes(qNorm) || qNorm.includes(normalize(match.name)))) {
-          const url = match.images?.[0]?.url;
-          if (url) return url;
+          // Genre sanity check: if we have genre context and Spotify has genre tags for this artist,
+          // reject the result when there's clearly no overlap — prevents wrong-artist disambiguation
+          // (e.g. Azerbaijani "Bulbul" classical singer vs. Indian pop "Bulbul")
+          if (genre && match.genres && match.genres.length > 0) {
+            const spotifyGenreStr = match.genres.join(' ').toLowerCase();
+            const genreWords = genre.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 3);
+            const hasOverlap = genreWords.length === 0 || genreWords.some(w => spotifyGenreStr.includes(w));
+            if (!hasOverlap) {
+              // Skip this Spotify result — fall through to Apple Music / Last.fm
+            } else {
+              const url = match.images?.[0]?.url;
+              if (url) return url;
+            }
+          } else {
+            const url = match.images?.[0]?.url;
+            if (url) return url;
+          }
         }
       }
     }
@@ -1222,6 +1238,53 @@ const COUNTRY_ISO = {
   "Djibouti":"DJ","Kuwait":"KW","Bahrain":"BH",
 };
 
+// ── Streaming floor helpers ───────────────────────────────
+const DECADES_LIST = ["1900s","1910s","1920s","1930s","1940s","1950s","1960s","1970s","1980s","1990s","2000s","2010s","2020s"];
+function yearToDecade(year) {
+  const y = parseInt(year);
+  if (isNaN(y) || y < 1900) return null;
+  return `${Math.floor(y / 10) * 10}s`;
+}
+function decadeIndex(decade) { return DECADES_LIST.indexOf(decade); }
+
+// Patch streamingFloor in-place without touching other cache fields (preserves expires_at, cached_at, etc.)
+async function patchStreamingFloor(country, floor) {
+  if (!supabase || !country || !floor) return;
+  const cacheKey = makeCacheKey(["recommend", country]);
+  const { data } = await supabase.from("recommendation_cache").select("result").eq("cache_key", cacheKey).single();
+  if (!data?.result) return;
+  if (data.result.streamingFloor === floor) return; // already correct
+  await supabase.from("recommendation_cache")
+    .update({ result: { ...data.result, streamingFloor: floor } })
+    .eq("cache_key", cacheKey);
+  console.log(`[streaming-floor] ${country}: floor set to ${floor}`);
+}
+
+// Called after getting validated Spotify/Apple tracks — improves floor if a track predates it
+async function maybeImproveStreamingFloor(country, tracks) {
+  if (!supabase || !country || !tracks?.length) return;
+  const cacheKey = makeCacheKey(["recommend", country]);
+  const { data } = await supabase.from("recommendation_cache").select("result").eq("cache_key", cacheKey).single();
+  if (!data?.result?.streamingFloor) return;
+  const currentIdx = decadeIndex(data.result.streamingFloor);
+  if (currentIdx <= 0) return; // already at earliest
+  let bestIdx = currentIdx;
+  for (const t of tracks) {
+    const year = t.releaseYear || t.year;
+    if (!year) continue;
+    const decade = yearToDecade(year);
+    const idx = decadeIndex(decade);
+    if (idx >= 0 && idx < bestIdx) bestIdx = idx;
+  }
+  if (bestIdx < currentIdx) {
+    const improved = DECADES_LIST[bestIdx];
+    await supabase.from("recommendation_cache")
+      .update({ result: { ...data.result, streamingFloor: improved } })
+      .eq("cache_key", cacheKey);
+    console.log(`[streaming-floor] ${country}: floor improved ${data.result.streamingFloor} → ${improved}`);
+  }
+}
+
 // Reverse map: ISO-2 → canonical country name (built once from COUNTRY_ISO)
 const ISO_TO_COUNTRY = Object.fromEntries(
   Object.entries(COUNTRY_ISO)
@@ -1760,7 +1823,7 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
     const artistPoolBase = rawPool.map(a => ({ ...a, hasVerifiedTracks: verifiedNames.has(a.name) }));
 
     // Fetch artist image URLs (Spotify → Last.fm fallback) — fire and forget errors
-    const imageUrls = await Promise.all(artistPoolBase.map(a => fetchArtistImageUrl(a.name).catch(() => null)));
+    const imageUrls = await Promise.all(artistPoolBase.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null)));
     const artistPool = artistPoolBase.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || undefined }));
 
     await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
@@ -2161,14 +2224,58 @@ app.post("/api/genre-spotlight", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
 
-  const { genre, country, service = "spotify" } = req.body;
+  const { genre, country, service = "spotify", relatedArtistNames = [] } = req.body;
   if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
 
   const gsCacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
   const gsCached = await getCached(gsCacheKey);
+
+  // Supplement sparse/empty track lists with 1-2 tracks per related artist (runs on cache hits too)
+  const supplementFromRelatedArtists = async (result, accessToken) => {
+    if (!relatedArtistNames.length) return result;
+    const tracks = [...(result.tracks || [])];
+    if (tracks.length >= 4) return result;
+    const seenIds = new Set(tracks.map(t => t.spotifyId || t.appleId).filter(Boolean));
+    for (const artistName of relatedArtistNames) {
+      if (tracks.length >= 5) break;
+      try {
+        if (service === 'apple-music') {
+          const appleToken = generateAppleMusicToken();
+          const appleArtistTracks = await proactiveArtistTracks(artistName, [], appleToken);
+          let added = 0;
+          for (const t of appleArtistTracks) {
+            if (added >= 2 || tracks.length >= 5) break;
+            if (!t.appleId || seenIds.has(t.appleId)) continue;
+            seenIds.add(t.appleId); tracks.push(t); added++;
+          }
+        } else if (accessToken) {
+          const sr = await fetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent('artist:' + artistName)}&type=track&limit=5&market=US`,
+            { headers: { Authorization: 'Bearer ' + accessToken } }
+          );
+          const sd = await sr.json();
+          const items = (sd.tracks?.items || []).filter(t => artistNamesMatch(artistName, t.artists?.[0]?.name || ''));
+          let added = 0;
+          for (const t of items) {
+            if (added >= 2 || tracks.length >= 5) break;
+            if (seenIds.has(t.id)) continue;
+            seenIds.add(t.id);
+            tracks.push({ title: t.name, artist: t.artists?.[0]?.name || artistName, spotifyId: t.id, previewUrl: t.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${t.id}` });
+            added++;
+          }
+        }
+      } catch {}
+    }
+    if (tracks.length === result.tracks?.length) return result;
+    console.log(`[genre-spotlight] supplemented with related artists: ${tracks.length} tracks`);
+    return { ...result, tracks, hasLocalScene: tracks.length > 0 ? true : result.hasLocalScene };
+  };
+
   if (gsCached) {
     console.log(`[genre-spotlight] cache hit → ${genre} / ${country}`);
-    return res.json(gsCached.result);
+    const accessToken = req.headers.authorization?.replace('Bearer ', '') || null;
+    const supplemented = await supplementFromRelatedArtists(gsCached.result, accessToken);
+    return res.json(supplemented);
   }
 
   try {
@@ -2182,30 +2289,31 @@ app.post("/api/genre-spotlight", async (req, res) => {
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
         max_tokens: 1000,
-        system: `You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.
-CRITICAL RULE: Every artist you recommend MUST be a native artist FROM the specified country. Never include an artist from another country, even if they recorded songs in that genre. If you are not certain an artist is from ${country}, do not include them. It is better to return fewer tracks than to include an artist from the wrong country.`,
+        system: `You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.`,
         messages: [{
           role: "user",
-          content: `Give a short spotlight on the genre "${genre}" as it originated and developed in "${country}".
+          content: `First assess whether "${genre}" is a NICHE genre (practiced in 1–4 countries with a strong cultural identity, e.g. Malouf, Ma'luf, Gnawa, Byzantine Chant, Gamelan, Morna, Mbube, Jùjú, Tuvan throat singing, Sega, Taarab, Chaabi) or a BROAD genre (practiced worldwide or easily found in many countries as local variants, e.g. Jazz, Rock, Hip-hop, Folk, Classical, Pop, R&B, Electronic, Reggae, Metal).
 
-STRICT REQUIREMENT: Every track and every artist must be from ${country}. Do NOT include any artist from another country, regardless of how famous they are or how well they fit the genre. If ${country} has a small or limited scene for this genre, return only as many as genuinely exist.
+IF NICHE: the user tapped this genre from a ${country} artist card. Provide globally representative artists and tracks for "${genre}" from any of its home countries worldwide. Set isNicheWorldGenre: true, hasLocalScene: true.
 
-When the local scene is small, use the explanation to honestly describe the country's relationship to the genre — its influences, radio history, or cultural context — rather than pretending it has more local artists than it does.
+IF BROAD: provide a spotlight on "${genre}" as it exists specifically in "${country}". Every artist and track must genuinely be from ${country}.
 
 Return exactly this JSON:
 {
+  "isNicheWorldGenre": true,
   "hasLocalScene": true,
-  "explanation": "1 sentence: what defines this genre in ${country}, its roots, local context, and why it matters",
+  "explanation": "1 sentence — for niche: cultural roots and where it thrives globally; for broad: its history and character in ${country}",
   "tracks": [
     { "title": "exact track title", "artist": "exact artist name" }
   ],
   "artists": ["Artist Name 1", "Artist Name 2", "Artist Name 3"],
   "suggestedGenres": ["Genre 1", "Genre 2", "Genre 3"]
 }
-- "hasLocalScene": set to false if ${country} has no meaningful local scene for "${genre}" (fewer than 2 genuine local artists you can confidently name). When false, set tracks and artists to empty arrays — do NOT pad with artists from other countries.
-- "tracks": 1–6 specific tracks by artists who are actually FROM ${country}. If you are not certain an artist is from ${country}, omit them. Return an empty array rather than include a single foreign artist.
-- "artists": up to 6 key artists genuinely FROM ${country} known for this genre. Empty array if hasLocalScene is false.
-- "suggestedGenres": exactly 3 music genres that DO have a genuine, notable scene in ${country}. These must be real genres with actual artists from ${country}.`,
+- "isNicheWorldGenre": true if niche, false if broad
+- "hasLocalScene": for NICHE always true; for BROAD: false if ${country} has fewer than 2 genuine local artists for "${genre}"
+- "tracks": for NICHE: 1–6 tracks from key worldwide artists; for BROAD: 1–6 tracks from ${country} only. Return empty array rather than include wrong-country artists. No more than 2 tracks from any single artist — spread across different artists to give a representative sample.
+- "artists": for NICHE: up to 6 globally recognized artists; for BROAD: up to 6 from ${country} (empty if hasLocalScene is false)
+- "suggestedGenres": for NICHE: 3 related world/niche genres; for BROAD: 3 genres with genuine scenes in ${country}`,
         }],
       }),
     });
@@ -2316,14 +2424,19 @@ Return exactly this JSON:
           })
         );
 
+        // First pass: 1 track per artist for breadth
         for (const artistTracks of artistFallbackTracks) {
-          for (const t of artistTracks) {
-            if (!seenIds.has(t.spotifyId)) {
-              seenIds.add(t.spotifyId);
-              tracks.push(t);
-            }
-          }
+          const t = artistTracks.find(t => !seenIds.has(t.spotifyId));
+          if (t) { seenIds.add(t.spotifyId); tracks.push(t); }
           if (tracks.length >= 5) break;
+        }
+        // Second pass: fill remaining slots with a second track per artist if needed
+        if (tracks.length < 4) {
+          for (const artistTracks of artistFallbackTracks) {
+            const t = artistTracks.find(t => !seenIds.has(t.spotifyId));
+            if (t) { seenIds.add(t.spotifyId); tracks.push(t); }
+            if (tracks.length >= 5) break;
+          }
         }
         console.log(`[genre-spotlight] after artist fallback: ${tracks.length} tracks`);
       }
@@ -2392,7 +2505,7 @@ Return exactly this JSON:
             console.log(`[genre-spotlight] MB tag "${mbTag}" → ${mbRecordings.length} candidates`);
 
             const seenIds = new Set(tracks.map(t => t.spotifyId));
-            const isoCode = COUNTRY_ISO[country] ?? null;
+            const isoCode = spotlight.isNicheWorldGenre ? null : (COUNTRY_ISO[country] ?? null);
 
             // For each MB recording, attempt a Spotify lookup
             const mbSpotifyResults = await Promise.all(
@@ -2439,14 +2552,26 @@ Return exactly this JSON:
         }
       }
 
-      tracks = tracks.slice(0, 5);
+      // Enforce max 2 tracks per artist across all phases, then take best 5
+      const artistCounts = {};
+      tracks = tracks.filter(t => {
+        const key = (t.artist || '').toLowerCase();
+        artistCounts[key] = (artistCounts[key] || 0) + 1;
+        return artistCounts[key] <= 2;
+      }).slice(0, 5);
     }
 
-    // If Claude says there's no local scene, discard any tracks it may have hallucinated
-    if (spotlight.hasLocalScene === false) tracks = [];
-    const gsResult = { genre, country, explanation: spotlight.explanation, tracks, suggestedGenres: spotlight.suggestedGenres || [], hasLocalScene: spotlight.hasLocalScene !== false };
+    // If Claude says there's no local scene (broad genre only), discard any hallucinated tracks
+    if (spotlight.hasLocalScene === false && !spotlight.isNicheWorldGenre) tracks = [];
+    const isNicheWorldGenre = spotlight.isNicheWorldGenre === true;
+    let gsResult = { genre, country, explanation: spotlight.explanation, tracks, suggestedGenres: spotlight.suggestedGenres || [], hasLocalScene: spotlight.hasLocalScene !== false, isNicheWorldGenre };
+
+    // Supplement with related artist tracks from the recommendation page (runs on fresh responses too)
+    const freshAccessToken = req.headers.authorization?.replace('Bearer ', '') || null;
+    gsResult = await supplementFromRelatedArtists(gsResult, freshAccessToken);
+
     await storeCache(gsCacheKey, "genre-spotlight", gsResult);
-    console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${tracks.length} tracks)`);
+    console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${gsResult.tracks.length} tracks)`);
     res.json(gsResult);
   } catch (err) {
     console.error("Genre spotlight error:", err);
@@ -2612,7 +2737,7 @@ Rules:
     console.log(`[genre-artists] Claude → ${genre} (${artistsBase.length} artists)`);
 
     // Fetch artist image URLs (Spotify → Last.fm fallback)
-    const imageUrls = await Promise.all(artistsBase.map(a => fetchArtistImageUrl(a.name).catch(() => null)));
+    const imageUrls = await Promise.all(artistsBase.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null)));
     const artists = artistsBase.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || undefined }));
 
     // Store in cache (30 day TTL)
@@ -4214,7 +4339,10 @@ Return exactly this JSON:
 era must be exactly one of: Contemporary, Golden Era, Pioneer.
 Include 12 artists — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
 knownTracks: real specific song titles this artist is known for (used to find them on Spotify/Apple Music).
-likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.${lfNote}`
+likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.
+
+Also include:
+"streamingFloor": the earliest decade where ${country} has notable music genuinely available on Spotify/Apple Music. Must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s. Consider whether pre-war or early-era recordings from ${country} are actually digitized and on streaming. Major hubs (USA, UK, France, Brazil, Cuba, Argentina, Nigeria, Jamaica): as early as 1920s–1950s. Most countries: 1970s–1990s.${lfNote}`
       }]
     }),
   });
@@ -4226,18 +4354,61 @@ likelyOnStreaming: true if you believe this artist has a presence on Spotify or 
 
   console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
 
-  // Step 2: Store recommendation cache with this fresh research
+  // Step 1c: Auto-improve Claude's streamingFloor estimate by cross-checking knownTracks on Spotify
+  let streamingFloor = DECADES_LIST.includes(research.streamingFloor) ? research.streamingFloor : '1980s';
+  try {
+    const clientToken = await getClientAccessToken();
+    if (clientToken) {
+      const artistsToCheck = research.artists.filter(a => a.knownTracks?.length).slice(0, 4);
+      for (const artist of artistsToCheck) {
+        try {
+          const sq = `track:${artist.knownTracks[0]} artist:${artist.name}`;
+          const r = await fetch(
+            `https://api.spotify.com/v1/search?q=${encodeURIComponent(sq)}&type=track&limit=1`,
+            { headers: { Authorization: 'Bearer ' + clientToken } }
+          );
+          const d = await r.json();
+          const releaseDate = d.tracks?.items?.[0]?.album?.release_date;
+          if (releaseDate) {
+            const decade = yearToDecade(parseInt(releaseDate.slice(0, 4)));
+            if (decade && decadeIndex(decade) < decadeIndex(streamingFloor)) {
+              console.log(`[streaming-floor] ${country}: ${artist.name} → ${decade}, improving floor from ${streamingFloor}`);
+              streamingFloor = decade;
+            }
+          }
+          await new Promise(r => setTimeout(r, 150));
+        } catch {}
+      }
+    }
+  } catch {}
+  console.log(`[streaming-floor] ${country}: final floor = ${streamingFloor}`);
+
+  // Step 2: Fetch image URLs for all artists (preserve any already cached)
   const cacheKey = makeCacheKey(["recommend", country]);
+  const existingCache = await getCached(cacheKey);
+  const existingImageMap = {};
+  for (const a of (existingCache?.artistPool || [])) {
+    if (a.name && a.imageUrl) existingImageMap[a.name.toLowerCase()] = a.imageUrl;
+  }
+
+  const artistsWithImages = await Promise.all(research.artists.map(async (a) => {
+    const existing = existingImageMap[a.name.toLowerCase()];
+    if (existing) return { ...a, imageUrl: existing };
+    const imageUrl = await fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null);
+    return imageUrl ? { ...a, imageUrl } : a;
+  }));
+  console.log(`[country-enrich] ${country}: fetched images for ${artistsWithImages.filter(a => a.imageUrl).length}/${artistsWithImages.length} artists`);
+
   await storeCache(cacheKey, "recommend",
-    { genres: research.genres, didYouKnow: research.didYouKnow },
-    research.artists
+    { genres: research.genres, didYouKnow: research.didYouKnow, streamingFloor },
+    artistsWithImages
   );
 
   // Step 3: Proactively fetch and cache tracks for each artist
   let withTracks = 0;
   let withoutTracks = 0;
 
-  for (const artist of research.artists) {
+  for (const artist of artistsWithImages) {
     const artistCacheKey = makeCacheKey(["artist-tracks-apple", artist.name]);
 
     // Skip if already cached
@@ -4270,7 +4441,90 @@ likelyOnStreaming: true if you believe this artist has a presence on Spotify or 
   return { country, artists: research.artists.length, withTracks, withoutTracks };
 }
 
+// GET /api/streaming-floors — public, returns { country: decade } for all countries with a known floor
+app.get("/api/streaming-floors", async (req, res) => {
+  if (!supabase) return res.json({});
+  // Build cache_key → country reverse map from COUNTRY_ISO
+  const keyToCountry = {};
+  const cacheKeys = [];
+  for (const country of [...new Set(Object.keys(COUNTRY_ISO))]) {
+    const key = makeCacheKey(["recommend", country]);
+    keyToCountry[key] = country;
+    cacheKeys.push(key);
+  }
+  const { data, error } = await supabase
+    .from("recommendation_cache")
+    .select("cache_key, result")
+    .in("cache_key", cacheKeys);
+  if (error) return res.status(500).json({ error: error.message });
+  const floors = {};
+  for (const row of (data || [])) {
+    const country = keyToCountry[row.cache_key];
+    if (country && row.result?.streamingFloor) floors[country] = row.result.streamingFloor;
+  }
+  res.json(floors);
+});
+
+// GET /api/populate-streaming-floors?secret=...  — background job: cheap Claude call per country missing a floor
+app.get("/api/populate-streaming-floors", async (req, res) => {
+  if (!req.query.secret || req.query.secret !== process.env.ENRICH_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
+
+  // Enumerate all known modern countries from COUNTRY_ISO
+  const countries = [...new Set(Object.keys(COUNTRY_ISO))];
+  const toProcess = [];
+  for (const country of countries) {
+    const cacheKey = makeCacheKey(["recommend", country]);
+    const { data } = await supabase.from("recommendation_cache")
+      .select("result").eq("cache_key", cacheKey).single();
+    if (data?.result && !data.result.streamingFloor) toProcess.push({ country, result: data.result });
+  }
+
+  console.log(`[streaming-floor-job] ${toProcess.length} countries need floors (${countries.length - toProcess.length} already have them)`);
+  res.json({ total: countries.length, toProcess: toProcess.length, message: "Job started in background — check server logs" });
+
+  // Run in background with rate-limit-friendly delays
+  setImmediate(async () => {
+    let done = 0;
+    for (const { country, result } of toProcess) {
+      try {
+        const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 10,
+            messages: [{
+              role: "user",
+              content: `What is the earliest decade where ${country} has notable music genuinely available on Spotify/Apple Music? Reply with ONLY the decade like "1970s". Major hubs (USA, UK, France, Brazil, Cuba, Jamaica, Nigeria): as early as 1920s–1950s. Most countries: 1970s–1990s.`
+            }]
+          }),
+        });
+        const claudeData = await claudeRes.json();
+        const raw = (claudeData.content?.[0]?.text || "").trim().replace(/[^0-9s]/g, '');
+        const floor = DECADES_LIST.find(d => d === raw + 's') || DECADES_LIST.find(d => raw.startsWith(d.slice(0, 4)));
+        if (floor) {
+          await supabase.from("recommendation_cache")
+            .update({ result: { ...result, streamingFloor: floor } })
+            .eq("cache_key", makeCacheKey(["recommend", country]));
+          console.log(`[streaming-floor-job] ✓ ${country} → ${floor} (${++done}/${toProcess.length})`);
+        } else {
+          console.warn(`[streaming-floor-job] ✗ ${country}: couldn't parse "${claudeData.content?.[0]?.text}"`);
+        }
+      } catch (err) {
+        console.error(`[streaming-floor-job] error for ${country}:`, err.message);
+      }
+      await new Promise(r => setTimeout(r, 2500)); // 2.5s between calls — well within Anthropic rate limits
+    }
+    console.log(`[streaming-floor-job] done. ${done}/${toProcess.length} floors populated.`);
+  });
+});
+
 // GET /api/enrich-countries?secret=...&count=2
+// GET /api/enrich-countries?secret=...&country=Azerbaijan  (target a specific country)
 app.get("/api/enrich-countries", async (req, res) => {
   if (!req.query.secret || req.query.secret !== process.env.ENRICH_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -4279,17 +4533,22 @@ app.get("/api/enrich-countries", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
 
-  const count = Math.min(parseInt(req.query.count || "2", 10), 5);
-
   try {
-    const weak = await findWeakCountries(count);
-    if (weak.length === 0) {
-      return res.json({ message: "All countries have sufficient data", enriched: [] });
+    let targets;
+    if (req.query.country) {
+      targets = [req.query.country];
+      console.log(`[country-enrich] Targeting specific country: ${req.query.country}`);
+    } else {
+      const count = Math.min(parseInt(req.query.count || "2", 10), 5);
+      targets = await findWeakCountries(count);
+      if (targets.length === 0) {
+        return res.json({ message: "All countries have sufficient data", enriched: [] });
+      }
+      console.log(`[country-enrich] Weak countries to enrich: ${targets.join(", ")}`);
     }
 
-    console.log(`[country-enrich] Weak countries to enrich: ${weak.join(", ")}`);
     const results = [];
-    for (const country of weak) {
+    for (const country of targets) {
       try {
         const result = await deepEnrichCountry(country, apiKey);
         results.push(result);
