@@ -879,6 +879,68 @@ async function processFlaggedTracks(maxContexts = 2) {
   return { reviewed, fixed };
 }
 
+// ── Deezer ID backfill ────────────────────────────────────
+// Given a list of artist names, enriches their cached artist-tracks entries
+// with deezerId/deezerUrl/previewUrl by title-matching against Deezer's top tracks.
+// Runs entirely in the background — safe to fire-and-forget.
+async function backfillDeezerForArtists(artistNames) {
+  if (!supabase || !artistNames?.length) return;
+  const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
+
+  for (const artistName of artistNames) {
+    try {
+      // Try both Spotify and Apple Music cache entries for this artist
+      const cacheKeys = [
+        makeCacheKey(["artist-tracks", artistName]),
+        makeCacheKey(["artist-tracks-apple", artistName]),
+      ];
+
+      const { data: rows } = await supabase
+        .from("recommendation_cache")
+        .select("cache_key, result")
+        .in("cache_key", cacheKeys);
+
+      if (!rows?.length) continue;
+
+      // Fetch Deezer tracks once, reuse for both entries
+      let deezerTracks = null;
+
+      for (const row of rows) {
+        const tracks = row.result?.tracks;
+        if (!Array.isArray(tracks) || tracks.length === 0) continue;
+        if (tracks.every(t => t.deezerId)) continue;
+
+        if (!deezerTracks) {
+          deezerTracks = await deezerArtistTopTracks(artistName, 10);
+          if (deezerTracks.length === 0) break;
+        }
+
+        const deezerByTitle = new Map(deezerTracks.map(t => [normalise(t.title), t]));
+        let changed = false;
+        const merged = tracks.map(t => {
+          if (t.deezerId) return t;
+          const match = deezerByTitle.get(normalise(t.title));
+          if (!match) return t;
+          changed = true;
+          return { ...t, deezerId: match.deezerId, deezerUrl: match.deezerUrl, previewUrl: t.previewUrl || match.previewUrl };
+        });
+
+        if (!changed) continue;
+
+        await supabase
+          .from("recommendation_cache")
+          .update({ result: { ...row.result, tracks: merged } })
+          .eq("cache_key", row.cache_key);
+
+        console.log(`[deezer-backfill] enriched ${artistName} (${row.cache_key})`);
+      }
+    } catch (e) {
+      console.warn(`[deezer-backfill] failed for ${artistName}:`, e.message);
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+}
+
 // ── Enrichment queue ──────────────────────────────────────
 async function addToEnrichmentQueue(artists, country) {
   if (!supabase || !artists?.length) return;
@@ -1901,6 +1963,9 @@ IMPORTANT: Use each artist's exact real name as it appears on streaming platform
     // Queue any unverified artists for deep enrich in background
     const unverified = rec.artists.filter(a => !verifiedPool.find(v => v.name === a.name));
     if (unverified.length) addToEnrichmentQueue(unverified, country).catch(() => {});
+
+    // Backfill Deezer IDs for all artists in this country's pool
+    backfillDeezerForArtists(artistPool.map(a => a.name)).catch(() => {});
   } catch (err) {
     if (_rejectInFlight) { _rejectInFlight(err); recommendInFlight.delete(_inflightKey); }
     console.error("Error:", err);
@@ -4939,66 +5004,24 @@ app.get("/api/backfill-deezer", async (req, res) => {
 
   const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
 
-  // Fetch artist-tracks cache entries
   const { data: rows, error } = await supabase
     .from("recommendation_cache")
-    .select("cache_key, result")
-    .eq("endpoint", "artist-tracks")
+    .select("result")
+    .in("endpoint", ["artist-tracks", "artist-tracks-apple"])
     .not("result->tracks", "is", null)
     .limit(limit);
 
   if (error) return res.status(500).json({ error: error.message });
 
-  res.json({ message: `Processing ${rows.length} entries in background` });
+  const artistNames = [...new Set(
+    rows
+      .filter(r => Array.isArray(r.result?.tracks) && !r.result.tracks.every(t => t.deezerId))
+      .map(r => r.result.tracks[0]?.artist)
+      .filter(Boolean)
+  )];
 
-  setImmediate(async () => {
-    const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-    let enriched = 0;
-
-    for (const row of rows) {
-      const tracks = row.result?.tracks;
-      if (!Array.isArray(tracks) || tracks.length === 0) continue;
-
-      // Skip if all tracks already have deezerId
-      if (tracks.every(t => t.deezerId)) continue;
-
-      // Derive artist name from cache_key: "artist-tracks_<normalised-name>"
-      const artistName = tracks[0]?.artist;
-      if (!artistName) continue;
-
-      try {
-        const deezerTracks = await deezerArtistTopTracks(artistName, 10);
-        if (deezerTracks.length === 0) continue;
-
-        // Merge by normalised title
-        const deezerByTitle = new Map(deezerTracks.map(t => [normalise(t.title), t]));
-        let changed = false;
-        const merged = tracks.map(t => {
-          if (t.deezerId) return t;
-          const match = deezerByTitle.get(normalise(t.title));
-          if (!match) return t;
-          changed = true;
-          return { ...t, deezerId: match.deezerId, deezerUrl: match.deezerUrl, previewUrl: t.previewUrl || match.previewUrl };
-        });
-
-        if (!changed) continue;
-
-        await supabase
-          .from("recommendation_cache")
-          .update({ result: { ...row.result, tracks: merged } })
-          .eq("cache_key", row.cache_key);
-
-        enriched++;
-        console.log(`[backfill-deezer] enriched ${artistName}`);
-      } catch (e) {
-        console.warn(`[backfill-deezer] failed for ${artistName}:`, e.message);
-      }
-
-      await new Promise(r => setTimeout(r, 200)); // respect deezer queue
-    }
-
-    console.log(`[backfill-deezer] done. ${enriched}/${rows.length} entries enriched.`);
-  });
+  res.json({ message: `Processing ${artistNames.length} artists in background` });
+  backfillDeezerForArtists(artistNames).catch(() => {});
 });
 
 // GET /api/enrich-countries?secret=...&count=2
