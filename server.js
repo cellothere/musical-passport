@@ -2841,6 +2841,13 @@ async function fetchArtistTracks(artistName, userToken = null) {
 }
 
 async function _fetchArtistTracksImpl(artistName, userToken = null) {
+  // Resolve canonical artist name via Last.fm before cache key (correction changes the key)
+  const lfCorrected = await lastfmArtistCorrection(artistName);
+  if (lfCorrected) {
+    console.log(`  [artist-tracks] Last.fm correction: "${artistName}" → "${lfCorrected}"`);
+    artistName = lfCorrected;
+  }
+
   const cacheKey = makeCacheKey(["artist-tracks", artistName]);
 
   // 1. In-memory cache (skip if user token present and cache was flagged — try fresh)
@@ -2995,10 +3002,11 @@ async function _fetchArtistTracksImpl(artistName, userToken = null) {
       }
     }
 
-    // Last resort: ListenBrainz
+    // Last resort: ListenBrainz → enrich with YouTube before caching so the URL is stored
     if (tracks.length === 0) {
       console.log(`  [artist-tracks] Spotify empty → trying ListenBrainz for "${artistName}"`);
-      tracks = await fetchArtistTracksFromLB(artistName);
+      const lbTracks = await fetchArtistTracksFromLB(artistName);
+      tracks = await enrichTracksWithYouTube(lbTracks, artistName);
     }
 
     artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
@@ -3015,7 +3023,8 @@ async function _fetchArtistTracksImpl(artistName, userToken = null) {
   } catch (err) {
     console.error(`  Error fetching tracks for ${artistName}:`, err);
     console.log(`  [artist-tracks] Spotify error → trying ListenBrainz for "${artistName}"`);
-    return fetchArtistTracksFromLB(artistName);
+    const lbTracks = await fetchArtistTracksFromLB(artistName);
+    return enrichTracksWithYouTube(lbTracks, artistName);
   }
 }
 
@@ -3978,11 +3987,13 @@ function fuzzyArtistMatch(a, b) {
   return diffs <= 1;
 }
 
-// Tries 'us' first, then 'gb' for artists not in the US catalog.
+// Storefronts tried in order — covers US, Europe, Middle East, South Asia, East Asia, Latin America.
+const APPLE_STOREFRONTS = ['us', 'gb', 'sa', 'ae', 'bh', 'eg', 'in', 'jp', 'kr', 'br', 'mx', 'de'];
+
 async function appleSongSearch(query, artistTarget, appleToken) {
   const normalise = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const target = normalise(primaryArtistName(artistTarget));
-  for (const sf of ['us', 'gb']) {
+  for (const sf of APPLE_STOREFRONTS) {
     try {
       const r = await fetch(
         `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(query)}&types=songs&limit=3`,
@@ -4009,10 +4020,10 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
   const searchName = primaryArtistName(artistName);
   const target = normalise(searchName);
 
-  // 1. Apple Music: search for the artist (try us then gb)
+  // 1. Apple Music: search for the artist across all storefronts
   if (appleToken) {
     try {
-      for (const sf of ['us', 'gb']) {
+      for (const sf of APPLE_STOREFRONTS) {
         const r = await fetch(
           `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(searchName)}&types=artists&limit=5`,
           { headers: { Authorization: `Bearer ${appleToken}` } }
@@ -4085,7 +4096,9 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
     }));
     return enriched;
   }
-  return lbTracks; // may be []
+  // Enrich LB-only tracks (no streaming IDs) with YouTube video URLs
+  if (lbTracks.length > 0) return enrichTracksWithYouTube(lbTracks, artistName);
+  return [];
 }
 
 // Fetch tracks for one artist using Spotify (2-step: artist search → top tracks).
@@ -4170,12 +4183,14 @@ async function _proactiveSpotifyTracksImpl(artistName) {
 
     if (proTracks.length > 0) return proTracks;
 
-    // Last resort: ListenBrainz
+    // Last resort: ListenBrainz → enrich with YouTube
     console.log(`  [proactive-spotify] no tracks from Spotify for "${artistName}" → LB fallback`);
-    return fetchArtistTracksFromLB(artistName);
+    const lbTracks = await fetchArtistTracksFromLB(artistName);
+    return enrichTracksWithYouTube(lbTracks, artistName);
   } catch (err) {
     console.error(`  [proactive-spotify] error for "${artistName}":`, err.message);
-    return fetchArtistTracksFromLB(artistName);
+    const lbTracks = await fetchArtistTracksFromLB(artistName);
+    return enrichTracksWithYouTube(lbTracks, artistName);
   }
 }
 
@@ -4220,6 +4235,57 @@ async function lastfmGeoTopArtists(country, limit = 25) {
   } catch { return []; }
 }
 
+// Returns the canonical artist name from Last.fm (e.g. "the beatles" → "The Beatles").
+// Returns null if no correction found or Last.fm key is missing.
+async function lastfmArtistCorrection(artistName) {
+  const key = process.env.LASTFM_API_KEY;
+  if (!key) return null;
+  try {
+    const r = await fetch(
+      `https://ws.audioscrobbler.com/2.0/?method=artist.getCorrection&artist=${encodeURIComponent(artistName)}&api_key=${key}&format=json`
+    );
+    const d = await r.json();
+    if (d.error) return null;
+    const corrected = d.corrections?.correction?.artist?.name;
+    if (corrected && corrected.toLowerCase() !== artistName.toLowerCase()) {
+      return corrected;
+    }
+    return null;
+  } catch { return null; }
+}
+
+// ── YouTube helpers ────────────────────────────────────────
+
+// Search YouTube Data API v3 for the best music video matching a query.
+// Returns a videoId string or null. Each call costs 100 quota units (10k/day free).
+async function youtubeVideoSearch(query) {
+  const key = process.env.YOUTUBE_API_KEY;
+  if (!key) return null;
+  try {
+    const r = await fetch(
+      `https://www.googleapis.com/youtube/v3/search?q=${encodeURIComponent(query)}&type=video&videoCategoryId=10&part=snippet&maxResults=1&key=${key}`
+    );
+    if (!r.ok) return null;
+    const d = await r.json();
+    return d.items?.[0]?.id?.videoId || null;
+  } catch { return null; }
+}
+
+// Enriches tracks that have no streaming IDs (i.e. LB-only results) with YouTube video URLs.
+// Only calls YouTube API for tracks that truly have no preview/embed — preserves quota.
+async function enrichTracksWithYouTube(tracks, artistName) {
+  if (!process.env.YOUTUBE_API_KEY) return tracks;
+  return Promise.all(tracks.map(async (track) => {
+    if (track.previewUrl || track.appleId || track.spotifyId) return track;
+    const videoId = await youtubeVideoSearch(`${track.title} ${artistName} official`);
+    if (videoId) {
+      console.log(`  [youtube] found video for "${track.title}" by "${artistName}": ${videoId}`);
+      return { ...track, youtubeUrl: `https://www.youtube.com/watch?v=${videoId}` };
+    }
+    return track;
+  }));
+}
+
 // Find all artist-tracks cache entries flagged as empty, then try much harder to find tracks.
 // Uses Last.fm to surface specific song titles first, falls back to Claude then LB.
 async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
@@ -4251,7 +4317,11 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
 
   for (const { slug, endpoint, cacheKey } of toEnrich) {
     // Reconstruct artist name from slug (hyphens back to spaces, best effort)
-    const artistName = slug.replace(/-/g, " ");
+    const rawName = slug.replace(/-/g, " ");
+    // Resolve canonical name via Last.fm before any lookups
+    const corrected = await lastfmArtistCorrection(rawName);
+    const artistName = corrected || rawName;
+    if (corrected) console.log(`[deep-enrich] Last.fm correction: "${rawName}" → "${corrected}"`);
 
     // Step 1a: Last.fm artist.getTopTracks — fast, free, great non-Western coverage
     let knownTitles = await lastfmArtistTopTracks(artistName, 5);
