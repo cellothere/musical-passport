@@ -1812,6 +1812,7 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 1
       .replace(/```json|```/g, "")
       .trim();
     const rec = JSON.parse(raw);
+    rec.artists = normalizeArtistNames(rec.artists);
 
     console.log(`[recommend] Claude → ${country} (${rec.artists.length} artists, ${rec.genres.length} genres)`);
 
@@ -3949,6 +3950,25 @@ function primaryArtistName(name) {
     .trim() || name;
 }
 
+// Collapse doubled names like "Banah Banah" → "Banah" that Claude occasionally
+// produces for non-Western artists when uncertain about romanization.
+function deduplicateArtistName(name) {
+  const trimmed = name.trim();
+  const parts = trimmed.split(/\s+/);
+  if (parts.length >= 2 && parts.length % 2 === 0) {
+    const half = parts.length / 2;
+    const first = parts.slice(0, half).join(' ').toLowerCase();
+    const second = parts.slice(half).join(' ').toLowerCase();
+    if (first === second) return parts.slice(0, half).join(' ');
+  }
+  return trimmed;
+}
+
+// Apply deduplicateArtistName to every artist object in a list.
+function normalizeArtistNames(artists) {
+  return artists.map(a => ({ ...a, name: deduplicateArtistName(a.name) }));
+}
+
 // Allow 1-character difference for names of similar length — handles transliteration
 // variants like "Beqele" vs "Bekele" (Amharic q/k) without risking false positives.
 function fuzzyArtistMatch(a, b) {
@@ -4371,6 +4391,7 @@ Also include:
   if (claudeData.error) throw new Error(`Claude error: ${claudeData.error.message}`);
   const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
   const research = JSON.parse(raw);
+  research.artists = normalizeArtistNames(research.artists);
 
   console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
 
