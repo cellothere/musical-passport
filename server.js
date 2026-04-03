@@ -1792,7 +1792,8 @@ Return exactly this JSON:
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
 }
-era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.${realPoolNote}`,
+era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
+IMPORTANT: Use each artist's exact real name as it appears on streaming platforms. Do NOT repeat a name (e.g. write "Banah" not "Banah Banah") unless the repeated form is the actual official band name (e.g. "Duran Duran", "Talk Talk" are correct).${realPoolNote}`,
           },
         ],
       }),
@@ -3950,23 +3951,9 @@ function primaryArtistName(name) {
     .trim() || name;
 }
 
-// Collapse doubled names like "Banah Banah" → "Banah" that Claude occasionally
-// produces for non-Western artists when uncertain about romanization.
-function deduplicateArtistName(name) {
-  const trimmed = name.trim();
-  const parts = trimmed.split(/\s+/);
-  if (parts.length >= 2 && parts.length % 2 === 0) {
-    const half = parts.length / 2;
-    const first = parts.slice(0, half).join(' ').toLowerCase();
-    const second = parts.slice(half).join(' ').toLowerCase();
-    if (first === second) return parts.slice(0, half).join(' ');
-  }
-  return trimmed;
-}
-
-// Apply deduplicateArtistName to every artist object in a list.
+// Apply any name normalization to every artist object in a list.
 function normalizeArtistNames(artists) {
-  return artists.map(a => ({ ...a, name: deduplicateArtistName(a.name) }));
+  return artists.map(a => ({ ...a, name: a.name.trim() }));
 }
 
 // Allow 1-character difference for names of similar length — handles transliteration
@@ -4380,6 +4367,7 @@ era must be exactly one of: Contemporary, Golden Era, Pioneer.
 Include 12 artists — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
 knownTracks: real specific song titles this artist is known for (used to find them on Spotify/Apple Music).
 likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.
+IMPORTANT: Use the artist's exact real name as it appears on streaming platforms. Do NOT repeat a name (e.g. write "Banah" not "Banah Banah") unless the repeated form is the actual official name (e.g. "Duran Duran", "Talk Talk" are correct).
 
 Also include:
 "streamingFloor": the earliest decade where ${country} has notable music genuinely available on Spotify/Apple Music. Must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s. Consider whether pre-war or early-era recordings from ${country} are actually digitized and on streaming. Major hubs (USA, UK, France, Brazil, Cuba, Argentina, Nigeria, Jamaica): as early as 1920s–1950s. Most countries: 1970s–1990s.${lfNote}`
