@@ -2836,16 +2836,16 @@ app.delete("/api/cache", async (req, res) => {
 });
 
 // ── Helper function to fetch artist tracks ──────────────
-async function fetchArtistTracks(artistName) {
-  return spotifyEnqueue(() => _fetchArtistTracksImpl(artistName));
+async function fetchArtistTracks(artistName, userToken = null) {
+  return spotifyEnqueue(() => _fetchArtistTracksImpl(artistName, userToken));
 }
 
-async function _fetchArtistTracksImpl(artistName) {
+async function _fetchArtistTracksImpl(artistName, userToken = null) {
   const cacheKey = makeCacheKey(["artist-tracks", artistName]);
 
-  // 1. In-memory cache
+  // 1. In-memory cache (skip if user token present and cache was flagged — try fresh)
   const mem = artistTracksMemCache.get(cacheKey);
-  if (mem && Date.now() - mem.cachedAt < ARTIST_TRACKS_TTL_MS) {
+  if (mem && Date.now() - mem.cachedAt < ARTIST_TRACKS_TTL_MS && mem.tracks.length > 0) {
     console.log(`  [artist-tracks] mem cache hit → ${artistName}`);
     return mem.tracks;
   }
@@ -2853,21 +2853,27 @@ async function _fetchArtistTracksImpl(artistName) {
   // 2. Supabase cache
   const cached = await getCached(cacheKey);
   if (cached?.result?.tracks) {
-    // If cached as empty+flagged, re-queue for deep enrich without blocking the response
     if (cached.result.tracks.length === 0 && cached.result.flagged) {
-      console.log(`  [artist-tracks] cached empty (flagged) → re-queuing deep enrich for "${artistName}"`);
-      reQueueForDeepEnrich(artistName).catch(() => {});
+      if (userToken) {
+        // User is logged in — bypass stale flag and try fresh with their token
+        console.log(`  [artist-tracks] flagged but user token present — retrying live for "${artistName}"`);
+      } else {
+        console.log(`  [artist-tracks] cached empty (flagged) → re-queuing deep enrich for "${artistName}"`);
+        reQueueForDeepEnrich(artistName).catch(() => {});
+        return cached.result.tracks;
+      }
     } else {
       console.log(`  [artist-tracks] db cache hit → ${artistName}`);
+      artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
+      return cached.result.tracks;
     }
-    artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
-    return cached.result.tracks;
   }
 
   try {
-    console.log(`  Searching Spotify for: "${artistName}"`);
+    console.log(`  Searching Spotify for: "${artistName}"${userToken ? " (user token)" : ""}`);
 
-    const accessToken = await getClientAccessToken();
+    // Prefer user token — gives user-market top-tracks without needing market=US
+    const accessToken = userToken || await getClientAccessToken();
     if (!accessToken) {
       console.error(`  Failed to get access token`);
       return [];
@@ -2931,11 +2937,13 @@ async function _fetchArtistTracksImpl(artistName) {
 
     console.log(`  Found artist: "${matchedArtist.name}" (id: ${matchedArtist.id})`);
 
-    // Step 2: fetch top tracks — market=US required with client credentials (no user market)
-    const topTracksRes = await spotifyFetch(
-      `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks?market=US`,
-      { headers: { Authorization: "Bearer " + accessToken } }
-    );
+    // Step 2: fetch top tracks
+    // User token → no market needed (Spotify uses user's own market, best for non-US artists)
+    // Client credentials → market=US required or Spotify returns empty
+    const topTracksUrl = userToken
+      ? `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks`
+      : `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks?market=US`;
+    const topTracksRes = await spotifyFetch(topTracksUrl, { headers: { Authorization: "Bearer " + accessToken } });
 
     let tracks = [];
     if (topTracksRes.ok) {
@@ -3270,13 +3278,14 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
 // Get tracks for a specific artist
 app.get("/api/artist-tracks/:artistName", async (req, res) => {
   const { artistName } = req.params;
+  if (!artistName) return res.status(400).json({ error: "Missing artist name" });
 
-  if (!artistName) {
-    return res.status(400).json({ error: "Missing artist name" });
-  }
+  // Pass the user's Spotify token when available — gives better market coverage
+  const authHeader = req.headers.authorization;
+  const userToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
 
   try {
-    const tracks = await fetchArtistTracks(decodeURIComponent(artistName));
+    const tracks = await fetchArtistTracks(decodeURIComponent(artistName), userToken);
     res.json({ artist: artistName, tracks });
   } catch (err) {
     console.error("Error fetching artist tracks:", err);
