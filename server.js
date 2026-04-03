@@ -4425,8 +4425,8 @@ Also include:
   );
 
   // Step 3: Proactively fetch and cache tracks for each artist
-  let withTracks = 0;
-  let withoutTracks = 0;
+  const successfulArtists = [];  // artists that have playable tracks
+  const failedArtists = [];      // artists with no tracks found
 
   for (const artist of artistsWithImages) {
     const artistCacheKey = makeCacheKey(["artist-tracks-apple", artist.name]);
@@ -4434,29 +4434,100 @@ Also include:
     // Skip if already cached
     const existing = await getCached(artistCacheKey);
     if (existing?.result?.tracks?.length > 0) {
-      withTracks++;
+      successfulArtists.push(artist);
       continue;
     }
 
     const tracks = await proactiveArtistTracks(artist.name, artist.knownTracks || [], appleToken);
 
     if (tracks.length > 0) {
-      // Store in mem cache + Supabase
       artistTracksMemCache.set(artistCacheKey, { tracks, cachedAt: Date.now() });
       await storeCache(artistCacheKey, "artist-tracks-apple", { tracks });
       console.log(`  [country-enrich] ✓ ${artist.name} → ${tracks.length} tracks${tracks[0]?.appleId ? " (Apple Music)" : " (LB)"}`);
-      withTracks++;
+      successfulArtists.push(artist);
     } else {
       console.log(`  [country-enrich] – ${artist.name} → no tracks found`);
-      // Mark as attempted in enrichment queue so we don't keep retrying
       await addToEnrichmentQueue([artist], country);
-      withoutTracks++;
+      failedArtists.push(artist);
     }
 
-    // Small delay to avoid rate-limiting
     await new Promise(r => setTimeout(r, 300));
   }
 
+  // Step 4: Replace unplayable artists — aim for at least 8 with tracks
+  const TARGET_WITH_TRACKS = 8;
+  const needed = Math.max(0, TARGET_WITH_TRACKS - successfulArtists.length);
+  const replacements = [];
+
+  if (needed > 0 && failedArtists.length > 0) {
+    console.log(`[country-enrich] ${country}: ${failedArtists.length} failed — finding ${needed} replacements`);
+    const allUsedNames = artistsWithImages.map(a => a.name);
+
+    // Ask Claude Haiku for replacements grounded in Last.fm geo data
+    const lfCandidates = lfArtists.filter(n => !allUsedNames.some(u => u.toLowerCase() === n.toLowerCase()));
+    const lfHint = lfCandidates.length > 0
+      ? `\nLast.fm top artists for ${country} not yet used: ${lfCandidates.slice(0, 15).join(', ')}. Prefer these if they are genuinely from ${country}.`
+      : '';
+
+    try {
+      const cr = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 500,
+          system: "Return ONLY valid JSON — no markdown, no preamble.",
+          messages: [{
+            role: "user",
+            content: `Suggest ${needed + 2} replacement artists from ${country} who ARE on Spotify or Apple Music.
+Do NOT suggest: ${allUsedNames.join(', ')}.
+Strongly prefer Contemporary artists (active in the last 20 years) who release on streaming platforms.${lfHint}
+JSON: {"artists": [{"name": "Artist Name", "genre": "genre", "era": "Contemporary", "knownTracks": ["Track 1", "Track 2"]}]}`
+          }]
+        }),
+      });
+      const cd = await cr.json();
+      const raw = (cd.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
+      const candidates = JSON.parse(raw).artists || [];
+      console.log(`[country-enrich] replacement candidates for ${country}: ${candidates.map(a => a.name).join(', ')}`);
+
+      for (const candidate of candidates) {
+        if (replacements.length >= needed) break;
+        const ck = makeCacheKey(["artist-tracks-apple", candidate.name]);
+        const lfTitles = await lastfmArtistTopTracks(candidate.name, 5);
+        const seedTracks = [...new Set([...(candidate.knownTracks || []), ...lfTitles])];
+        const tracks = await proactiveArtistTracks(candidate.name, seedTracks, appleToken);
+        if (tracks.length > 0) {
+          artistTracksMemCache.set(ck, { tracks, cachedAt: Date.now() });
+          await storeCache(ck, "artist-tracks-apple", { tracks });
+          replacements.push(candidate);
+          console.log(`  [country-enrich] ✓ replacement ${candidate.name} → ${tracks.length} tracks`);
+        } else {
+          console.log(`  [country-enrich] – replacement ${candidate.name} → still no tracks`);
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+    } catch (err) {
+      console.error(`[country-enrich] replacement search failed for ${country}:`, err.message);
+    }
+  }
+
+  // Update cached pool: swap in replacements for failed artists, keep rest
+  if (replacements.length > 0) {
+    const updatedPool = [
+      ...successfulArtists,
+      ...replacements,
+      ...failedArtists.slice(replacements.length), // keep any still-unresolved failures at end
+    ];
+    await storeCache(cacheKey, "recommend",
+      { genres: research.genres, didYouKnow: research.didYouKnow, streamingFloor },
+      updatedPool
+    );
+    console.log(`[country-enrich] ${country}: updated pool with ${replacements.length} replacements`);
+  }
+
+  const withTracks = successfulArtists.length + replacements.length;
+  const withoutTracks = failedArtists.length - replacements.length;
   console.log(`[country-enrich] ${country} done: ${withTracks} with tracks, ${withoutTracks} without`);
   return { country, artists: research.artists.length, withTracks, withoutTracks };
 }
