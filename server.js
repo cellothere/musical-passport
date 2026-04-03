@@ -68,43 +68,33 @@ async function getClientAccessToken() {
 
 // ── Artist image URL fetching (Spotify → Apple Music → Last.fm fallback) ──
 async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = null } = {}) {
-  if (!skipSpotify) try {
-    const token = await getClientAccessToken();
-    if (token) {
+  if (!skipSpotify && Date.now() >= spotifyRateLimitedUntil) try {
+    const spotifyImageUrl = await spotifyEnqueue(async () => {
+      const token = await getClientAccessToken();
+      if (!token) return null;
       const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
       const qNorm = normalize(artistName);
-
-      const r = await fetch(
+      const r = await spotifyFetch(
         `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
         { headers: { Authorization: 'Bearer ' + token } }
       );
+      if (!r.ok) return null;
       const data = await r.json();
       const candidates = data.artists?.items || [];
-      if (candidates.length > 0) {
-        const match = candidates.find(a => normalize(a.name) === qNorm)
-          || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
-          || candidates[0];
-        if (match && (normalize(match.name).includes(qNorm) || qNorm.includes(normalize(match.name)))) {
-          // Genre sanity check: if we have genre context and Spotify has genre tags for this artist,
-          // reject the result when there's clearly no overlap — prevents wrong-artist disambiguation
-          // (e.g. Azerbaijani "Bulbul" classical singer vs. Indian pop "Bulbul")
-          if (genre && match.genres && match.genres.length > 0) {
-            const spotifyGenreStr = match.genres.join(' ').toLowerCase();
-            const genreWords = genre.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 3);
-            const hasOverlap = genreWords.length === 0 || genreWords.some(w => spotifyGenreStr.includes(w));
-            if (!hasOverlap) {
-              // Skip this Spotify result — fall through to Apple Music / Last.fm
-            } else {
-              const url = match.images?.[0]?.url;
-              if (url) return url;
-            }
-          } else {
-            const url = match.images?.[0]?.url;
-            if (url) return url;
-          }
-        }
+      if (candidates.length === 0) return null;
+      const match = candidates.find(a => normalize(a.name) === qNorm)
+        || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
+        || candidates[0];
+      if (!match || !(normalize(match.name).includes(qNorm) || qNorm.includes(normalize(match.name)))) return null;
+      if (genre && match.genres && match.genres.length > 0) {
+        const spotifyGenreStr = match.genres.join(' ').toLowerCase();
+        const genreWords = genre.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 3);
+        const hasOverlap = genreWords.length === 0 || genreWords.some(w => spotifyGenreStr.includes(w));
+        if (!hasOverlap) return null;
       }
-    }
+      return match.images?.[0]?.url || null;
+    });
+    if (spotifyImageUrl) return spotifyImageUrl;
   } catch {}
 
   try {
@@ -158,6 +148,10 @@ const ARTIST_TRACKS_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 // small gap between them so we never fire two at once.
 const spotifyQueue = [];
 let spotifyBusy = false;
+// Circuit breaker: when a non-retryable 429 is received, all queued calls are
+// short-circuited until this timestamp. Prevents draining 10+ queued calls that
+// will all hit 429 anyway and worsen the ban.
+let spotifyRateLimitedUntil = 0;
 
 function spotifyEnqueue(fn) {
   return new Promise((resolve, reject) => {
@@ -166,17 +160,33 @@ function spotifyEnqueue(fn) {
   });
 }
 
+const RATE_LIMIT_ERROR = new Response(JSON.stringify({ error: "rate_limited" }), {
+  status: 429,
+  headers: { "Content-Type": "application/json" },
+});
+
 async function drainSpotifyQueue() {
   if (spotifyQueue.length === 0) { spotifyBusy = false; return; }
   spotifyBusy = true;
   const { fn, resolve, reject } = spotifyQueue.shift();
+
+  // Circuit breaker: if we're inside a rate-limit window, short-circuit immediately
+  if (Date.now() < spotifyRateLimitedUntil) {
+    const remainingS = Math.ceil((spotifyRateLimitedUntil - Date.now()) / 1000);
+    console.warn(`  [Spotify] circuit open — skipping queued call (${remainingS}s remaining, ${spotifyQueue.length} more queued)`);
+    resolve(RATE_LIMIT_ERROR.clone());
+    setTimeout(drainSpotifyQueue, 50); // drain remaining items quickly
+    return;
+  }
+
   try { resolve(await fn()); } catch (e) { reject(e); }
   setTimeout(drainSpotifyQueue, 200); // 200ms between calls → max ~5/s
 }
 
 // Wraps fetch with retry-on-429 logic.
 // If Retry-After > MAX_RETRY_WAIT_S we don't retry — Spotify issued a long-term
-// ban (up to 24h on some endpoints). Waiting that long blocks the whole queue.
+// ban (up to 24h on some endpoints). Opens the circuit breaker so queued calls
+// short-circuit instead of all hitting 429.
 const MAX_RETRY_WAIT_S = 30;
 async function spotifyFetch(url, options = {}, retries = 2) {
   const res = await fetch(url, options);
@@ -188,8 +198,9 @@ async function spotifyFetch(url, options = {}, retries = 2) {
       await new Promise(r => setTimeout(r, wait));
       return spotifyFetch(url, options, retries - 1);
     }
-    // Can't retry (daily limit or too long a wait) — return a safe JSON-parseable 429 response
-    console.warn(`  [Spotify] 429 rate-limited (Retry-After ${retryAfter}s) – returning error response`);
+    // Long-term ban — open circuit breaker so remaining queued calls don't pile on
+    spotifyRateLimitedUntil = Date.now() + retryAfter * 1000;
+    console.warn(`  [Spotify] 429 rate-limited (Retry-After ${retryAfter}s) – circuit open until ${new Date(spotifyRateLimitedUntil).toISOString()}`);
     return new Response(JSON.stringify({ error: "rate_limited", retryAfter }), {
       status: 429,
       headers: { "Content-Type": "application/json" },
@@ -2841,7 +2852,10 @@ async function fetchArtistTracks(artistName, userToken = null) {
 }
 
 async function _fetchArtistTracksImpl(artistName, userToken = null) {
-  // Resolve canonical artist name via Last.fm before cache key (correction changes the key)
+  // Try Last.fm correction for canonical name — but keep the original as fallback.
+  // Last.fm corrections are sometimes just different romanizations (e.g. Jahanzeb → Jehanzeb)
+  // that don't match the name Spotify actually uses.
+  const originalName = artistName;
   const lfCorrected = await lastfmArtistCorrection(artistName);
   if (lfCorrected) {
     console.log(`  [artist-tracks] Last.fm correction: "${artistName}" → "${lfCorrected}"`);
@@ -2924,6 +2938,48 @@ async function _fetchArtistTracksImpl(artistName, userToken = null) {
     };
 
     if (!matchedArtist) {
+      // If Last.fm gave us a corrected name that Spotify doesn't recognise, retry with the
+      // original name — corrections are often just different romanizations (Jehanzeb vs Jahanzeb).
+      if (lfCorrected && originalName !== artistName) {
+        console.log(`  [artist-tracks] corrected name failed — retrying Spotify with original "${originalName}"`);
+        const retrySearch = await spotifyFetch(
+          `https://api.spotify.com/v1/search?q=${encodeURIComponent(originalName)}&type=artist&limit=5`,
+          { headers: { Authorization: "Bearer " + accessToken } }
+        );
+        if (retrySearch.ok) {
+          const retryData = await retrySearch.json();
+          const retryArtists = retryData.artists?.items || [];
+          const origTarget = normalize(originalName);
+          const retryMatched = retryArtists.find(a => normalize(a.name) === origTarget)
+            ?? retryArtists.find(a => {
+              const n = normalize(a.name);
+              return n.includes(origTarget) || origTarget.includes(n);
+            });
+          if (retryMatched) {
+            console.log(`  [artist-tracks] original name matched: "${retryMatched.name}" — using it`);
+            artistName = originalName; // switch back to the name Spotify knows
+            // fall through to top-tracks fetch below using retryMatched
+            const retryTopUrl = userToken
+              ? `https://api.spotify.com/v1/artists/${retryMatched.id}/top-tracks`
+              : `https://api.spotify.com/v1/artists/${retryMatched.id}/top-tracks?market=US`;
+            const retryTopRes = await spotifyFetch(retryTopUrl, { headers: { Authorization: "Bearer " + accessToken } });
+            if (retryTopRes.ok) {
+              const retryTopData = await retryTopRes.json();
+              const retryTracks = (retryTopData.tracks || []).slice(0, 3).map(t => ({
+                title: t.name, artist: t.artists?.[0]?.name, spotifyId: t.id,
+                previewUrl: t.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+              }));
+              if (retryTracks.length > 0) {
+                artistTracksMemCache.set(cacheKey, { tracks: retryTracks, cachedAt: Date.now() });
+                storeCache(cacheKey, "artist-tracks", { tracks: retryTracks }).catch(() => {});
+                console.log(`  [artist-tracks] original-name retry found ${retryTracks.length} tracks for "${originalName}"`);
+                return retryTracks;
+              }
+            }
+          }
+        }
+      }
+
       // Artist not on Spotify by name — try Last.fm seed titles as targeted searches
       console.log(`  No artist match for "${artistName}" on Spotify → trying Last.fm seeded search`);
       const lfTitles = await lastfmArtistTopTracks(artistName, 5);
