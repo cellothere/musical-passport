@@ -4678,7 +4678,7 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
     if (corrected) console.log(`[deep-enrich] Last.fm correction: "${rawName}" → "${corrected}"`);
 
     // Step 1a: Last.fm artist.getTopTracks — fast, free, great non-Western coverage
-    let knownTitles = await lastfmArtistTopTracks(artistName, 5);
+    let knownTitles = await lastfmArtistTopTracks(artistName, 10);
     if (knownTitles.length > 0) {
       console.log(`[deep-enrich] Last.fm → ${knownTitles.length} known tracks for "${artistName}"`);
     } else {
@@ -4712,7 +4712,7 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
         if (!token) return [];
         // Try each known title with artist name on Spotify
         const results = [];
-        for (const title of knownTitles) {
+        for (const title of knownTitles.slice(0, 5)) {
           const r = await spotifyFetch(
             `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:"${title}" artist:"${artistName}"`)}&type=track&limit=3`,
             { headers: { Authorization: "Bearer " + token } }
@@ -4729,8 +4729,10 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
       })();
     }
 
-    // Step 4: ListenBrainz final fallback
-    if (tracks.length === 0) tracks = await fetchArtistTracksFromLB(artistName);
+    // Step 4: full Spotify artist-search path (top-tracks → track-search → LB → YouTube)
+    // proactiveArtistTracks already tried Deezer + LB; this covers the Spotify angle
+    // and enriches any LB results with YouTube preview URLs as a last resort
+    if (tracks.length === 0) tracks = await proactiveSpotifyTracks(artistName);
 
     if (tracks.length > 0) {
       // Clear flag — we found tracks
