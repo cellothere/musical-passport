@@ -1090,7 +1090,7 @@ function pickDiverse(arr, n) {
   return chosen;
 }
 
-// Pick n artists from pool ensuring era diversity (Contemporary / Golden Era / Pioneer).
+// Pick n artists from pool ensuring era diversity across decades.
 function pickDiverseByEra(arr, n) {
   // Prefer artists with verified tracks; fill remaining slots from unverified
   const withTracks = arr.filter(a => a.hasVerifiedTracks);
@@ -1891,7 +1891,6 @@ IMPORTANT: If "${country}" is a historical, defunct, or ancient civilization (e.
 - Treat it as a rich musical culture worth exploring — not an error.
 - Recommend real artists and genres from that tradition, including modern scholars, revival artists, and descendants of that musical heritage.
 - Mix artists who were active during that civilization's time with modern artists who carry the tradition forward.
-- "Contemporary" means an artist working today who continues or revives this tradition.
 - The "didYouKnow" should reveal something genuinely surprising about that civilization's music.
 
 Return exactly this JSON:
@@ -1901,13 +1900,13 @@ Return exactly this JSON:
     {
       "name": "Name",
       "genre": "specific genre",
-      "era": "Contemporary",
+      "era": "1980s",
       "similarTo": "One well-known artist name only, no description (e.g. 'Bob Dylan')"
     }
   ],
   "didYouKnow": "One surprising musical fact about ${country}"
 }
-era must be exactly one of: Contemporary, Golden Era, Pioneer. Include exactly 12 artists mixing eras — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
+era must be a decade string — exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s — representing the decade this artist was most active or is most associated with. Include exactly 12 artists with a varied spread of decades — include artists from at least 3 different decade groups.
 IMPORTANT: Use each artist's exact real name as it appears on streaming platforms. Do NOT repeat a name (e.g. write "Banah" not "Banah Banah") unless the repeated form is the actual official band name (e.g. "Duran Duran", "Talk Talk" are correct).${realPoolNote}`,
           },
         ],
@@ -2844,7 +2843,7 @@ Return exactly this JSON:
     {
       "name": "Artist Name",
       "genre": "${genre}",
-      "era": "Contemporary",
+      "era": "1980s",
       "country": "Country name",
       "countryCode": "XX"
     }
@@ -2853,8 +2852,7 @@ Return exactly this JSON:
 
 Rules:
 - Include exactly 12 artists from diverse countries — not just English-speaking or Western artists.
-- Each era must be exactly one of: Contemporary, Golden Era, Pioneer.
-- Include at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
+- era must be a decade string — exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s — the decade this artist was most active or is most associated with. Include artists from at least 3 different decade groups.
 - Artists should be real, historically significant or culturally important for this genre in their country.
 - Prioritize artists from countries where this genre originated or has a strong tradition.
 - countryCode must be the correct ISO 3166-1 alpha-2 two-letter country code (e.g. "NG" for Nigeria, "BR" for Brazil).`,
@@ -3716,7 +3714,7 @@ Return ONLY valid JSON:
       "country": "full country name",
       "countryCode": "2-letter ISO code",
       "genre": "their primary genre",
-      "era": "Contemporary|Golden Era|Pioneer"
+      "era": "1980s (decade string: 1900s–2020s)"
     }
   ]
 }`;
@@ -4726,7 +4724,7 @@ Return exactly this JSON:
     {
       "name": "Artist Name",
       "genre": "specific local genre",
-      "era": "Contemporary",
+      "era": "1980s",
       "similarTo": "one well-known comparison artist name only",
       "knownTracks": ["Exact Song Title 1", "Exact Song Title 2"],
       "likelyOnStreaming": true
@@ -4734,8 +4732,8 @@ Return exactly this JSON:
   ]
 }
 
-era must be exactly one of: Contemporary, Golden Era, Pioneer.
-Include 12 artists — at least 3 Contemporary, at least 2 Golden Era, at least 1 Pioneer.
+era must be a decade string — exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s — the decade this artist was most active or is most associated with.
+Include 12 artists with a varied spread of decades — include artists from at least 3 different decade groups.
 knownTracks: real specific song titles this artist is known for (used to find them on Spotify/Apple Music).
 likelyOnStreaming: true if you believe this artist has a presence on Spotify or Apple Music; false for purely regional or very obscure artists.
 IMPORTANT: Use the artist's exact real name as it appears on streaming platforms. Do NOT repeat a name (e.g. write "Banah" not "Banah Banah") unless the repeated form is the actual official name (e.g. "Duran Duran", "Talk Talk" are correct).
