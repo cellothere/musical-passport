@@ -3614,13 +3614,26 @@ app.post("/api/similar-artists", async (req, res) => {
 
   const simCacheKey = makeCacheKey(["similar", artistName]);
 
+  // Helper: fetch and attach missing images to a pool, update cache
+  async function ensurePoolImages(pool, cacheKey, cacheResult) {
+    const needsImages = pool.some(a => !a.imageUrl);
+    if (!needsImages) return pool;
+    const imageUrls = await Promise.all(
+      pool.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null))
+    );
+    const updated = pool.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || a.imageUrl || null }));
+    await storeCache(cacheKey, "similar-artists", cacheResult, updated).catch(() => {});
+    return updated;
+  }
+
   // 1. Direct cache hit
   const simCached = await getCached(simCacheKey);
   if (simCached && simCached.artist_pool && simCached.artist_pool.length >= 4) {
     console.log(`[similar-artists] cache hit → ${artistName}`);
+    const pool = await ensurePoolImages(simCached.artist_pool, simCacheKey, simCached.result);
     return res.json({
       baseArtist: simCached.result.baseArtist,
-      artists: pickDiverse(simCached.artist_pool, 6),
+      artists: pickDiverse(pool, 5),
     });
   }
 
@@ -3630,87 +3643,90 @@ app.post("/api/similar-artists", async (req, res) => {
     const sourcePool = await getCached(reverseEntry.result.poolKey);
     if (sourcePool?.artist_pool?.length >= 4) {
       console.log(`[similar-artists] reverse-index hit → ${artistName} from pool ${reverseEntry.result.poolKey}`);
-      // Filter out the original base artist, then pick diverse results
       const filtered = sourcePool.artist_pool.filter(
         a => makeCacheKey([a.name]) !== makeCacheKey([sourcePool.result.baseArtist])
       );
-      // Store a direct cache entry for future hits
-      await storeCache(simCacheKey, "similar-artists", { baseArtist: artistName }, filtered);
-      return res.json({ baseArtist: artistName, artists: pickDiverse(filtered, 6) });
+      const pool = await ensurePoolImages(filtered, simCacheKey, { baseArtist: artistName });
+      await storeCache(simCacheKey, "similar-artists", { baseArtist: artistName }, pool);
+      return res.json({ baseArtist: artistName, artists: pickDiverse(pool, 5) });
     }
   }
 
   try {
-    const token = await getClientAccessToken();
-    if (!token) return res.status(503).json({ error: "Could not authenticate with Spotify." });
-
-    // Step 1: Look up artist on Spotify for genres
-    const artistSearch = await spotifyFetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
-      { headers: { Authorization: "Bearer " + token } }
-    );
-    if (!artistSearch.ok) return res.status(503).json({ error: "Spotify search unavailable, please try again later." });
-    const artistData = await artistSearch.json();
-    const candidates = artistData.artists?.items || [];
-    if (candidates.length === 0) return res.status(404).json({ error: "Artist not found on Spotify." });
-
-    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const qNorm = normalize(artistName);
-    const artist = candidates.find(a => normalize(a.name) === qNorm)
-      || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
-      || candidates[0];
-
-    if (!normalize(artist.name).includes(qNorm) && !qNorm.includes(normalize(artist.name))) {
-      return res.status(404).json({ error: "Artist not found on Spotify." });
-    }
-
-    const foundName = artist.name;
-    const genres = artist.genres?.slice(0, 5) || [];
-
-    // Step 2: Last.fm similar artists
-    let lastfmSimilar = [];
     const lastfmKey = process.env.LASTFM_API_KEY;
-    if (lastfmKey) {
-      try {
-        const lfRes = await fetch(
-          `https://ws.audioscrobbler.com/2.0/?method=artist.getSimilar&artist=${encodeURIComponent(foundName)}&limit=30&autocorrect=1&api_key=${lastfmKey}&format=json`
-        );
-        const lfData = await lfRes.json();
-        lastfmSimilar = (lfData.similarartists?.artist || [])
-          .map(a => ({ name: a.name, match: parseFloat(a.match) }))
-          .filter(a => a.match > 0.1)
-          .slice(0, 25);
-        console.log(`[similar-artists] Last.fm → ${lastfmSimilar.length} similar artists for ${foundName}`);
-      } catch (e) {
-        console.log("Last.fm unavailable:", e.message);
-      }
-    }
+    let foundName = artistName;
+    let genres = [];
+    let lastfmSimilar = [];
+    let deezerSimilar = [];
 
-    // Step 3: Build Claude prompt
+    // Run Last.fm (info + similar) and Deezer (related) in parallel
+    await Promise.all([
+      (async () => {
+        if (!lastfmKey) return;
+        try {
+          const [infoRes, simRes] = await Promise.all([
+            fetch(`https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artistName)}&autocorrect=1&api_key=${lastfmKey}&format=json`),
+            fetch(`https://ws.audioscrobbler.com/2.0/?method=artist.getSimilar&artist=${encodeURIComponent(artistName)}&limit=30&autocorrect=1&api_key=${lastfmKey}&format=json`),
+          ]);
+          const [infoData, simData] = await Promise.all([infoRes.json(), simRes.json()]);
+
+          if (!infoData.error && infoData.artist?.name) {
+            foundName = infoData.artist.name;
+            genres = (infoData.artist.tags?.tag || []).map(t => t.name).filter(t => t.length < 40).slice(0, 6);
+            console.log(`[similar-artists] Last.fm info → ${foundName}, tags: ${genres.join(", ")}`);
+          } else {
+            console.log(`[similar-artists] Last.fm couldn't resolve "${artistName}" — using as-is`);
+          }
+
+          lastfmSimilar = (simData.similarartists?.artist || [])
+            .map(a => ({ name: a.name, match: parseFloat(a.match) }))
+            .filter(a => a.match > 0.1)
+            .slice(0, 25);
+          console.log(`[similar-artists] Last.fm similar → ${lastfmSimilar.length} artists for ${foundName}`);
+        } catch (e) {
+          console.log(`[similar-artists] Last.fm unavailable: ${e.message}`);
+        }
+      })(),
+      (async () => {
+        try {
+          deezerSimilar = await deezerRelatedArtists(artistName);
+          if (deezerSimilar.length > 0) console.log(`[similar-artists] Deezer related → ${deezerSimilar.length} artists`);
+        } catch (e) {
+          console.log(`[similar-artists] Deezer unavailable: ${e.message}`);
+        }
+      })(),
+    ]);
+
+    // Build Claude prompt
     const lastfmLines = lastfmSimilar.length > 0
       ? `\nLast.fm similar artists (ranked by listener similarity — use these as your primary sonic reference to find global equivalents):\n${lastfmSimilar.map(a => `- ${a.name} (similarity: ${(a.match * 100).toFixed(0)}%)`).join("\n")}`
       : "";
+    const deezerLines = deezerSimilar.length > 0
+      ? `\nDeezer related artists (editorial/algorithmic — cross-reference with Last.fm for validation):\n${deezerSimilar.map(n => `- ${n}`).join("\n")}`
+      : "";
 
-    const prompt = `Find 16 artists from different countries around the world who sound similar to ${foundName}.
+    const prompt = `Find 10 artists from different countries around the world who sound similar to ${foundName}.
 
 Their profile:
-- Primary genres: ${genres.length > 0 ? genres.join(", ") : "mainstream pop"}
-${lastfmLines}
+- Primary genres: ${genres.length > 0 ? genres.join(", ") : "inferred from artist name"}
+${lastfmLines}${deezerLines}
 
 Rules:
 - Each artist must be from a DIFFERENT country
-- Spread across at least 6 different continents/regions
+- HARD LIMIT: No more than 2 artists from the same continent (Asia, Europe, Americas, Africa, Oceania)
+- You MUST include at least one artist from each of: the Americas, Europe, and Africa or the Middle East
 - Mix of contemporary and classic artists
 - Avoid globally mainstream acts (no top-10 global chart artists)
-- If any Last.fm similar artists above are from Africa, Asia, Latin America, Middle East, or Oceania, include them directly
-- For the rest, use the Last.fm list as a sonic fingerprint to find lesser-known global equivalents
+- Even if the input artist is from a specific regional genre (K-pop, J-pop, etc.), find global equivalents who capture the same energy — do not just pick similar acts from the same region
+- Use the Last.fm and Deezer lists as a sonic fingerprint to find the best global equivalents
 - Focus on capturing the same sonic energy, emotional feel, or stylistic DNA
+- Be precise about country of origin — do NOT confuse similar-named artists (e.g. Nick Drake is English, not Canadian; George Michael is British; do not guess)
 
 Return ONLY valid JSON:
 {
   "artists": [
     {
-      "name": "exact artist name as on Spotify",
+      "name": "exact artist name",
       "country": "full country name",
       "countryCode": "2-letter ISO code",
       "genre": "their primary genre",
@@ -3742,31 +3758,50 @@ Return ONLY valid JSON:
 
     const rawPool = result.artists || [];
 
-    // Validate artists exist on Last.fm — filters hallucinations before caching
-    const lastfmKey2 = process.env.LASTFM_API_KEY;
-    const validatedPool = lastfmKey2
-      ? (await Promise.all(rawPool.map(async (artist) => {
-          try {
-            const r = await fetch(
-              `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artist.name)}&autocorrect=0&api_key=${lastfmKey2}&format=json`
-            );
-            const d = await r.json();
-            if (d.error || !d.artist?.name) {
-              console.log(`[similar-artists] filtered hallucination: ${artist.name}`);
-              return null;
-            }
-            return artist;
-          } catch { return artist; } // network error → keep, don't over-filter
-        }))).filter(Boolean)
-      : rawPool;
+    // Run Last.fm hallucination filtering and image fetching in parallel to save time
+    const [validatedPool, imageUrls] = await Promise.all([
+      lastfmKey
+        ? (async () => {
+            const results = await Promise.all(rawPool.map(async (artist) => {
+              try {
+                const r = await fetch(
+                  `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artist.name)}&autocorrect=0&api_key=${lastfmKey}&format=json`
+                );
+                const d = await r.json();
+                if (d.error || !d.artist?.name) {
+                  console.log(`[similar-artists] filtered hallucination: ${artist.name}`);
+                  return null;
+                }
+                return artist;
+              } catch { return artist; }
+            }));
+            return results.filter(Boolean);
+          })()
+        : Promise.resolve(rawPool),
+      Promise.all(rawPool.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null))),
+    ]);
+
     console.log(`[similar-artists] validation: ${rawPool.length} → ${validatedPool.length} artists`);
 
-    const simPool = await verifyPoolCountries(validatedPool);
-    await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, simPool);
-    // Write reverse-index entries for every artist in the pool
-    await storeSimilarIndex(simPool, simCacheKey);
-    console.log(`[similar-artists] Claude → ${foundName} (${simPool.length} matches)`);
-    res.json({ baseArtist: foundName, artists: pickDiverse(simPool, 6) });
+    // Attach images to validated pool
+    const nameToImage = {};
+    rawPool.forEach((a, i) => { if (imageUrls[i]) nameToImage[a.name] = imageUrls[i]; });
+    const poolWithImages = validatedPool.map(a => ({ ...a, imageUrl: nameToImage[a.name] || null }));
+
+    // Store pool immediately (with images, without MB country verification)
+    await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, poolWithImages);
+    await storeSimilarIndex(poolWithImages, simCacheKey);
+    console.log(`[similar-artists] → ${foundName} (${poolWithImages.length} matches)`);
+    res.json({ baseArtist: foundName, artists: pickDiverse(poolWithImages, 5) });
+
+    // Country verification runs in background — corrects & re-caches without blocking the response
+    verifyPoolCountries(poolWithImages).then(async verified => {
+      const changed = verified.some((a, i) => a.countryCode !== poolWithImages[i]?.countryCode);
+      if (changed) {
+        await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, verified);
+        console.log(`[similar-artists] background country verify updated cache for ${foundName}`);
+      }
+    }).catch(() => {});
   } catch (err) {
     console.error("Similar artists error:", err);
     res.status(500).json({ error: err.message });
@@ -4535,6 +4570,35 @@ async function deezerTrackSearch(trackTitle, artistName) {
       deezerUrl: best.link,
     };
   } catch { return null; }
+}
+
+async function deezerRelatedArtists(artistName) {
+  try {
+    const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const target = normalise(artistName);
+
+    const searchRes = await deezerEnqueue(() =>
+      fetch(`${DEEZER_BASE}/search/artist?q=${encodeURIComponent(artistName)}&limit=5`)
+    );
+    const searchData = await searchRes.json();
+    if (searchData.error?.code === 4) { console.warn('  [Deezer related] quota exceeded'); return []; }
+
+    const artists = searchData.data || [];
+    const matched = artists.find(a => normalise(a.name) === target)
+      ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || (n.length >= 5 && target.includes(n)); });
+    if (!matched) return [];
+
+    const relRes = await deezerEnqueue(() =>
+      fetch(`${DEEZER_BASE}/artist/${matched.id}/related?limit=20`)
+    );
+    const relData = await relRes.json();
+    if (relData.error?.code === 4) return [];
+
+    return (relData.data || []).map(a => a.name).filter(Boolean).slice(0, 20);
+  } catch (err) {
+    console.error(`  [Deezer related] error for "${artistName}":`, err.message);
+    return [];
+  }
 }
 
 // ── YouTube helpers ────────────────────────────────────────
