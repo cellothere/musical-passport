@@ -501,9 +501,10 @@ async function verifyArtistTracksForRecommend(artists, country) {
     );
 
     if (uniqueTracks.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks: uniqueTracks, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks-apple", { tracks: uniqueTracks }).catch(() => {});
-      return { artist, tracks: uniqueTracks };
+      const withDeezer = await enrichWithDeezer(uniqueTracks, artist.name);
+      artistTracksMemCache.set(cacheKey, { tracks: withDeezer, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: withDeezer }).catch(() => {});
+      return { artist, tracks: withDeezer };
     }
 
     // Flag it — cron will deep-enrich; Spotify check runs when user taps the card
@@ -2370,38 +2371,23 @@ app.post("/api/genre-spotlight", async (req, res) => {
   const gsCached = await getCached(gsCacheKey);
 
   // Supplement sparse/empty track lists with 1-2 tracks per related artist (runs on cache hits too)
-  const supplementFromRelatedArtists = async (result, accessToken) => {
+  const supplementFromRelatedArtists = async (result) => {
     if (!relatedArtistNames.length) return result;
     const tracks = [...(result.tracks || [])];
     if (tracks.length >= 4) return result;
-    const seenIds = new Set(tracks.map(t => t.spotifyId || t.appleId).filter(Boolean));
+    const seenIds = new Set(tracks.map(t => t.appleId || t.deezerId).filter(Boolean));
+    const appleToken = generateAppleMusicToken();
     for (const artistName of relatedArtistNames) {
       if (tracks.length >= 5) break;
       try {
-        if (service === 'apple-music') {
-          const appleToken = generateAppleMusicToken();
-          const appleArtistTracks = await proactiveArtistTracks(artistName, [], appleToken);
-          let added = 0;
-          for (const t of appleArtistTracks) {
-            if (added >= 2 || tracks.length >= 5) break;
-            if (!t.appleId || seenIds.has(t.appleId)) continue;
-            seenIds.add(t.appleId); tracks.push(t); added++;
-          }
-        } else if (accessToken) {
-          const sr = await fetch(
-            `https://api.spotify.com/v1/search?q=${encodeURIComponent('artist:' + artistName)}&type=track&limit=5&market=US`,
-            { headers: { Authorization: 'Bearer ' + accessToken } }
-          );
-          const sd = await sr.json();
-          const items = (sd.tracks?.items || []).filter(t => artistNamesMatch(artistName, t.artists?.[0]?.name || ''));
-          let added = 0;
-          for (const t of items) {
-            if (added >= 2 || tracks.length >= 5) break;
-            if (seenIds.has(t.id)) continue;
-            seenIds.add(t.id);
-            tracks.push({ title: t.name, artist: t.artists?.[0]?.name || artistName, spotifyId: t.id, previewUrl: t.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${t.id}` });
-            added++;
-          }
+        const artistTracks = await proactiveArtistTracks(artistName, [], appleToken);
+        const withDeezer = await enrichWithDeezer(artistTracks, artistName);
+        let added = 0;
+        for (const t of withDeezer) {
+          if (added >= 2 || tracks.length >= 5) break;
+          const trackId = t.appleId || t.deezerId;
+          if (!trackId || seenIds.has(trackId)) continue;
+          seenIds.add(trackId); tracks.push(t); added++;
         }
       } catch {}
     }
@@ -2412,8 +2398,7 @@ app.post("/api/genre-spotlight", async (req, res) => {
 
   if (gsCached) {
     console.log(`[genre-spotlight] cache hit → ${genre} / ${country}`);
-    const accessToken = req.headers.authorization?.replace('Bearer ', '') || null;
-    const supplemented = await supplementFromRelatedArtists(gsCached.result, accessToken);
+    const supplemented = await supplementFromRelatedArtists(gsCached.result);
     return res.json(supplemented);
   }
 
@@ -2706,8 +2691,7 @@ Return exactly this JSON:
     let gsResult = { genre, country, explanation: spotlight.explanation, tracks, suggestedGenres: spotlight.suggestedGenres || [], hasLocalScene: spotlight.hasLocalScene !== false, isNicheWorldGenre };
 
     // Supplement with related artist tracks from the recommendation page (runs on fresh responses too)
-    const freshAccessToken = req.headers.authorization?.replace('Bearer ', '') || null;
-    gsResult = await supplementFromRelatedArtists(gsResult, freshAccessToken);
+    gsResult = await supplementFromRelatedArtists(gsResult);
 
     await storeCache(gsCacheKey, "genre-spotlight", gsResult);
     console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${gsResult.tracks.length} tracks)`);
@@ -2952,15 +2936,11 @@ app.delete("/api/cache", async (req, res) => {
 });
 
 // ── Helper function to fetch artist tracks ──────────────
-async function fetchArtistTracks(artistName, userToken = null) {
-  return spotifyEnqueue(() => _fetchArtistTracksImpl(artistName, userToken));
+async function fetchArtistTracks(artistName) {
+  return _fetchArtistTracksImpl(artistName);
 }
 
-async function _fetchArtistTracksImpl(artistName, userToken = null) {
-  // Try Last.fm correction for canonical name — but keep the original as fallback.
-  // Last.fm corrections are sometimes just different romanizations (e.g. Jahanzeb → Jehanzeb)
-  // that don't match the name Spotify actually uses.
-  const originalName = artistName;
+async function _fetchArtistTracksImpl(artistName) {
   const lfCorrected = await lastfmArtistCorrection(artistName);
   if (lfCorrected) {
     console.log(`  [artist-tracks] Last.fm correction: "${artistName}" → "${lfCorrected}"`);
@@ -2969,7 +2949,7 @@ async function _fetchArtistTracksImpl(artistName, userToken = null) {
 
   const cacheKey = makeCacheKey(["artist-tracks", artistName]);
 
-  // 1. In-memory cache (skip if user token present and cache was flagged — try fresh)
+  // 1. In-memory cache
   const mem = artistTracksMemCache.get(cacheKey);
   if (mem && Date.now() - mem.cachedAt < ARTIST_TRACKS_TTL_MS && mem.tracks.length > 0) {
     console.log(`  [artist-tracks] mem cache hit → ${artistName}`);
@@ -2980,14 +2960,9 @@ async function _fetchArtistTracksImpl(artistName, userToken = null) {
   const cached = await getCached(cacheKey);
   if (cached?.result?.tracks) {
     if (cached.result.tracks.length === 0 && cached.result.flagged) {
-      if (userToken) {
-        // User is logged in — bypass stale flag and try fresh with their token
-        console.log(`  [artist-tracks] flagged but user token present — retrying live for "${artistName}"`);
-      } else {
-        console.log(`  [artist-tracks] cached empty (flagged) → re-queuing deep enrich for "${artistName}"`);
-        reQueueForDeepEnrich(artistName).catch(() => {});
-        return cached.result.tracks;
-      }
+      console.log(`  [artist-tracks] cached empty (flagged) → re-queuing deep enrich for "${artistName}"`);
+      reQueueForDeepEnrich(artistName).catch(() => {});
+      return cached.result.tracks;
     } else {
       console.log(`  [artist-tracks] db cache hit → ${artistName}`);
       artistTracksMemCache.set(cacheKey, { tracks: cached.result.tracks, cachedAt: Date.now() });
@@ -2995,224 +2970,31 @@ async function _fetchArtistTracksImpl(artistName, userToken = null) {
     }
   }
 
-  // No user token = not an allowlisted Spotify user (dev-mode quota capped at ~25 users).
-  // Use Apple Music instead — no quota restrictions, better non-Western coverage.
-  if (!userToken) {
-    console.log(`  [artist-tracks] no user token → Apple Music path for "${artistName}"`);
-    const appleToken = generateAppleMusicToken();
-    const lfTitles = await lastfmArtistTopTracks(artistName, 5);
-    const tracks = await proactiveArtistTracks(artistName, lfTitles, appleToken);
-    if (tracks.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
-      console.log(`  [artist-tracks] Apple Music → ${tracks.length} tracks for "${artistName}"`);
-      return tracks;
-    }
-    // Apple Music also found nothing — YouTube-enriched LB as final fallback
-    const lbTracks = await fetchArtistTracksFromLB(artistName);
-    const enriched = await enrichTracksWithYouTube(lbTracks, artistName);
-    if (enriched.length > 0) {
-      artistTracksMemCache.set(cacheKey, { tracks: enriched, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks", { tracks: enriched }).catch(() => {});
-    } else {
-      storeCache(cacheKey, "artist-tracks", { tracks: [], flagged: true }).catch(() => {});
-      console.log(`  [artist-tracks] no tracks found — flagged for deep enrich: "${artistName}"`);
-    }
-    return enriched;
-  }
+  // 3. Apple Music → Deezer enrich
+  console.log(`  [artist-tracks] fetching via Apple Music for "${artistName}"`);
+  const appleToken = generateAppleMusicToken();
+  const lfTitles = await lastfmArtistTopTracks(artistName, 5);
+  let tracks = await proactiveArtistTracks(artistName, lfTitles, appleToken);
 
-  try {
-    console.log(`  Searching Spotify for: "${artistName}" (user token)`);
-
-    // User token — gives user-market top-tracks without needing market=US
-    const accessToken = userToken || await getClientAccessToken();
-    if (!accessToken) {
-      console.error(`  Failed to get access token`);
-      return [];
-    }
-
-    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const target = normalize(artistName);
-
-    // Step 1: search for the artist by name — no market restriction for non-Western artists
-    const artistSearch = await spotifyFetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
-      { headers: { Authorization: "Bearer " + accessToken } }
-    );
-
-    if (!artistSearch.ok) {
-      console.error(`  Spotify artist search failed: ${artistSearch.status}`);
-      return fetchArtistTracksFromLB(artistName);
-    }
-
-    const artistData = await artistSearch.json();
-    const artists = artistData.artists?.items || [];
-
-    // Require the artist name to actually match — prevents "Oraz Tagan" matching Polish children's music
-    const matchedArtist = artists.find(a => normalize(a.name) === target)
-      ?? artists.find(a => {
-        const n = normalize(a.name);
-        return n.includes(target) || target.includes(n);
-      });
-
-    // Helper: search Spotify for specific track+artist, return a track object or null
-    const spotifyTrackSearch = async (title, artistHint) => {
-      const r = await spotifyFetch(
-        `https://api.spotify.com/v1/search?q=${encodeURIComponent(`track:"${title}" artist:"${artistHint}"`)}&type=track&limit=3`,
-        { headers: { Authorization: "Bearer " + accessToken } }
-      );
-      if (!r.ok) return null;
-      const d = await r.json();
-      return (d.tracks?.items || []).find(t =>
-        t.artists?.some(a => normalize(a.name) === target || normalize(a.name).includes(target) || target.includes(normalize(a.name)))
-      ) ?? null;
-    };
-
-    if (!matchedArtist) {
-      // If Last.fm gave us a corrected name that Spotify doesn't recognise, retry with the
-      // original name — corrections are often just different romanizations (Jehanzeb vs Jahanzeb).
-      if (lfCorrected && originalName !== artistName) {
-        console.log(`  [artist-tracks] corrected name failed — retrying Spotify with original "${originalName}"`);
-        const retrySearch = await spotifyFetch(
-          `https://api.spotify.com/v1/search?q=${encodeURIComponent(originalName)}&type=artist&limit=5`,
-          { headers: { Authorization: "Bearer " + accessToken } }
-        );
-        if (retrySearch.ok) {
-          const retryData = await retrySearch.json();
-          const retryArtists = retryData.artists?.items || [];
-          const origTarget = normalize(originalName);
-          const retryMatched = retryArtists.find(a => normalize(a.name) === origTarget)
-            ?? retryArtists.find(a => {
-              const n = normalize(a.name);
-              return n.includes(origTarget) || origTarget.includes(n);
-            });
-          if (retryMatched) {
-            console.log(`  [artist-tracks] original name matched: "${retryMatched.name}" — using it`);
-            artistName = originalName; // switch back to the name Spotify knows
-            // fall through to top-tracks fetch below using retryMatched
-            const retryTopUrl = userToken
-              ? `https://api.spotify.com/v1/artists/${retryMatched.id}/top-tracks`
-              : `https://api.spotify.com/v1/artists/${retryMatched.id}/top-tracks?market=US`;
-            const retryTopRes = await spotifyFetch(retryTopUrl, { headers: { Authorization: "Bearer " + accessToken } });
-            if (retryTopRes.ok) {
-              const retryTopData = await retryTopRes.json();
-              const retryTracks = (retryTopData.tracks || []).slice(0, 3).map(t => ({
-                title: t.name, artist: t.artists?.[0]?.name, spotifyId: t.id,
-                previewUrl: t.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${t.id}`,
-              }));
-              if (retryTracks.length > 0) {
-                artistTracksMemCache.set(cacheKey, { tracks: retryTracks, cachedAt: Date.now() });
-                storeCache(cacheKey, "artist-tracks", { tracks: retryTracks }).catch(() => {});
-                console.log(`  [artist-tracks] original-name retry found ${retryTracks.length} tracks for "${originalName}"`);
-                return retryTracks;
-              }
-            }
-          }
-        }
-      }
-
-      // Artist not on Spotify by name — try Last.fm seed titles as targeted searches
-      console.log(`  No artist match for "${artistName}" on Spotify → trying Last.fm seeded search`);
-      const lfTitles = await lastfmArtistTopTracks(artistName, 5);
-      const lfResults = [];
-      for (const title of lfTitles) {
-        const match = await spotifyTrackSearch(title, artistName);
-        if (match) lfResults.push({ title: match.name, artist: match.artists?.[0]?.name, spotifyId: match.id, previewUrl: match.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${match.id}` });
-        if (lfResults.length >= 3) break;
-      }
-      if (lfResults.length > 0) {
-        console.log(`  [artist-tracks] LF-seeded search found ${lfResults.length} tracks for "${artistName}"`);
-        artistTracksMemCache.set(cacheKey, { tracks: lfResults, cachedAt: Date.now() });
-        storeCache(cacheKey, "artist-tracks", { tracks: lfResults }).catch(() => {});
-        return lfResults;
-      }
-      return fetchArtistTracksFromLB(artistName);
-    }
-
-    console.log(`  Found artist: "${matchedArtist.name}" (id: ${matchedArtist.id})`);
-
-    // Step 2: fetch top tracks
-    // User token → no market needed (Spotify uses user's own market, best for non-US artists)
-    // Client credentials → market=US required or Spotify returns empty
-    const topTracksUrl = userToken
-      ? `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks`
-      : `https://api.spotify.com/v1/artists/${matchedArtist.id}/top-tracks?market=US`;
-    const topTracksRes = await spotifyFetch(topTracksUrl, { headers: { Authorization: "Bearer " + accessToken } });
-
-    let tracks = [];
-    if (topTracksRes.ok) {
-      const topData = await topTracksRes.json();
-      tracks = (topData.tracks || []).slice(0, 3).map(track => ({
-        title: track.name,
-        artist: track.artists?.[0]?.name,
-        spotifyId: track.id,
-        previewUrl: track.preview_url || null,
-        spotifyUrl: `https://open.spotify.com/track/${track.id}`,
-      }));
-    }
-
-    // top-tracks?market=US returns empty for artists not licensed in the US (e.g. German, Latin).
-    // Fall back to a broad artist track search — no market restriction.
-    if (tracks.length === 0) {
-      console.log(`  [artist-tracks] top-tracks empty for "${artistName}", trying search fallback`);
-      const searchRes = await spotifyFetch(
-        `https://api.spotify.com/v1/search?q=${encodeURIComponent(`artist:${artistName}`)}&type=track&limit=5`,
-        { headers: { Authorization: "Bearer " + accessToken } }
-      );
-      if (searchRes.ok) {
-        const sd = await searchRes.json();
-        const items = (sd.tracks?.items || []).filter(t =>
-          t.artists?.some(a => normalize(a.name) === target || normalize(a.name).includes(target) || target.includes(normalize(a.name)))
-        );
-        tracks = items.slice(0, 3).map(t => ({
-          title: t.name,
-          artist: t.artists?.[0]?.name,
-          spotifyId: t.id,
-          previewUrl: t.preview_url || null,
-          spotifyUrl: `https://open.spotify.com/track/${t.id}`,
-        }));
-        if (tracks.length > 0) console.log(`  [artist-tracks] search fallback found ${tracks.length} tracks for "${artistName}"`);
-      }
-    }
-
-    // Still empty — try Last.fm seeded targeted searches before giving up
-    if (tracks.length === 0) {
-      const lfTitles = await lastfmArtistTopTracks(artistName, 5);
-      if (lfTitles.length > 0) {
-        console.log(`  [artist-tracks] trying LF-seeded search for "${artistName}" (${lfTitles.length} seed titles)`);
-        for (const title of lfTitles) {
-          const match = await spotifyTrackSearch(title, artistName);
-          if (match) tracks.push({ title: match.name, artist: match.artists?.[0]?.name, spotifyId: match.id, previewUrl: match.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${match.id}` });
-          if (tracks.length >= 3) break;
-        }
-        if (tracks.length > 0) console.log(`  [artist-tracks] LF-seeded search found ${tracks.length} tracks for "${artistName}"`);
-      }
-    }
-
-    // Last resort: ListenBrainz → enrich with YouTube before caching so the URL is stored
-    if (tracks.length === 0) {
-      console.log(`  [artist-tracks] Spotify empty → trying ListenBrainz for "${artistName}"`);
-      const lbTracks = await fetchArtistTracksFromLB(artistName);
-      tracks = await enrichTracksWithYouTube(lbTracks, artistName);
-    }
-
+  if (tracks.length > 0) {
+    tracks = await enrichWithDeezer(tracks, artistName);
     artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-    if (tracks.length > 0) {
-      storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
-      console.log(`  [artist-tracks] cached ${tracks.length} tracks → ${artistName}`);
-    } else {
-      // Store flagged empty result — cron will deep-enrich this artist
-      storeCache(cacheKey, "artist-tracks", { tracks: [], flagged: true }).catch(() => {});
-      console.log(`  [artist-tracks] no tracks found — flagged for deep enrich: "${artistName}"`);
-    }
-
+    storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
+    console.log(`  [artist-tracks] Apple Music → ${tracks.length} tracks for "${artistName}"`);
     return tracks;
-  } catch (err) {
-    console.error(`  Error fetching tracks for ${artistName}:`, err);
-    console.log(`  [artist-tracks] Spotify error → trying ListenBrainz for "${artistName}"`);
-    const lbTracks = await fetchArtistTracksFromLB(artistName);
-    return enrichTracksWithYouTube(lbTracks, artistName);
   }
+
+  // 4. ListenBrainz → Deezer/YouTube enrichment as final fallback
+  const lbTracks = await fetchArtistTracksFromLB(artistName);
+  const enriched = await enrichTracksWithYouTube(lbTracks, artistName);
+  if (enriched.length > 0) {
+    artistTracksMemCache.set(cacheKey, { tracks: enriched, cachedAt: Date.now() });
+    storeCache(cacheKey, "artist-tracks", { tracks: enriched }).catch(() => {});
+  } else {
+    storeCache(cacheKey, "artist-tracks", { tracks: [], flagged: true }).catch(() => {});
+    console.log(`  [artist-tracks] no tracks found — flagged for deep enrich: "${artistName}"`);
+  }
+  return enriched;
 }
 
 // ── Spotify OAuth endpoints ──────────────────────────────
@@ -3476,12 +3258,8 @@ app.get("/api/artist-tracks/:artistName", async (req, res) => {
   const { artistName } = req.params;
   if (!artistName) return res.status(400).json({ error: "Missing artist name" });
 
-  // Pass the user's Spotify token when available — gives better market coverage
-  const authHeader = req.headers.authorization;
-  const userToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-
   try {
-    const tracks = await fetchArtistTracks(decodeURIComponent(artistName), userToken);
+    const tracks = await fetchArtistTracks(decodeURIComponent(artistName));
     res.json({ artist: artistName, tracks });
   } catch (err) {
     console.error("Error fetching artist tracks:", err);
@@ -4559,6 +4337,15 @@ async function deezerArtistTopTracks(artistName, limit = 5) {
     console.error(`  [Deezer] error for "${artistName}":`, err.message);
     return [];
   }
+}
+
+// Enriches any tracks missing a deezerId by calling deezerTrackSearch per track.
+async function enrichWithDeezer(tracks, artistName) {
+  return Promise.all(tracks.map(async (t) => {
+    if (t.deezerId || t.deezerUrl) return t;
+    const found = await deezerTrackSearch(t.title, artistName);
+    return found ? { ...t, ...found } : t;
+  }));
 }
 
 // Search Deezer for a specific track by title + artist. Returns a track object with previewUrl or null.
