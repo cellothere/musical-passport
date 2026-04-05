@@ -4224,12 +4224,17 @@ async function appleSongSearch(query, artistTarget, appleToken) {
       if (!r.ok) continue;
       const d = await r.json();
       const songs = d.results?.songs?.data || [];
-      const match = songs.find(s => {
+      // Prefer songs where the target is the PRIMARY artist (name starts with or equals theirs),
+      // only fall back to featured appearances if nothing else matches.
+      const primaryMatch = songs.find(s => {
         const n = normalise(s.attributes.artistName);
-        // Only allow reverse inclusion if the found name is long enough to avoid
-        // short substrings (e.g. "strings") falsely matching within the target ("vanuastrings")
-        return n.includes(target) || (n.length >= 6 && target.includes(n)) || fuzzyArtistMatch(n, target);
+        return n === target || n.startsWith(target) || fuzzyArtistMatch(n, target);
       });
+      const featuredMatch = primaryMatch ? null : songs.find(s => {
+        const n = normalise(s.attributes.artistName);
+        return n.includes(target) || (n.length >= 6 && target.includes(n));
+      });
+      const match = primaryMatch || featuredMatch;
       if (match) return match;
     } catch { /* try next storefront */ }
   }
@@ -4268,7 +4273,14 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
             const sd = await songsRes.json();
             const songs = sd.data || [];
             if (songs.length > 0) {
-              return songs.slice(0, 3).map(s => ({
+              // Prefer songs where this artist is the PRIMARY artist (artistName starts with
+              // or equals their name), not tracks they merely appear on as a featured guest.
+              const ownSongs = songs.filter(s => {
+                const an = normalise(s.attributes?.artistName || "");
+                return an === target || an.startsWith(target);
+              });
+              const toReturn = ownSongs.length >= 2 ? ownSongs : songs;
+              return toReturn.slice(0, 3).map(s => ({
                 title: s.attributes.name,
                 artist: s.attributes.artistName,
                 appleId: s.id,
@@ -4528,8 +4540,10 @@ async function deezerArtistTopTracks(artistName, limit = 5) {
     const topData = await topRes.json();
     if (topData.error?.code === 4) return [];
 
-    const tracks = (topData.data || [])
-      .filter(t => t.preview)
+    const allWithPreview = (topData.data || []).filter(t => t.preview);
+    // Prefer tracks where this artist is the main artist, not just a featured guest
+    const ownTracks = allWithPreview.filter(t => t.artist?.id === matched.id);
+    const tracks = (ownTracks.length >= 2 ? ownTracks : allWithPreview)
       .slice(0, 3)
       .map(t => ({
         title: t.title_short || t.title,
