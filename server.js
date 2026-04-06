@@ -3337,39 +3337,31 @@ app.get("/api/find-artist", async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: "Missing query." });
 
-  try {
-    const token = await getClientAccessToken();
-    if (!token) return res.status(503).json({ error: "Spotify unavailable." });
+  const lastfmKey = process.env.LASTFM_API_KEY;
+  if (!lastfmKey) return res.status(503).json({ error: "Last.fm unavailable." });
 
-    // Plain query with type=artist — the artist: field filter is designed for track searches
-    // and silently returns 0 results for short/all-caps names (e.g. DMX, ABBA, MF DOOM).
+  try {
     const r = await fetch(
-      `https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=artist&limit=5`,
-      { headers: { Authorization: "Bearer " + token } }
+      `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(q)}&autocorrect=1&api_key=${lastfmKey}&format=json`
     );
     const data = await r.json();
-    const candidates = data.artists?.items || [];
-    if (candidates.length === 0) return res.status(404).json({ error: "Artist not found." });
 
-    // Pick the candidate whose name most closely matches the query
-    const normalize = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const qNorm = normalize(q);
-    const artist = candidates.find(a => normalize(a.name) === qNorm)
-      || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
-      || candidates[0];
-
-    // Reject if name shares no overlap with query (e.g. "toulouse" → "Nicky Romero")
-    const aName = normalize(artist.name);
-    if (!aName.includes(qNorm) && !qNorm.includes(aName)) {
+    if (data.error || !data.artist?.name) {
       return res.status(404).json({ error: "Artist not found." });
     }
 
+    const artist = data.artist;
+    const name = artist.name;
+    const genres = (artist.tags?.tag || []).map(t => t.name).filter(t => t.length < 40).slice(0, 3);
+    const listeners = parseInt(artist.stats?.listeners || "0", 10);
+    const imageUrl = await fetchArtistImageUrl(name, { genre: genres[0] || null, skipSpotify: true }).catch(() => null);
+
     res.json({
-      id: artist.id,
-      name: artist.name,
-      genres: artist.genres?.slice(0, 3) || [],
-      imageUrl: artist.images?.[0]?.url || null,
-      followers: artist.followers?.total || 0,
+      id: name, // id unused by client — name is sufficient
+      name,
+      genres,
+      imageUrl,
+      followers: listeners,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
