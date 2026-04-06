@@ -2737,7 +2737,7 @@ app.post("/api/genre-deeper", async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 400,
+        max_tokens: 200,
         system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks.",
         messages: [{
           role: "user",
@@ -2755,13 +2755,11 @@ Rules:
 - Prefer genres that have actual tracks available on Spotify, Apple Music, or YouTube
 - If "${genre}" is already extremely niche with no meaningful subgenres, suggest a related sibling or parent genre instead — do NOT suggest a synonym or rename
 - Be specific enough to find real tracks (e.g. "Desert Blues" not "African Blues", "Lovers Rock" not "Reggae Pop")
-- The reason must be a single factual sentence — clinical and concise, stating the musical or historical link between "${genre}" and the suggestion. No hype, no adjectives like "exciting" or "fascinating". State a concrete fact about instrumentation, rhythm, shared roots, migration, or influence. Example: "Honky-tonk incorporated Hawaiian steel guitar techniques into country instrumentation, establishing the steel guitar as a defining element of the style."
 
 Return exactly:
 {
   "genre": "specific genre name",
-  "country": "best country for this genre",
-  "reason": "one factual sentence stating the musical link"
+  "country": "best country for this genre"
 }`,
         }],
       }),
