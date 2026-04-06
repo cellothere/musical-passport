@@ -418,6 +418,100 @@ function makeCacheKey(parts) {
   return normalized;
 }
 
+// ─── Genre canonicalization ───────────────────────────────────────────────────
+// Resolves user-facing genre strings to a consistent canonical form so that
+// "polo disco" and "disco polo", "drum 'n' bass" and "drum & bass", "kawwali"
+// and "qawwali" all resolve to the same cache key and the same Last.fm tag.
+
+// Known aliases: covers phonetic variants and common abbreviations that
+// word-sort or punctuation normalisation alone can't catch.
+const GENRE_ALIASES = new Map([
+  // Qawwali spelling variants
+  ["kawwali",          "qawwali"],
+  ["kwaali",           "qawwali"],
+  ["kawali",           "qawwali"],
+  ["qawali",           "qawwali"],
+  // Hip-hop
+  ["hip hop",          "hip-hop"],
+  ["hiphop",           "hip-hop"],
+  // R&B
+  ["r and b",          "r&b"],
+  ["rhythm and blues", "r&b"],
+  ["rnb",              "r&b"],
+  // Drum and bass
+  ["dnb",              "drum and bass"],
+  // Reggaetón
+  ["reggaeton",        "reggaetón"],
+  // Séga (Mauritius/Réunion)
+  ["sega",             "séga"],
+  // Zydeco
+  ["zeideco",          "zydeco"],
+  ["zaideco",          "zydeco"],
+  // Cumbia
+  ["cumbia",           "cumbia"],    // keep to normalise accented variants
+]);
+
+/** Strip punctuation/formatting noise so "drum 'n' bass" → "drum and bass" */
+function preNormalizeGenre(genre) {
+  return genre
+    .toLowerCase()
+    .trim()
+    .replace(/[''ʼ]/g, "")               // remove apostrophes: drum 'n' bass → drum n bass
+    .replace(/\bn\b/g, "and")            // isolated "n" → "and": drum n bass → drum and bass
+    .replace(/\s*&\s*/g, " and ")        // & → and: drum & bass → drum and bass
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// In-memory cache: pre-normalised string → canonical display name
+const genreNormCache = new Map();
+
+/**
+ * Returns the canonical display name for a genre string.
+ * Falls back to the original if Last.fm doesn't recognise any candidate.
+ */
+async function resolveGenreCanonical(genre) {
+  if (!genre) return genre;
+
+  const norm = preNormalizeGenre(genre);
+
+  if (genreNormCache.has(norm)) return genreNormCache.get(norm);
+
+  // 1. Known aliases table (phonetic / abbreviation variants)
+  if (GENRE_ALIASES.has(norm)) {
+    const canonical = GENRE_ALIASES.get(norm);
+    genreNormCache.set(norm, canonical);
+    return canonical;
+  }
+
+  // 2. Build candidate list to try against Last.fm
+  //    Word-sort catches ordering variants: "polo disco" → ["disco","polo"] → "disco polo"
+  const wordSorted = norm.split(" ").sort().join(" ");
+  const candidates = [...new Set([norm, wordSorted])]; // deduplicate
+
+  const lfKey = process.env.LASTFM_API_KEY;
+  if (lfKey) {
+    for (const candidate of candidates) {
+      try {
+        const url = `https://ws.audioscrobbler.com/2.0/?method=tag.getInfo&tag=${encodeURIComponent(candidate)}&api_key=${lfKey}&format=json`;
+        const r = await fetch(url);
+        const data = await r.json();
+        if (!data.error && data.tag?.name) {
+          // Last.fm returns its own canonical casing (e.g. "Disco Polo", "drum and bass")
+          const canonical = data.tag.name;
+          genreNormCache.set(norm, canonical);
+          if (norm !== preNormalizeGenre(genre)) genreNormCache.set(preNormalizeGenre(genre), canonical);
+          return canonical;
+        }
+      } catch { /* network glitch — fall through */ }
+    }
+  }
+
+  // 3. Fall back to the original string (preserves user-visible casing)
+  genreNormCache.set(norm, genre);
+  return genre;
+}
+
 async function getCached(cacheKey) {
   if (!supabase) return null;
   const { data, error } = await supabase
@@ -1939,6 +2033,7 @@ IMPORTANT: Use each artist's exact real name as it appears on streaming platform
       .trim();
     const rec = JSON.parse(raw);
     rec.artists = normalizeArtistNames(rec.artists);
+    rec.genres = await Promise.all((rec.genres || []).map(g => resolveGenreCanonical(g)));
 
     console.log(`[recommend] Claude → ${country} (${rec.artists.length} artists, ${rec.genres.length} genres)`);
 
@@ -2374,8 +2469,11 @@ app.post("/api/genre-spotlight", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
 
-  const { genre, country, service = "spotify", relatedArtistNames = [] } = req.body;
-  if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
+  const { genre: rawGenre, country, service = "spotify", relatedArtistNames = [] } = req.body;
+  if (!rawGenre || !country) return res.status(400).json({ error: "Missing genre or country." });
+
+  const genre = await resolveGenreCanonical(rawGenre);
+  if (genre !== rawGenre) console.log(`[genre-spotlight] genre normalised: "${rawGenre}" → "${genre}"`);
 
   const gsCacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
   const gsCached = await getCached(gsCacheKey);
@@ -2775,6 +2873,7 @@ Return exactly:
       return res.status(500).json({ error: "Failed to parse Claude response" });
     }
 
+    result.genre = await resolveGenreCanonical(result.genre);
     await storeCache(cacheKey, "genre-deeper", result);
     console.log(`[genre-deeper] Claude → "${result.genre}" / ${result.country} (from ${genre} / ${country})`);
     res.json(result);
