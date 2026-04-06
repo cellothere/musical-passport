@@ -70,29 +70,39 @@ async function getClientAccessToken() {
 // Priority: Apple Music → Last.fm → Spotify (last resort, dev-mode quota is precious).
 // Spotify is only tried if not currently rate-limited and skipSpotify is false.
 async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = null } = {}) {
+  const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const target = normalise(artistName);
+
+  // When the artist name is short or common, ambiguous matches (e.g. "Lego" → toy brand) are likely.
+  // Appending the genre to the search term helps disambiguate. We try genre-qualified first, then fall back.
+  const isAmbiguous = artistName.trim().split(/\s+/).length <= 2;
+  const terms = (genre && isAmbiguous)
+    ? [`${artistName} ${genre}`, artistName]
+    : [artistName];
+
   // 1. Apple Music — no quota concerns, high-quality artwork
-  try {
-    const appleToken = generateAppleMusicToken();
-    if (appleToken) {
-      const r = await fetch(
-        `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=5`,
-        { headers: { Authorization: `Bearer ${appleToken}` } }
-      );
-      if (r.ok) {
-        const data = await r.json();
-        const candidates = data.results?.artists?.data || [];
-        const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const target = normalise(artistName);
-        const match = candidates.find(a => normalise(a.attributes?.name || '') === target)
-          ?? candidates.find(a => {
-            const n = normalise(a.attributes?.name || '');
-            return n.includes(target) || target.includes(n);
-          });
-        const artworkUrl = match?.attributes?.artwork?.url;
-        if (artworkUrl) return artworkUrl.replace('{w}', '600').replace('{h}', '600');
+  for (const term of terms) {
+    try {
+      const appleToken = generateAppleMusicToken();
+      if (appleToken) {
+        const r = await fetch(
+          `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(term)}&types=artists&limit=5`,
+          { headers: { Authorization: `Bearer ${appleToken}` } }
+        );
+        if (r.ok) {
+          const data = await r.json();
+          const candidates = data.results?.artists?.data || [];
+          const match = candidates.find(a => normalise(a.attributes?.name || '') === target)
+            ?? candidates.find(a => {
+              const n = normalise(a.attributes?.name || '');
+              return n.includes(target) || target.includes(n);
+            });
+          const artworkUrl = match?.attributes?.artwork?.url;
+          if (artworkUrl) return artworkUrl.replace('{w}', '600').replace('{h}', '600');
+        }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   // 2. Last.fm — global coverage, good for non-Western artists
   try {
@@ -111,21 +121,21 @@ async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = nu
   } catch {}
 
   // 3. Deezer — high-quality artist images, no auth, no quota cost vs Spotify
-  try {
-    const deezerImageUrl = await deezerEnqueue(async () => {
-      const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const target = normalise(artistName);
-      const r = await fetch(`${DEEZER_BASE}/search/artist?q=${encodeURIComponent(artistName)}&limit=5`);
-      if (!r.ok) return null;
-      const d = await r.json();
-      if (d.error?.code === 4) return null;
-      const artists = d.data || [];
-      const match = artists.find(a => normalise(a.name) === target)
-        ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || target.includes(n); });
-      return match?.picture_xl || match?.picture_big || null;
-    });
-    if (deezerImageUrl) return deezerImageUrl;
-  } catch {}
+  for (const term of terms) {
+    try {
+      const deezerImageUrl = await deezerEnqueue(async () => {
+        const r = await fetch(`${DEEZER_BASE}/search/artist?q=${encodeURIComponent(term)}&limit=5`);
+        if (!r.ok) return null;
+        const d = await r.json();
+        if (d.error?.code === 4) return null;
+        const artists = d.data || [];
+        const match = artists.find(a => normalise(a.name) === target)
+          ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || target.includes(n); });
+        return match?.picture_xl || match?.picture_big || null;
+      });
+      if (deezerImageUrl) return deezerImageUrl;
+    } catch {}
+  }
 
   // 4. Spotify — last resort only; dev-mode quota is very limited (30 req/30s window)
   if (!skipSpotify && Date.now() >= spotifyRateLimitedUntil) try {
@@ -4547,6 +4557,7 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
           .eq("artist", artistName);
       }
       console.log(`[deep-enrich] ✓ "${artistName}" → ${tracks.length} tracks`);
+      backfillDeezerForArtists([artistName]).catch(() => {});
       processed++;
     } else {
       console.log(`[deep-enrich] – "${artistName}" still no tracks — keeping flagged`);
