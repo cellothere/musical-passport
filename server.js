@@ -2469,14 +2469,26 @@ app.post("/api/genre-spotlight", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
 
-  const { genre: rawGenre, country, service = "spotify", relatedArtistNames = [] } = req.body;
+  const { genre: rawGenre, country, service = "spotify", relatedArtistNames = [], seedArtist } = req.body;
   if (!rawGenre || !country) return res.status(400).json({ error: "Missing genre or country." });
 
   const genre = await resolveGenreCanonical(rawGenre);
   if (genre !== rawGenre) console.log(`[genre-spotlight] genre normalised: "${rawGenre}" → "${genre}"`);
 
   const gsCacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
-  const gsCached = await getCached(gsCacheKey);
+  let gsCached = await getCached(gsCacheKey);
+
+  // If a seed artist is provided but absent from a sparse cached result, bust the cache so the
+  // next request generates a fresh result that explicitly includes them.
+  if (gsCached && seedArtist) {
+    const cachedTracks = gsCached.result?.tracks || [];
+    const normSeed = seedArtist.toLowerCase();
+    const hasSeed = cachedTracks.some(t => (t.artist || "").toLowerCase() === normSeed);
+    if (!hasSeed && cachedTracks.length < 4) {
+      console.log(`[genre-spotlight] cache bypassed — seedArtist "${seedArtist}" absent from sparse result (${cachedTracks.length} tracks)`);
+      gsCached = null;
+    }
+  }
 
   // Supplement sparse/empty track lists with 1-2 tracks per related artist (runs on cache hits too)
   const supplementFromRelatedArtists = async (result) => {
@@ -2525,7 +2537,7 @@ app.post("/api/genre-spotlight", async (req, res) => {
         messages: [{
           role: "user",
           content: `First assess whether "${genre}" is a NICHE genre (practiced in 1–4 countries with a strong cultural identity, e.g. Malouf, Ma'luf, Gnawa, Byzantine Chant, Gamelan, Morna, Mbube, Jùjú, Tuvan throat singing, Sega, Taarab, Chaabi) or a BROAD genre (practiced worldwide or easily found in many countries as local variants, e.g. Jazz, Rock, Hip-hop, Folk, Classical, Pop, R&B, Electronic, Reggae, Metal).
-
+${seedArtist ? `\nCRITICAL: "${seedArtist}" is a confirmed real artist in this genre. You MUST include them in the artists array and include at least one of their actual, real tracks in the tracks array. Do not invent track titles — only use tracks you are certain exist.\n` : ""}
 IF NICHE: the user tapped this genre from a ${country} artist card. Provide globally representative artists and tracks for "${genre}" from any of its home countries worldwide. Set isNicheWorldGenre: true, hasLocalScene: true.
 
 IF BROAD: provide a spotlight on "${genre}" as it exists specifically in "${country}". Every artist and track must genuinely be from ${country}.
