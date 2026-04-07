@@ -1337,7 +1337,7 @@ async function discogsTracksForCountryDecade(country, decade) {
 
 // ── MusicBrainz helpers ──────────────────────────────────
 const MB_BASE = "https://musicbrainz.org/ws/2";
-const MB_UA   = "MusicalPassport/1.0 (contact@musicalpassport.app)";
+const MB_UA   = "MusicalPassport/1.0 (cellorepertoireinitiative@gmail.com)";
 
 // Rate-limit queue: MusicBrainz allows 1 req/sec. 4s timeout per request.
 const MB_TIMEOUT_MS = 4000;
@@ -2570,7 +2570,11 @@ Return exactly this JSON:
     if (data.error) return res.status(500).json({ error: data.error.message });
 
     const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
-    const spotlight = JSON.parse(raw);
+    let spotlight;
+    try { spotlight = JSON.parse(raw); } catch (parseErr) {
+      console.error(`[genre-spotlight] JSON.parse failed (${genre}/${country}):`, parseErr.message, "\nRaw:", raw.slice(0, 200));
+      return res.status(500).json({ error: "Failed to parse Claude response" });
+    }
     const suggestedArtists = spotlight.artists || [];
 
     // Search streaming catalog for each track
@@ -2998,6 +3002,107 @@ Rules:
     return res.json({ genre, artists: pickDiverseByEra(annotated, 8) });
   } catch (err) {
     console.error("[genre-artists] error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Decade Spotlight: diverse global artists for a given decade ──────────────
+app.post("/api/decade-spotlight", async (req, res) => {
+  const { decade, service = "spotify" } = req.body;
+  if (!decade) return res.status(400).json({ error: "decade is required" });
+
+  const cacheKey = makeCacheKey(["decade-spotlight", decade]);
+
+  if (supabase) {
+    const { data } = await supabase
+      .from("recommendation_cache")
+      .select("result, expires_at")
+      .eq("cache_key", cacheKey)
+      .maybeSingle();
+    if (data?.result) {
+      const expired = data.expires_at && new Date(data.expires_at) < new Date();
+      if (!expired) {
+        console.log(`[decade-spotlight] cache hit → ${decade}`);
+        return res.json({ decade, artists: annotateTrackStatus(data.result.artists || []) });
+      }
+    }
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "API key not configured" });
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 2500,
+        system: "You are a world music curator with encyclopedic knowledge of global music history. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [{
+          role: "user",
+          content: `List 16 iconic artists who were at their peak during the ${decade}, drawn from every corner of the world.
+
+Return exactly this JSON:
+{
+  "artists": [
+    {
+      "name": "Artist Name",
+      "genre": "their primary genre",
+      "era": "${decade}",
+      "country": "Country name",
+      "countryCode": "XX",
+      "similarTo": "A well-known Western artist the listener might know"
+    }
+  ]
+}
+
+Rules:
+- Exactly 16 artists. Cover ALL of these regions with at least 1–2 artists each: Sub-Saharan Africa, North Africa / Middle East, Latin America, Europe, South/Southeast Asia, East Asia, North America. Oceania is a bonus.
+- Every artist must have been genuinely active and prominent in the ${decade} — not just born then or discovered later.
+- Prioritise artists whose music is realistically available on streaming today (major or significant regional artists).
+- Include a wide variety of genres: pop, rock, folk, traditional, electronic, hip-hop, afrobeat, cumbia, etc. — not just Western genres.
+- countryCode must be a valid ISO 3166-1 alpha-2 code.
+- similarTo should help a Western listener understand the vibe — keep it brief (one artist name).
+- No duplicate countries unless the country is very large (e.g. USA, Brazil, India can appear twice).`,
+        }],
+      }),
+    });
+
+    if (response.status === 529) {
+      return res.status(503).json({ error: "Our servers are busy right now. Try again in a moment." });
+    }
+
+    const claudeData = await response.json();
+    if (claudeData.error) return res.status(500).json({ error: claudeData.error.message });
+
+    const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(raw);
+    const artistsBase = parsed.artists || [];
+
+    console.log(`[decade-spotlight] Claude → ${decade} (${artistsBase.length} artists)`);
+
+    // Fetch artist images in parallel
+    const imageUrls = await Promise.all(
+      artistsBase.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null))
+    );
+    const artists = artistsBase.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || undefined }));
+
+    if (supabase) {
+      const expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+      await supabase.from("recommendation_cache").upsert(
+        { cache_key: cacheKey, endpoint: "decade-spotlight", result: { artists }, expires_at },
+        { onConflict: "cache_key" }
+      );
+    }
+
+    return res.json({ decade, artists: annotateTrackStatus(artists) });
+  } catch (err) {
+    console.error("[decade-spotlight] error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -5316,6 +5421,6 @@ async function backfillArtistImageUrls() {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎵 Musical Passport running at http://localhost:${PORT}\n`);
-  // Delay backfill so it doesn't compete with initial traffic on cold start
-  setTimeout(() => backfillArtistImageUrls().catch(err => console.error('[image-backfill] error:', err.message)), 15_000);
+  // Image backfill disabled — re-enable by uncommenting when needed
+  // setTimeout(() => backfillArtistImageUrls().catch(err => console.error('[image-backfill] error:', err.message)), 15_000);
 });
