@@ -1967,14 +1967,14 @@ app.post("/api/recommend", async (req, res) => {
   const isoCode = COUNTRY_ISO[country];
   const realPoolPromise = isoCode ? buildRealArtistPool(country, isoCode) : Promise.resolve([]);
 
-  const realPool = await realPoolPromise;
-  const realPoolNote = realPool.length > 0
-    ? `\n\nVERIFIED ARTISTS from MusicBrainz + ListenBrainz databases for ${country}:\n${
-        realPool.map(a => `- ${a.name}${a.confidence === "high" ? " [verified in both MB+LB]" : ""}${a.tags.length ? ` (${a.tags.slice(0, 3).join(", ")})` : ""}`).join("\n")
-      }\n\nThese artists are confirmed to be from ${country} by music databases. Your 12 artists MUST include as many of these as fit the era/genre mix. You may add artists NOT in this list only if you are certain they are from ${country} — and you must include their name exactly as known. Do NOT invent or misattribute artists.`
-    : "";
-
   try {
+    const realPool = await realPoolPromise;
+    const realPoolNote = realPool.length > 0
+      ? `\n\nVERIFIED ARTISTS from MusicBrainz + ListenBrainz databases for ${country}:\n${
+          realPool.map(a => `- ${a.name}${a.confidence === "high" ? " [verified in both MB+LB]" : ""}${a.tags.length ? ` (${a.tags.slice(0, 3).join(", ")})` : ""}`).join("\n")
+        }\n\nThese artists are confirmed to be from ${country} by music databases. Your 12 artists MUST include as many of these as fit the era/genre mix. You may add artists NOT in this list only if you are certain they are from ${country} — and you must include their name exactly as known. Do NOT invent or misattribute artists.`
+      : "";
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -2031,7 +2031,11 @@ IMPORTANT: Use each artist's exact real name as it appears on streaming platform
     const raw = (data.content[0].text || "")
       .replace(/```json|```/g, "")
       .trim();
-    const rec = JSON.parse(raw);
+    let rec;
+    try { rec = JSON.parse(raw); } catch (parseErr) {
+      console.error(`[recommend] JSON.parse failed for ${country}:`, parseErr.message, "\nRaw:", raw.slice(0, 200));
+      throw parseErr;
+    }
     rec.artists = normalizeArtistNames(rec.artists);
     rec.genres = await Promise.all((rec.genres || []).map(g => resolveGenreCanonical(g)));
 
@@ -3320,10 +3324,10 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
   try {
     // Step 1: search for the artist by name (strip ensemble suffixes for better search results)
     const searchName = primaryArtistName(artistName);
-    const artistSearch = await fetch(
+    const artistSearch = await appleEnqueue(() => fetch(
       `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(searchName)}&types=artists&limit=5`,
       { headers: { Authorization: `Bearer ${token}` } }
-    );
+    ));
     if (!artistSearch.ok) return res.json({ tracks: [] });
     const artistData = await artistSearch.json();
     const artists = artistData.results?.artists?.data || [];
@@ -3341,10 +3345,10 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
     if (matchedArtist) {
       // Step 2: fetch top songs for the matched artist
       const artistId = matchedArtist.id;
-      const songsRes = await fetch(
+      const songsRes = await appleEnqueue(() => fetch(
         `https://api.music.apple.com/v1/catalog/us/artists/${artistId}/view/top-songs?limit=5`,
         { headers: { Authorization: `Bearer ${token}` } }
-      );
+      ));
       if (songsRes.ok) {
         const songsData = await songsRes.json();
         const songs = (songsData.data || []).slice(0, 3);
@@ -4159,10 +4163,10 @@ async function appleSongSearch(query, artistTarget, appleToken) {
   const target = normalise(primaryArtistName(artistTarget));
   for (const sf of APPLE_STOREFRONTS) {
     try {
-      const r = await fetch(
+      const r = await appleEnqueue(() => fetch(
         `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(query)}&types=songs&limit=3`,
         { headers: { Authorization: `Bearer ${appleToken}` } }
-      );
+      ));
       if (!r.ok) continue;
       const d = await r.json();
       const songs = d.results?.songs?.data || [];
@@ -4193,10 +4197,10 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
   if (appleToken) {
     try {
       for (const sf of APPLE_STOREFRONTS) {
-        const r = await fetch(
+        const r = await appleEnqueue(() => fetch(
           `https://api.music.apple.com/v1/catalog/${sf}/search?term=${encodeURIComponent(searchName)}&types=artists&limit=5`,
           { headers: { Authorization: `Bearer ${appleToken}` } }
-        );
+        ));
         if (!r.ok) continue;
         const d = await r.json();
         const artists = d.results?.artists?.data || [];
@@ -4207,10 +4211,10 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
           });
 
         if (matched) {
-          const songsRes = await fetch(
+          const songsRes = await appleEnqueue(() => fetch(
             `https://api.music.apple.com/v1/catalog/${sf}/artists/${matched.id}/view/top-songs?limit=5`,
             { headers: { Authorization: `Bearer ${appleToken}` } }
-          );
+          ));
           if (songsRes.ok) {
             const sd = await songsRes.json();
             const songs = sd.data || [];
@@ -4454,6 +4458,27 @@ async function drainDeezerQueue() {
   const { fn, resolve, reject } = deezerQueue.shift();
   try { resolve(await fn()); } catch (e) { reject(e); }
   setTimeout(drainDeezerQueue, 150); // 6.7/s → well within 50/5s limit
+}
+
+// ── Apple Music API queue ─────────────────────────────────
+// No published hard rate limit, but concurrent calls cause 429s under load.
+// 100ms gap → 10 req/s; safe for background enrichment while serving live requests.
+const appleQueue = [];
+let appleBusy = false;
+
+function appleEnqueue(fn) {
+  return new Promise((resolve, reject) => {
+    appleQueue.push({ fn, resolve, reject });
+    if (!appleBusy) drainAppleQueue();
+  });
+}
+
+async function drainAppleQueue() {
+  if (appleQueue.length === 0) { appleBusy = false; return; }
+  appleBusy = true;
+  const { fn, resolve, reject } = appleQueue.shift();
+  try { resolve(await fn()); } catch (e) { reject(e); }
+  setTimeout(drainAppleQueue, 100);
 }
 
 // Returns top tracks for an artist from Deezer with 30s preview MP3 URLs.
@@ -4821,7 +4846,11 @@ Also include:
   const claudeData = await claudeRes.json();
   if (claudeData.error) throw new Error(`Claude error: ${claudeData.error.message}`);
   const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
-  const research = JSON.parse(raw);
+  let research;
+  try { research = JSON.parse(raw); } catch (parseErr) {
+    console.error(`[country-enrich] JSON.parse failed for ${country}:`, parseErr.message, "\nRaw:", raw.slice(0, 200));
+    throw parseErr;
+  }
   research.artists = normalizeArtistNames(research.artists);
 
   console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
@@ -5189,7 +5218,7 @@ app.get("/api/enrich", async (req, res) => {
 
   try {
     // Priority 1: deep-enrich artists that returned 0 tracks (flagged in cache)
-    const deepResult = await deepEnrichFlaggedArtists(apiKey, 5);
+    const deepResult = await deepEnrichFlaggedArtists(process.env.ANTHROPIC_API_KEY, 5);
     if (deepResult.total > 0) {
       console.log(`[enrich] deep-enrich: ${deepResult.processed}/${deepResult.total} flagged artists resolved`);
     }
