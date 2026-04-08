@@ -3045,7 +3045,7 @@ app.post("/api/decade-spotlight", async (req, res) => {
         system: "You are a world music curator with encyclopedic knowledge of global music history. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
         messages: [{
           role: "user",
-          content: `List 16 artists who were ACTIVELY RECORDING AND PERFORMING during the ${decade}, drawn from every corner of the world.
+          content: `You are curating a "Decade Spotlight" for the ${decade}. Select 16 artists who DEFINE THE SOUND of that decade — artists whose most iconic, career-defining recordings belong to the ${decade} and no other.
 
 Return exactly this JSON:
 {
@@ -3061,13 +3061,23 @@ Return exactly this JSON:
   ]
 }
 
-CRITICAL ERA ACCURACY RULES (violations will make the app wrong):
-- Every artist MUST have been alive AND releasing music during the ${decade}. The first year of the decade is ${decade.replace('s','')} and the last is ${parseInt(decade) + 9}.
-- Do NOT include anyone who died before ${decade.replace('s','')}. For example: Umm Kulthum died in 1975 — never include her for any decade after the 1960s.
-- Do NOT include artists whose primary fame was in a different decade. Each artist should be genuinely associated with THIS decade's sound, not just still alive.
-- Think carefully before each artist: "Were they actually making music people cared about in the ${decade}?" If unsure, pick someone else.
+THE CORE TEST — ask this for every artist before including them:
+"If someone asks what decade THIS artist is most identified with, is the answer unambiguously the ${decade}?"
+If the answer is any other decade, do NOT include them. Pick someone else.
 
-Other rules:
+EXAMPLES OF CORRECT THINKING:
+- Fela Kuti → 1970s (Afrobeat peak). Include him in the 1970s list, NOT the 1960s or 1980s.
+- Umm Kulthum → 1950s–1960s (died 1975). Include her in the 1960s list only, NOT the 1970s or 1980s.
+- Bob Marley → 1970s. Do not put him in the 1960s or 1980s.
+- Youssou N'Dour → 1980s–1990s. Include him in the 1980s or 1990s list, not earlier.
+
+ERA RULES:
+- The artist's most celebrated albums/recordings must have been released in ${decade.replace('s','')}–${parseInt(decade) + 9}.
+- Artists whose peak fame is in an adjacent decade should go in that other decade's list.
+- An artist who spans multiple decades should be assigned to the ONE decade they are most closely identified with.
+- Do NOT include anyone who died before ${decade.replace('s','')}.
+
+OTHER RULES:
 - Exactly 16 artists. Cover ALL of these regions with at least 1–2 artists each: Sub-Saharan Africa, North Africa / Middle East, Latin America, Europe, South/Southeast Asia, East Asia, North America. Oceania is a bonus.
 - Prioritise artists whose music is realistically available on streaming today.
 - Include a wide variety of genres: pop, rock, folk, traditional, electronic, hip-hop, afrobeat, cumbia, etc.
