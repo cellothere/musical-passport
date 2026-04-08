@@ -530,7 +530,7 @@ async function getCached(cacheKey) {
 }
 
 const CACHE_TTL = {
-  'recommend':          7   * 24 * 60 * 60 * 1000,
+  'recommend':          30  * 24 * 60 * 60 * 1000,
   'genre-spotlight':    180 * 24 * 60 * 60 * 1000,
   'genre-deeper':       180 * 24 * 60 * 60 * 1000,
   'time-machine':       14  * 24 * 60 * 60 * 1000,
@@ -1939,6 +1939,7 @@ app.post("/api/recommend", async (req, res) => {
         genres: cached.result.genres,
         artists: pickDiverseByEra(annotateTrackStatus(pool), 4),
         didYouKnow: cached.result.didYouKnow,
+        fromCache: true,
       });
     }
     console.log(`[recommend] pool shrank to ${pool.length} after filtering flagged — regenerating`);
