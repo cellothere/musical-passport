@@ -108,7 +108,7 @@ async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = nu
   try {
     const lfKey = process.env.LASTFM_API_KEY;
     if (lfKey) {
-      const r = await fetch(
+      const r = await lfFetch(
         `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artistName)}&autocorrect=1&api_key=${lfKey}&format=json`
       );
       const data = await r.json();
@@ -494,7 +494,7 @@ async function resolveGenreCanonical(genre) {
     for (const candidate of candidates) {
       try {
         const url = `https://ws.audioscrobbler.com/2.0/?method=tag.getInfo&tag=${encodeURIComponent(candidate)}&api_key=${lfKey}&format=json`;
-        const r = await fetch(url);
+        const r = await lfFetch(url);
         const data = await r.json();
         if (!data.error && data.tag?.name) {
           // Last.fm returns its own canonical casing (e.g. "Disco Polo", "drum and bass")
@@ -1415,40 +1415,81 @@ async function setMbArtistCached(artistName, country) {
 
 // Country name → ISO-2 code (historical/cultural regions return null → skip MB)
 const COUNTRY_ISO = {
+  // A
   "Afghanistan":"AF","Albania":"AL","Algeria":"DZ","Angola":"AO","Argentina":"AR",
-  "Armenia":"AM","Australia":"AU","Austria":"AT","Azerbaijan":"AZ","Bahrain":"BH",
-  "Bangladesh":"BD","Barbados":"BB","Belgium":"BE","Belize":"BZ","Benin":"BJ",
-  "Bolivia":"BO","Bosnia":"BA","Botswana":"BW","Brazil":"BR","Bulgaria":"BG",
-  "Burkina Faso":"BF","Cambodia":"KH","Cameroon":"CM","Canada":"CA","Cape Verde":"CV",
-  "Chile":"CL","China":"CN","Colombia":"CO","Congo":"CG","Costa Rica":"CR",
+  "Armenia":"AM","Australia":"AU","Austria":"AT","Azerbaijan":"AZ",
+  // B
+  "Bahrain":"BH","Bangladesh":"BD","Barbados":"BB","Belarus":"BY","Belgium":"BE",
+  "Belize":"BZ","Benin":"BJ","Bolivia":"BO","Bosnia":"BA","Botswana":"BW",
+  "Brazil":"BR","Brunei":"BN","Bulgaria":"BG","Burkina Faso":"BF","Burundi":"BI",
+  // C
+  "Cambodia":"KH","Cameroon":"CM","Canada":"CA","Cape Verde":"CV",
+  "Central African Republic":"CF","Chad":"TD","Chile":"CL","China":"CN",
+  "Colombia":"CO","Comoros":"KM","Congo":"CG","DR Congo":"CD","Costa Rica":"CR",
   "Croatia":"HR","Cuba":"CU","Cyprus":"CY","Czechia":"CZ","Czech Republic":"CZ",
-  "Denmark":"DK","Dominican Republic":"DO","Ecuador":"EC","Egypt":"EG",
-  "El Salvador":"SV","Eritrea":"ER","Estonia":"EE","Ethiopia":"ET","Fiji":"FJ",
-  "Finland":"FI","France":"FR","Georgia":"GE","Germany":"DE","Ghana":"GH",
-  "Greece":"GR","Guatemala":"GT","Guinea":"GN","Guyana":"GY","Haiti":"HT",
-  "Honduras":"HN","Hong Kong":"HK","Hungary":"HU","Iceland":"IS","India":"IN",
-  "Indonesia":"ID","Iran":"IR","Iraq":"IQ","Ireland":"IE","Israel":"IL",
-  "Italy":"IT","Ivory Coast":"CI","Jamaica":"JM","Japan":"JP","Jordan":"JO",
-  "Kazakhstan":"KZ","Kenya":"KE","Kosovo":"XK","Kuwait":"KW","Kyrgyzstan":"KG",
-  "Laos":"LA","Latvia":"LV","Lebanon":"LB","Liberia":"LR","Libya":"LY",
-  "Lithuania":"LT","Luxembourg":"LU","Madagascar":"MG","Malawi":"MW",
-  "Malaysia":"MY","Mali":"ML","Malta":"MT","Mauritius":"MU","Mexico":"MX",
+  // D
+  "Denmark":"DK","Djibouti":"DJ","Dominican Republic":"DO",
+  // E
+  "East Timor":"TL","Ecuador":"EC","Egypt":"EG","El Salvador":"SV",
+  "England":"GB","Equatorial Guinea":"GQ","Eritrea":"ER","Estonia":"EE","Eswatini":"SZ",
+  "Ethiopia":"ET",
+  // F
+  "Fiji":"FJ","Finland":"FI","France":"FR",
+  // G
+  "Gabon":"GA","Gambia":"GM","Georgia":"GE","Germany":"DE","Ghana":"GH",
+  "Greece":"GR","Guadeloupe":"GP","Guatemala":"GT","Guinea":"GN",
+  "Guinea-Bissau":"GW","Guyana":"GY",
+  // H
+  "Haiti":"HT","Honduras":"HN","Hong Kong":"HK","Hungary":"HU",
+  // I
+  "Iceland":"IS","India":"IN","Indonesia":"ID","Iran":"IR","Iraq":"IQ",
+  "Ireland":"IE","Israel":"IL","Italy":"IT","Ivory Coast":"CI",
+  // J
+  "Jamaica":"JM","Japan":"JP","Jordan":"JO",
+  // K
+  "Kazakhstan":"KZ","Kenya":"KE","Kiribati":"KI","Kosovo":"XK","Kuwait":"KW",
+  "Kyrgyzstan":"KG",
+  // L
+  "Laos":"LA","Latvia":"LV","Lebanon":"LB","Lesotho":"LS","Liberia":"LR",
+  "Libya":"LY","Lithuania":"LT","Luxembourg":"LU",
+  // M
+  "Madagascar":"MG","Malawi":"MW","Malaysia":"MY","Mali":"ML","Malta":"MT",
+  "Martinique":"MQ","Mauritania":"MR","Mauritius":"MU","Mexico":"MX",
   "Moldova":"MD","Mongolia":"MN","Montenegro":"ME","Morocco":"MA","Mozambique":"MZ",
-  "Myanmar":"MM","Namibia":"NA","Nepal":"NP","Netherlands":"NL","New Zealand":"NZ",
-  "Nicaragua":"NI","Nigeria":"NG","North Macedonia":"MK","Norway":"NO","Oman":"OM",
+  "Myanmar":"MM",
+  // N
+  "Namibia":"NA","Nepal":"NP","Netherlands":"NL","New Zealand":"NZ",
+  "Nicaragua":"NI","Niger":"NE","Nigeria":"NG","North Macedonia":"MK","Norway":"NO",
+  // O
+  "Oman":"OM",
+  // P
   "Pakistan":"PK","Palestine":"PS","Panama":"PA","Papua New Guinea":"PG",
   "Paraguay":"PY","Peru":"PE","Philippines":"PH","Poland":"PL","Portugal":"PT",
-  "Puerto Rico":"PR","Qatar":"QA","Romania":"RO","Rwanda":"RW","Samoa":"WS",
-  "Saudi Arabia":"SA","Senegal":"SN","Serbia":"RS","Sierra Leone":"SL",
-  "Singapore":"SG","Slovakia":"SK","Slovenia":"SI","Solomon Islands":"SB",
-  "Somalia":"SO","South Africa":"ZA","South Korea":"KR","Spain":"ES",
-  "Sri Lanka":"LK","Sudan":"SD","Suriname":"SR","Sweden":"SE","Switzerland":"CH",
-  "Syria":"SY","Taiwan":"TW","Tajikistan":"TJ","Tanzania":"TZ","Thailand":"TH",
-  "Togo":"TG","Tonga":"TO","Trinidad & Tobago":"TT","Tunisia":"TN","Turkey":"TR",
-  "Turkmenistan":"TM","UAE":"AE","Uganda":"UG","Ukraine":"UA","Uruguay":"UY",
-  "USA":"US","Uzbekistan":"UZ","Vanuatu":"VU","Venezuela":"VE","Vietnam":"VN",
-  "Wales":"GB","Scotland":"GB","Yemen":"YE","Zambia":"ZM","Zimbabwe":"ZW",
-  "Djibouti":"DJ","Kuwait":"KW","Bahrain":"BH",
+  "Puerto Rico":"PR",
+  // Q
+  "Qatar":"QA",
+  // R
+  "Romania":"RO","Russia":"RU","Rwanda":"RW","Réunion":"RE",
+  // S
+  "Samoa":"WS","Saudi Arabia":"SA","Scotland":"GB","Senegal":"SN","Serbia":"RS",
+  "Seychelles":"SC","Sierra Leone":"SL","Singapore":"SG","Slovakia":"SK",
+  "Slovenia":"SI","Solomon Islands":"SB","Somalia":"SO","South Africa":"ZA",
+  "South Korea":"KR","Spain":"ES","Sri Lanka":"LK","Sudan":"SD","Suriname":"SR",
+  "Sweden":"SE","Switzerland":"CH","Syria":"SY",
+  // T
+  "Taiwan":"TW","Tajikistan":"TJ","Tanzania":"TZ","Thailand":"TH","Togo":"TG",
+  "Tonga":"TO","Trinidad & Tobago":"TT","Tunisia":"TN","Turkey":"TR",
+  "Turkmenistan":"TM",
+  // U
+  "UAE":"AE","Uganda":"UG","Ukraine":"UA","Uruguay":"UY","USA":"US","Uzbekistan":"UZ",
+  // V
+  "Vanuatu":"VU","Venezuela":"VE","Vietnam":"VN",
+  // W
+  "Wales":"GB",
+  // Y
+  "Yemen":"YE",
+  // Z
+  "Zambia":"ZM","Zimbabwe":"ZW",
 };
 
 // ── Streaming floor helpers ───────────────────────────────
@@ -1550,28 +1591,84 @@ async function mbArtistCountry(artistName) {
 }
 
 // ── ListenBrainz fallback for artist tracks ───────────────
+// ── Last.fm fetch queue ───────────────────────────────────
+// Last.fm has no hard rate limit but ~5 req/s is the community guideline.
+// 300ms between calls (~3.3/s) keeps us well within that.
+const LF_TIMEOUT_MS = 6000;
+const lfQueue = [];
+let lfBusy = false;
+function lfFetch(url) {
+  return new Promise((resolve, reject) => {
+    lfQueue.push({ url, resolve, reject });
+    if (!lfBusy) drainLfQueue();
+  });
+}
+async function drainLfQueue() {
+  lfBusy = true;
+  while (lfQueue.length > 0) {
+    const { url, resolve, reject } = lfQueue.shift();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LF_TIMEOUT_MS);
+    try {
+      const r = await fetch(url, {
+        headers: { "User-Agent": MB_UA },
+        signal: controller.signal,
+      });
+      resolve(r);
+    } catch (e) {
+      if (e.name === "AbortError") {
+        console.warn(`[LF] Request timed out: ${url}`);
+        resolve({ ok: false, status: 408 });
+      } else {
+        reject(e);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (lfQueue.length > 0) await new Promise(r => setTimeout(r, 300));
+  }
+  lfBusy = false;
+}
+
+// ── ListenBrainz fetch queue ──────────────────────────────
+// ListenBrainz has no published rate limit but is a community project.
+// 500ms between calls (~2/s) is respectful.
 const LB_BASE = "https://api.listenbrainz.org/1";
 const LB_TIMEOUT_MS = 8000;
-
-async function lbFetch(url, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), LB_TIMEOUT_MS);
-  try {
-    const r = await fetch(url, {
-      ...options,
-      headers: { "User-Agent": MB_UA, ...(options.headers || {}) },
-      signal: controller.signal,
-    });
-    return r;
-  } catch (e) {
-    if (e.name === "AbortError") {
-      console.warn(`[LB] Request timed out: ${url}`);
-      return { ok: false, status: 408 };
+const lbQueue = [];
+let lbBusy = false;
+function lbFetch(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    lbQueue.push({ url, options, resolve, reject });
+    if (!lbBusy) drainLbQueue();
+  });
+}
+async function drainLbQueue() {
+  lbBusy = true;
+  while (lbQueue.length > 0) {
+    const { url, options, resolve, reject } = lbQueue.shift();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LB_TIMEOUT_MS);
+    try {
+      const r = await fetch(url, {
+        ...options,
+        headers: { "User-Agent": MB_UA, ...(options.headers || {}) },
+        signal: controller.signal,
+      });
+      resolve(r);
+    } catch (e) {
+      if (e.name === "AbortError") {
+        console.warn(`[LB] Request timed out: ${url}`);
+        resolve({ ok: false, status: 408 });
+      } else {
+        reject(e);
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    throw e;
-  } finally {
-    clearTimeout(timer);
+    if (lbQueue.length > 0) await new Promise(r => setTimeout(r, 500));
   }
+  lbBusy = false;
 }
 
 // ── LB popular-recordings-by-country ─────────────────────
@@ -2700,7 +2797,7 @@ Return exactly this JSON:
           const lfKey = process.env.LASTFM_API_KEY;
           if (lfKey) {
             const lfTag = genre.toLowerCase().replace(/[^a-z0-9\s\-]/g, "").trim();
-            const lfRes = await fetch(
+            const lfRes = await lfFetch(
               `https://ws.audioscrobbler.com/2.0/?method=tag.getTopTracks&tag=${encodeURIComponent(lfTag)}&limit=20&api_key=${lfKey}&format=json`
             );
             const lfData = await lfRes.json();
@@ -3792,7 +3889,8 @@ Return ONLY valid JSON:
 {
   "artists": [
     {
-      "name": "exact artist name",
+      "name": "exact artist name in their native script if applicable (e.g. 杏里, BTS, Fairuz)",
+      "romanizedName": "romanized/English name ONLY if name uses non-Latin script — omit otherwise",
       "country": "full country name",
       "countryCode": "2-letter ISO code",
       "genre": "their primary genre",
@@ -4202,8 +4300,26 @@ const ALL_ENRICHABLE_COUNTRIES = [
   'Qatar','Bahrain','UAE','Saudi Arabia','Palestine','Cyprus','Malta',
   'Albania','Bosnia','North Macedonia','Kosovo','Moldova','Belarus',
   'Latvia','Lithuania','Estonia','Slovenia','Croatia','Serbia','Montenegro',
-  'Slovakia','Czech Republic','Hungary','Romania','Bulgaria','Ukraine',
-  'New Zealand','Australia','Canada','Mexico',
+  'Slovakia','Czechia','Hungary','Romania','Bulgaria','Ukraine',
+  'Russia','Finland','Sweden','Norway','Denmark','Poland','Switzerland','Austria',
+  'Belgium','Netherlands','Ireland','England','Scotland','Wales','Spain','Italy','France','Germany',
+  'Luxembourg',
+  // Latin America additions
+  'Chile','Puerto Rico','Belize',
+  // Africa additions
+  'South Africa','Kenya',
+  // Middle East additions
+  'Israel',
+  // Asia additions
+  'China','Taiwan','Singapore','Hong Kong',
+  // Oceania additions
+  'Hawaii',
+  // Historical civilizations
+  'Soviet Union','Yugoslavia','Ottoman Empire','East Germany','Ceylon','Rhodesia','Zaire',
+  'Siam','Byzantine Empire','Prussia','Austro-Hungarian Empire','Ancient Rome','Ancient Greece',
+  'Mesopotamia','Viking Scandinavia','Moorish Spain','Weimar Republic',
+  'Republic of South Vietnam','Meiji Japan',
+  'New Zealand','Australia','Canada','Mexico','USA',
 ];
 
 async function findWeakCountries(limit = 2) {
@@ -4516,7 +4632,7 @@ async function lastfmArtistTopTracks(artistName, limit = 5) {
   const key = process.env.LASTFM_API_KEY;
   if (!key) return [];
   try {
-    const r = await fetch(
+    const r = await lfFetch(
       `https://ws.audioscrobbler.com/2.0/?method=artist.getTopTracks&artist=${encodeURIComponent(artistName)}&limit=${limit}&autocorrect=1&api_key=${key}&format=json`
     );
     const d = await r.json();
@@ -4531,7 +4647,7 @@ async function lastfmGeoTopArtists(country, limit = 25) {
   const key = process.env.LASTFM_API_KEY;
   if (!key) return [];
   try {
-    const r = await fetch(
+    const r = await lfFetch(
       `https://ws.audioscrobbler.com/2.0/?method=geo.getTopArtists&country=${encodeURIComponent(country)}&limit=${limit}&api_key=${key}&format=json`
     );
     const d = await r.json();
@@ -4546,7 +4662,7 @@ async function lastfmArtistCorrection(artistName) {
   const key = process.env.LASTFM_API_KEY;
   if (!key) return null;
   try {
-    const r = await fetch(
+    const r = await lfFetch(
       `https://ws.audioscrobbler.com/2.0/?method=artist.getCorrection&artist=${encodeURIComponent(artistName)}&api_key=${key}&format=json`
     );
     const d = await r.json();
@@ -4911,9 +5027,242 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
   return { processed, total: toEnrich.length };
 }
 
+const POOL_CAP = 40;
+const POOL_GROW_TARGET = 3; // additions per enrichment run
+
+// Tries to grow a country's artist pool toward POOL_CAP with verified additions.
+// Sources: MusicBrainz + ListenBrainz (high/medium confidence) and Last.fm geo data.
+// Asks Haiku to annotate candidates, then verifies each has playable tracks before adding.
+async function growArtistPool(country, isoCode, currentPool, lfArtists, apiKey, appleToken) {
+  const slots = Math.min(POOL_GROW_TARGET, POOL_CAP - currentPool.length);
+  if (slots <= 0) return [];
+
+  const normName = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const currentNames = new Set(currentPool.map(a => normName(a.name)));
+
+  // Gather candidates — MB+LB first (geographically verified by music databases),
+  // then Last.fm geo (scrobbling-based, strong signal but looser geography).
+  const candidates = [];
+  if (isoCode) {
+    try {
+      const realPool = await buildRealArtistPool(country, isoCode);
+      for (const a of realPool) {
+        if (!currentNames.has(normName(a.name))) {
+          candidates.push({ name: a.name, confidence: a.confidence });
+        }
+      }
+    } catch {}
+  }
+  for (const name of lfArtists) {
+    const n = normName(name);
+    if (!currentNames.has(n) && !candidates.some(c => normName(c.name) === n)) {
+      candidates.push({ name, confidence: "lastfm" });
+    }
+  }
+
+  if (!candidates.length) {
+    console.log(`[pool-grow] ${country}: no new candidates from databases`);
+    return [];
+  }
+
+  // Prioritise: high (MB+LB) → medium-lb → medium-mb → lastfm
+  const confRank = { high: 0, "medium-lb": 1, "medium-mb": 2, lastfm: 3 };
+  candidates.sort((a, b) => (confRank[a.confidence] ?? 9) - (confRank[b.confidence] ?? 9));
+
+  // Batch-annotate the top candidates with genre/era/similarTo via Haiku.
+  // We ask Haiku because these artists ARE database-verified — we just need metadata.
+  // Haiku is told to omit anyone it doesn't have real knowledge of.
+  const topCandidates = candidates.slice(0, Math.min(slots * 5, 20));
+  console.log(`[pool-grow] ${country}: ${candidates.length} candidates, annotating top ${topCandidates.length}…`);
+
+  let annotated = [];
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 700,
+        system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [{
+          role: "user",
+          content: `These artists have been verified by MusicBrainz and/or ListenBrainz as being from ${country}.
+
+Annotate each with genre, decade most active, and one well-known comparison artist.
+ONLY include artists you have genuine knowledge of — omit anyone you are unsure about.
+Do NOT repeat a name unless the repeated form is the artist's actual official name.
+
+Artists: ${topCandidates.map(c => c.name).join(", ")}
+
+Return JSON:
+{
+  "artists": [
+    {
+      "name": "Exact Name As Given",
+      "genre": "specific local genre",
+      "era": "1990s",
+      "similarTo": "One well-known comparison artist"
+    }
+  ]
+}
+
+era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s.`
+        }],
+      }),
+    });
+    const d = await res.json();
+    if (!d.error) {
+      const raw = (d.content[0].text || "").replace(/```json|```/g, "").trim();
+      annotated = normalizeArtistNames(JSON.parse(raw).artists || []);
+    }
+  } catch (err) {
+    console.error(`[pool-grow] ${country}: annotation failed —`, err.message);
+    return [];
+  }
+
+  if (!annotated.length) {
+    console.log(`[pool-grow] ${country}: Haiku had no knowledge of candidates`);
+    return [];
+  }
+
+  // Verify each annotated artist has playable tracks before adding to pool
+  const added = [];
+  for (const artist of annotated) {
+    if (added.length >= slots) break;
+
+    const ck = makeCacheKey(["artist-tracks-apple", artist.name]);
+    const existing = await getCached(ck);
+    let tracks = existing?.result?.tracks || [];
+
+    if (!tracks.length) {
+      const lfTitles = await lastfmArtistTopTracks(artist.name, 5);
+      tracks = await proactiveArtistTracks(artist.name, lfTitles, appleToken);
+      if (tracks.length) {
+        artistTracksMemCache.set(ck, { tracks, cachedAt: Date.now() });
+        await storeCache(ck, "artist-tracks-apple", { tracks });
+      }
+    }
+
+    if (!tracks.length) {
+      console.log(`  [pool-grow] – ${artist.name}: no tracks found`);
+      await new Promise(r => setTimeout(r, 200));
+      continue;
+    }
+
+    const imageUrl = await fetchArtistImageUrl(artist.name, { genre: artist.genre }).catch(() => null);
+    added.push({ ...artist, hasVerifiedTracks: true, ...(imageUrl ? { imageUrl } : {}) });
+    console.log(`  [pool-grow] ✓ ${artist.name} (${artist.era} ${artist.genre})`);
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  console.log(`[pool-grow] ${country}: added ${added.length}/${slots} artist(s)`);
+  return added;
+}
+
+// Audits the existing artist_pool for a country, identifying misattributed artists.
+// Moves them to their real country's pool, then returns their lowercased names for removal.
+async function auditCountryPool(artistPool, country, apiKey) {
+  if (!artistPool?.length) return [];
+  const names = artistPool.map(a => a.name);
+  console.log(`[pool-audit] ${country}: auditing ${names.length} artists…`);
+
+  let result;
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 800,
+        system: "You are a music geography expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        messages: [{
+          role: "user",
+          content: `These artists are stored in a music database for "${country}".
+
+Check each artist and identify any who are clearly misattributed to ${country}.
+
+Artists to check: ${names.join(", ")}
+
+Rules:
+- Only flag an artist if they were BORN IN and PRIMARILY ASSOCIATED WITH a different country.
+- Diaspora artists, dual-heritage artists, or artists who spent part of their career abroad but are rooted in ${country}'s music tradition should NOT be flagged — keep them.
+- Artists who moved to another country but whose musical identity and output is still tied to ${country} should NOT be flagged.
+- Soviet-era artists born in a Soviet republic should be attributed to that republic (e.g. an artist born in Baku belongs to Azerbaijan, not the USSR or Russia), even if they had a USSR-wide career.
+- Only flag clear-cut cases (e.g. a Canadian band appearing in a French database). When in doubt, omit.
+
+For artists you are flagging, provide their actual country as a plain English country name only — no explanations, parentheses, or qualifiers.
+
+Return JSON:
+{
+  "misattributed": [
+    { "name": "Exact Artist Name As Listed Above", "actualCountry": "Country Name" }
+  ]
+}
+
+If all artists are correctly attributed to ${country}, return: { "misattributed": [] }`
+        }],
+      }),
+    });
+    const data = await res.json();
+    if (data.error) { console.error(`[pool-audit] Claude error: ${data.error.message}`); return []; }
+    const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
+    result = JSON.parse(raw);
+  } catch (err) {
+    console.error(`[pool-audit] ${country}: failed —`, err.message);
+    return [];
+  }
+
+  const misattributed = result.misattributed || [];
+  if (!misattributed.length) {
+    console.log(`[pool-audit] ${country}: all artists verified ✓`);
+    return [];
+  }
+
+  console.log(`[pool-audit] ${country}: ${misattributed.length} misattributed — ${misattributed.map(m => `${m.name} → ${m.actualCountry}`).join(", ")}`);
+
+  // Move each misattributed artist to their correct country's pool if we have one cached
+  for (const { name, actualCountry } of misattributed) {
+    if (!ALL_ENRICHABLE_COUNTRIES.includes(actualCountry)) {
+      console.log(`  [pool-audit] ${name}: actualCountry "${actualCountry}" not in enrichable list — just removing`);
+      continue;
+    }
+    const artist = artistPool.find(a => a.name.toLowerCase() === name.toLowerCase());
+    if (!artist) continue;
+
+    const targetKey = makeCacheKey(["recommend", actualCountry]);
+    const targetCache = await getCached(targetKey);
+    if (!targetCache?.artist_pool) {
+      console.log(`  [pool-audit] ${name}: no cache for ${actualCountry} yet — just removing`);
+      continue;
+    }
+
+    const alreadyPresent = targetCache.artist_pool.some(a => a.name.toLowerCase() === name.toLowerCase());
+    if (!alreadyPresent) {
+      await storeCache(targetKey, "recommend", targetCache.result, [...targetCache.artist_pool, { ...artist }]);
+      console.log(`  [pool-audit] ✓ moved ${name} → ${actualCountry}`);
+    } else {
+      console.log(`  [pool-audit] ${name} already in ${actualCountry} pool — just removing from ${country}`);
+    }
+  }
+
+  return misattributed.map(m => m.name.toLowerCase());
+}
+
 async function deepEnrichCountry(country, apiKey) {
   console.log(`[country-enrich] Researching ${country}...`);
   const appleToken = generateAppleMusicToken();
+
+  // Step 0: Audit existing pool — remove misattributed artists and move them to the right country
+  const cacheKey = makeCacheKey(["recommend", country]);
+  const existingCache = await getCached(cacheKey);
+  if (existingCache?.artist_pool?.length) {
+    const toRemove = await auditCountryPool(existingCache.artist_pool, country, apiKey);
+    if (toRemove.length) {
+      const cleanedPool = existingCache.artist_pool.filter(a => !toRemove.includes(a.name.toLowerCase()));
+      await storeCache(cacheKey, "recommend", existingCache.result, cleanedPool);
+      console.log(`[pool-audit] ${country}: removed ${toRemove.length} artist(s) from pool`);
+    }
+  }
 
   // Step 1a: Pull Last.fm geo.getTopArtists to ground Claude in real scrobble data
   const lfArtists = await lastfmGeoTopArtists(country, 25);
@@ -5006,10 +5355,8 @@ Also include:
   console.log(`[streaming-floor] ${country}: final floor = ${streamingFloor}`);
 
   // Step 2: Fetch image URLs for all artists (preserve any already cached)
-  const cacheKey = makeCacheKey(["recommend", country]);
-  const existingCache = await getCached(cacheKey);
   const existingImageMap = {};
-  for (const a of (existingCache?.artistPool || [])) {
+  for (const a of (existingCache?.artist_pool || [])) {
     if (a.name && a.imageUrl) existingImageMap[a.name.toLowerCase()] = a.imageUrl;
   }
 
@@ -5115,23 +5462,33 @@ JSON: {"artists": [{"name": "Artist Name", "genre": "genre", "era": "Contemporar
   }
 
   // Update cached pool: swap in replacements for failed artists, keep rest
+  const finalPool = [
+    ...successfulArtists,
+    ...replacements,
+    ...failedArtists.slice(replacements.length),
+  ];
   if (replacements.length > 0) {
-    const updatedPool = [
-      ...successfulArtists,
-      ...replacements,
-      ...failedArtists.slice(replacements.length), // keep any still-unresolved failures at end
-    ];
     await storeCache(cacheKey, "recommend",
       { genres: research.genres, didYouKnow: research.didYouKnow, streamingFloor },
-      updatedPool
+      finalPool
     );
     console.log(`[country-enrich] ${country}: updated pool with ${replacements.length} replacements`);
   }
 
-  const withTracks = successfulArtists.length + replacements.length;
+  // Step 5: Grow the pool toward 40 with database-verified additions
+  const isoCode = COUNTRY_ISO[country];
+  const growAdditions = await growArtistPool(country, isoCode, finalPool, lfArtists, apiKey, appleToken);
+  if (growAdditions.length) {
+    await storeCache(cacheKey, "recommend",
+      { genres: research.genres, didYouKnow: research.didYouKnow, streamingFloor },
+      [...finalPool, ...growAdditions]
+    );
+  }
+
+  const withTracks = successfulArtists.length + replacements.length + growAdditions.length;
   const withoutTracks = failedArtists.length - replacements.length;
-  console.log(`[country-enrich] ${country} done: ${withTracks} with tracks, ${withoutTracks} without`);
-  return { country, artists: research.artists.length, withTracks, withoutTracks };
+  console.log(`[country-enrich] ${country} done: ${withTracks} with tracks, ${withoutTracks} without, pool size ${finalPool.length + growAdditions.length}`);
+  return { country, artists: research.artists.length, withTracks, withoutTracks, poolSize: finalPool.length + growAdditions.length };
 }
 
 // GET /api/streaming-floors — public, returns { country: decade } for all countries with a known floor
