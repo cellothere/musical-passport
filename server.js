@@ -3045,7 +3045,7 @@ app.post("/api/decade-spotlight", async (req, res) => {
         system: "You are a world music curator with encyclopedic knowledge of global music history. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
         messages: [{
           role: "user",
-          content: `List 16 iconic artists who were at their peak during the ${decade}, drawn from every corner of the world.
+          content: `List 16 artists who were ACTIVELY RECORDING AND PERFORMING during the ${decade}, drawn from every corner of the world.
 
 Return exactly this JSON:
 {
@@ -3061,11 +3061,16 @@ Return exactly this JSON:
   ]
 }
 
-Rules:
+CRITICAL ERA ACCURACY RULES (violations will make the app wrong):
+- Every artist MUST have been alive AND releasing music during the ${decade}. The first year of the decade is ${decade.replace('s','')} and the last is ${parseInt(decade) + 9}.
+- Do NOT include anyone who died before ${decade.replace('s','')}. For example: Umm Kulthum died in 1975 — never include her for any decade after the 1960s.
+- Do NOT include artists whose primary fame was in a different decade. Each artist should be genuinely associated with THIS decade's sound, not just still alive.
+- Think carefully before each artist: "Were they actually making music people cared about in the ${decade}?" If unsure, pick someone else.
+
+Other rules:
 - Exactly 16 artists. Cover ALL of these regions with at least 1–2 artists each: Sub-Saharan Africa, North Africa / Middle East, Latin America, Europe, South/Southeast Asia, East Asia, North America. Oceania is a bonus.
-- Every artist must have been genuinely active and prominent in the ${decade} — not just born then or discovered later.
-- Prioritise artists whose music is realistically available on streaming today (major or significant regional artists).
-- Include a wide variety of genres: pop, rock, folk, traditional, electronic, hip-hop, afrobeat, cumbia, etc. — not just Western genres.
+- Prioritise artists whose music is realistically available on streaming today.
+- Include a wide variety of genres: pop, rock, folk, traditional, electronic, hip-hop, afrobeat, cumbia, etc.
 - countryCode must be a valid ISO 3166-1 alpha-2 code.
 - similarTo should help a Western listener understand the vibe — keep it brief (one artist name).
 - No duplicate countries unless the country is very large (e.g. USA, Brazil, India can appear twice).`,
