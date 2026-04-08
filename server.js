@@ -1719,7 +1719,7 @@ async function buildRealArtistPool(country, isoCode) {
     pool.push({ name: mbArtist.name, confidence: "medium-mb", listenCount: 0, tags: mbArtist.tags });
   }
 
-  const result = pool.slice(0, 20);
+  const result = pool.slice(0, 40);
   console.log(`[real-pool] ${country}: ${result.filter(a => a.confidence === "high").length} high-conf, ${result.filter(a => a.confidence !== "high").length} medium-conf artists`);
   return result;
 }
@@ -1937,7 +1937,7 @@ app.post("/api/recommend", async (req, res) => {
     if (pool.length >= 4) {
       return res.json({
         genres: cached.result.genres,
-        artists: pickDiverseByEra(annotateTrackStatus(pool), 4),
+        artists: pickDiverseByEra(annotateTrackStatus(pool), pool.length),
         didYouKnow: cached.result.didYouKnow,
         fromCache: true,
       });
@@ -2066,7 +2066,7 @@ IMPORTANT: Use each artist's exact real name as it appears on streaming platform
     await storeCache(cacheKey, "recommend", { genres: rec.genres, didYouKnow: rec.didYouKnow }, artistPool);
     verifyArtistPoolWithMB(artistPool, country, [cacheKey]).catch(() => {});
 
-    const _result = { genres: rec.genres, artists: pickDiverseByEra(artistPool, 4), didYouKnow: rec.didYouKnow };
+    const _result = { genres: rec.genres, artists: pickDiverseByEra(artistPool, artistPool.length), didYouKnow: rec.didYouKnow };
     if (_resolveInFlight) { _resolveInFlight(_result); recommendInFlight.delete(_inflightKey); }
     res.json(_result);
 
