@@ -1337,7 +1337,7 @@ async function discogsTracksForCountryDecade(country, decade) {
 
 // ── MusicBrainz helpers ──────────────────────────────────
 const MB_BASE = "https://musicbrainz.org/ws/2";
-const MB_UA   = "MusicalPassport/1.0 (cellorepertoireinitiative@gmail.com)";
+const MB_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 
 // Rate-limit queue: MusicBrainz allows 1 req/sec. 4s timeout per request.
 const MB_TIMEOUT_MS = 4000;
