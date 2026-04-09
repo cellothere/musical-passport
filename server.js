@@ -536,6 +536,7 @@ const CACHE_TTL = {
   'time-machine':       14  * 24 * 60 * 60 * 1000,
   'artist-tracks':      90  * 24 * 60 * 60 * 1000,
   'artist-tracks-apple':90  * 24 * 60 * 60 * 1000,
+  'artist-meta':        180 * 24 * 60 * 60 * 1000,
   'similar-artists':    180 * 24 * 60 * 60 * 1000,
   'similar-of':         180 * 24 * 60 * 60 * 1000,
   'genre-artists':      180 * 24 * 60 * 60 * 1000,
@@ -1268,22 +1269,42 @@ const DISCOGS_COUNTRY_NAME = {
 };
 
 async function discogsFetch(url) {
-  const token = process.env.DISCOGS_TOKEN;
-  const headers = { "User-Agent": DISCOGS_UA };
-  if (token) headers["Authorization"] = `Discogs token=${token}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
-  try {
-    return await fetch(url, { headers, signal: controller.signal });
-  } catch (e) {
-    if (e.name === "AbortError") {
-      console.warn(`[Discogs] Request timed out: ${url}`);
-      return { ok: false, status: 408 };
+  return new Promise((resolve, reject) => {
+    discogsQueue.push({ url, resolve, reject });
+    if (!discogsBusy) drainDiscogsQueue();
+  });
+}
+
+const DISCOGS_TIMEOUT_MS = 5000;
+const DISCOGS_GAP_MS = 1200;
+const discogsQueue = [];
+let discogsBusy = false;
+
+async function drainDiscogsQueue() {
+  discogsBusy = true;
+  while (discogsQueue.length > 0) {
+    const { url, resolve, reject } = discogsQueue.shift();
+    const token = process.env.DISCOGS_TOKEN;
+    const headers = { "User-Agent": DISCOGS_UA };
+    if (token) headers["Authorization"] = `Discogs token=${token}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DISCOGS_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, { headers, signal: controller.signal });
+      resolve(response);
+    } catch (e) {
+      if (e.name === "AbortError") {
+        console.warn(`[Discogs] Request timed out: ${url}`);
+        resolve({ ok: false, status: 408 });
+      } else {
+        reject(e);
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    throw e;
-  } finally {
-    clearTimeout(timer);
+    if (discogsQueue.length > 0) await new Promise(r => setTimeout(r, DISCOGS_GAP_MS));
   }
+  discogsBusy = false;
 }
 
 // Fetch real tracks from Discogs for a country+decade.
@@ -1307,7 +1328,6 @@ async function discogsTracksForCountryDecade(country, decade) {
     const tracks = [];
     for (const master of masters) {
       try {
-        await new Promise(r => setTimeout(r, 400)); // stay well under 60 req/min
         const masterRes = await discogsFetch(`${DISCOGS_BASE}/masters/${master.id}`);
         if (!masterRes.ok) continue;
         const masterData = await masterRes.json();
@@ -1339,8 +1359,9 @@ async function discogsTracksForCountryDecade(country, decade) {
 const MB_BASE = "https://musicbrainz.org/ws/2";
 const MB_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 
-// Rate-limit queue: MusicBrainz allows 1 req/sec. 4s timeout per request.
-const MB_TIMEOUT_MS = 4000;
+// Rate-limit queue: MusicBrainz allows 1 req/sec. Keep one global queue for all
+// user/background work so requests never hit MB concurrently.
+const MB_TIMEOUT_MS = 7000;
 const mbQueue = [];
 let mbBusy = false;
 function mbFetch(url) {
@@ -1379,6 +1400,26 @@ async function drainMbQueue() {
 // In-memory cache for MB artist → ISO country (avoids repeat lookups within a process lifetime)
 const mbArtistCache = new Map(); // artistName → { country: string|null, at: number }
 const MB_ARTIST_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+const MB_TRANSIENT_CACHE_TTL = 60 * 60 * 1000; // 1 hour for timeouts / temporary failures
+const mbTransientCache = new Map(); // key → { value, at }
+
+function getMbTransientCached(key) {
+  const cached = mbTransientCache.get(key);
+  if (!cached) return undefined;
+  if (Date.now() - cached.at >= MB_TRANSIENT_CACHE_TTL) {
+    mbTransientCache.delete(key);
+    return undefined;
+  }
+  return cached.value;
+}
+
+function setMbTransientCached(key, value = null) {
+  mbTransientCache.set(key, { value, at: Date.now() });
+}
+
+function isMbTransientStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
 
 async function getMbArtistCached(artistName) {
   const key = artistName.toLowerCase().trim();
@@ -1582,13 +1623,17 @@ ISO_TO_COUNTRY["CI"] = "Ivory Coast";
 
 // Verify and correct country info for each artist in a pool using MusicBrainz.
 // Runs lookups in the existing MB queue (rate-limited to 1/sec), so it's slow but accurate.
+// Conservative policy: only fill missing country data. Do not overwrite an
+// existing country assignment from the curated pool, because ambiguous MB
+// matches can be wrong for diaspora/borderline artists and bands.
 async function verifyPoolCountries(pool) {
   return Promise.all(pool.map(async (artist) => {
+    if (artist.countryCode) return artist;
     const mbCode = await mbArtistCountry(artist.name);
-    if (!mbCode || mbCode === artist.countryCode) return artist; // no change needed
+    if (!mbCode) return artist; // no change needed
     const mbName = ISO_TO_COUNTRY[mbCode];
     if (!mbName) return artist; // unknown ISO code, keep Claude's answer
-    console.log(`[verify-country] ${artist.name}: ${artist.countryCode}(${artist.country}) → ${mbCode}(${mbName})`);
+    console.log(`[verify-country] ${artist.name}: filled ${mbCode}(${mbName})`);
     return { ...artist, country: mbName, countryCode: mbCode };
   }));
 }
@@ -1602,14 +1647,31 @@ function parseDecade(decade) {
 
 // Look up an artist on MusicBrainz; returns their ISO country code or null
 async function mbArtistCountry(artistName) {
+  const transientKey = `country:${artistName.toLowerCase().trim()}`;
+  const transient = getMbTransientCached(transientKey);
+  if (transient !== undefined) return transient;
   const cached = await getMbArtistCached(artistName);
   if (cached !== undefined) return cached?.trim() ?? null;
   try {
-    const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(artistName)}&limit=3&fmt=json`;
+    const searchName = canonicalizeArtistName(artistName);
+    const target = normalizeArtistKey(searchName);
+    const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(searchName)}&limit=5&fmt=json`;
     const r = await mbFetch(url);
-    if (!r.ok) { await setMbArtistCached(artistName, null); return null; }
+    if (!r.ok) {
+      if (isMbTransientStatus(r.status)) {
+        setMbTransientCached(transientKey, null);
+        return null;
+      }
+      await setMbArtistCached(artistName, null);
+      return null;
+    }
     const d = await r.json();
-    const top = (d.artists || []).find(a => (a.score || 0) >= 80);
+    const top = (d.artists || []).find(a => {
+      const score = a.score || 0;
+      if (score < 80) return false;
+      const candidate = normalizeArtistKey(a.name || "");
+      return candidate === target || candidate.includes(target) || (candidate.length >= 6 && target.includes(candidate)) || fuzzyArtistMatch(candidate, target);
+    });
     const country = top?.country?.trim() ?? null;
     await setMbArtistCached(artistName, country);
     return country;
@@ -1852,18 +1914,158 @@ const mbidCache = new Map(); // artistName → { mbid, at }
 const MBID_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 async function getMbArtistMBID(artistName) {
+  const transientKey = `mbid:${artistName.toLowerCase().trim()}`;
+  const transient = getMbTransientCached(transientKey);
+  if (transient !== undefined) return transient;
   const cached = mbidCache.get(artistName);
   if (cached && Date.now() - cached.at < MBID_CACHE_TTL) return cached.mbid;
   try {
     const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(artistName)}&limit=3&fmt=json`;
     const r = await mbFetch(url);
-    if (!r.ok) { mbidCache.set(artistName, { mbid: null, at: Date.now() }); return null; }
+    if (!r.ok) {
+      if (isMbTransientStatus(r.status)) {
+        setMbTransientCached(transientKey, null);
+        return null;
+      }
+      mbidCache.set(artistName, { mbid: null, at: Date.now() });
+      return null;
+    }
     const d = await r.json();
     const top = (d.artists || []).find(a => (a.score || 0) >= 80);
     const mbid = top?.id ?? null;
     mbidCache.set(artistName, { mbid, at: Date.now() });
     return mbid;
   } catch { return null; }
+}
+
+async function mbArtistDetails(artistName) {
+  const searchName = canonicalizeArtistName(artistName);
+  const transientKey = `details:${searchName.toLowerCase()}`;
+  const transient = getMbTransientCached(transientKey);
+  if (transient !== undefined) return transient;
+  const target = normalizeArtistKey(searchName);
+  try {
+    const url = `${MB_BASE}/artist?query=artist:${encodeURIComponent(searchName)}&limit=5&fmt=json`;
+    const r = await mbFetch(url);
+    if (!r.ok) {
+      if (isMbTransientStatus(r.status)) setMbTransientCached(transientKey, null);
+      return null;
+    }
+    const d = await r.json();
+    const artists = d.artists || [];
+    const matched = artists.find(a => normalizeArtistKey(a.name || "") === target)
+      ?? artists.find(a => {
+        const n = normalizeArtistKey(a.name || "");
+        return n === target || n.includes(target) || target.includes(n);
+      })
+      ?? artists.find(a => (a.score || 0) >= 85);
+    if (!matched) return null;
+    const beginYear = parseInt((matched["life-span"]?.begin || "").slice(0, 4), 10);
+    const endYear = parseInt((matched["life-span"]?.end || "").slice(0, 4), 10);
+    return {
+      mbid: matched.id || null,
+      canonicalName: matched.name || searchName,
+      countryCode: matched.country || null,
+      beginYear: Number.isFinite(beginYear) ? beginYear : null,
+      endYear: Number.isFinite(endYear) ? endYear : null,
+      type: matched.type || null,
+      disambiguation: matched.disambiguation || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function discogsArtistReleaseYears(artistName, limit = 10) {
+  if (!process.env.DISCOGS_TOKEN) return [];
+  const searchName = canonicalizeArtistName(artistName);
+  const target = normalizeArtistKey(searchName);
+  try {
+    const searchUrl = `${DISCOGS_BASE}/database/search?artist=${encodeURIComponent(searchName)}&type=release&per_page=${Math.min(limit, 20)}&page=1`;
+    const searchRes = await discogsFetch(searchUrl);
+    if (!searchRes.ok) return [];
+    const searchData = await searchRes.json();
+    const years = [];
+    for (const result of (searchData.results || [])) {
+      const year = parseInt(result.year, 10);
+      if (!Number.isFinite(year) || year < 1900 || year > 2035) continue;
+      const titleNorm = normalizeArtistKey(result.title || "");
+      if (!titleNorm || (!titleNorm.startsWith(target) && !titleNorm.includes(target))) continue;
+      years.push(year);
+    }
+    return [...new Set(years)].sort((a, b) => a - b).slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+function inferArtistEraFromEvidence({ discogsYears = [], beginYear = null, endYear = null }) {
+  const yearCounts = new Map();
+  for (const year of discogsYears) {
+    const decade = yearToDecade(year);
+    if (!decade) continue;
+    yearCounts.set(decade, (yearCounts.get(decade) || 0) + 1);
+  }
+  const ranked = [...yearCounts.entries()].sort((a, b) => b[1] - a[1] || decadeIndex(a[0]) - decadeIndex(b[0]));
+  if (ranked[0]?.[0] && ranked[0][1] >= 2) return { era: ranked[0][0], confidence: "high" };
+  if (ranked[0]?.[0]) return { era: ranked[0][0], confidence: "medium" };
+  const mbYear = beginYear || endYear;
+  const mbEra = yearToDecade(mbYear);
+  return mbEra ? { era: mbEra, confidence: "low" } : { era: null, confidence: "none" };
+}
+
+async function getArtistMetaEvidence(artistName) {
+  const canonical = canonicalizeArtistName(artistName);
+  const cacheKey = makeCacheKey(["artist-meta", canonical]);
+  const cached = await getCached(cacheKey);
+  if (cached?.result?.canonicalName) return cached.result;
+
+  const correctedName = await lastfmArtistCorrection(canonical).catch(() => null) || canonical;
+  const [mbDetails, discogsYears] = await Promise.all([
+    mbArtistDetails(correctedName),
+    discogsArtistReleaseYears(correctedName),
+  ]);
+
+  const inferred = inferArtistEraFromEvidence({
+    discogsYears,
+    beginYear: mbDetails?.beginYear ?? null,
+    endYear: mbDetails?.endYear ?? null,
+  });
+
+  const result = {
+    canonicalName: mbDetails?.canonicalName || correctedName,
+    mbid: mbDetails?.mbid || null,
+    countryCode: mbDetails?.countryCode || null,
+    beginYear: mbDetails?.beginYear ?? null,
+    endYear: mbDetails?.endYear ?? null,
+    discogsYears,
+    inferredEra: inferred.era,
+    eraConfidence: inferred.confidence,
+  };
+  await storeCache(cacheKey, "artist-meta", result).catch(() => {});
+  return result;
+}
+
+async function applyArtistEvidence(artists) {
+  const hydrated = [];
+  let droppedAmbiguous = 0;
+  for (const artist of normalizeArtistNames(artists)) {
+    const meta = await getArtistMetaEvidence(artist.name);
+    if (isAmbiguousArtistName(artist.name) && !hasStrongArtistEvidence(meta, artist)) {
+      droppedAmbiguous++;
+      continue;
+    }
+    const correctedEra = normalizeDecade(meta?.inferredEra);
+    hydrated.push({
+      ...artist,
+      name: meta?.canonicalName || artist.name,
+      ...(correctedEra && (meta.eraConfidence === "high" || !normalizeDecade(artist.era)) ? { era: correctedEra } : {}),
+    });
+  }
+  if (droppedAmbiguous > 0) {
+    console.log(`[artist-filter] dropped ${droppedAmbiguous} ambiguous low-evidence artist(s)`);
+  }
+  return dedupeArtistsByName(hydrated);
 }
 
 async function fetchArtistTracksFromLB(artistName) {
@@ -2293,7 +2495,7 @@ Rules:
       let newArtists;
       try { newArtists = JSON.parse(raw).artists || []; } catch { return; }
 
-      newArtists = normalizeArtistNames(newArtists);
+      newArtists = await applyArtistEvidence(newArtists);
 
       // Deduplicate against existing pool
       const normExisting = new Set(pool.map(a => a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
@@ -2327,7 +2529,11 @@ Rules:
       const latestCached = await getCached(cacheKey);
       const latestPool = latestCached?.artist_pool || pool;
       const latestNames = new Set(latestPool.map(a => a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
-      const trulyNew = withImages.filter(a => !latestNames.has(a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+      const currentDecadeCount = latestPool.filter(a => a.era && a.era.includes(decadeYear)).length;
+      const stillNeeded = Math.max(0, 5 - currentDecadeCount);
+      const trulyNew = withImages
+        .filter(a => !latestNames.has(a.name.toLowerCase().replace(/[^a-z0-9]/g, "")))
+        .slice(0, stillNeeded);
 
       if (!trulyNew.length) {
         console.log(`[enrich-decade] ${country} ${decade}: all new artists already in pool`);
@@ -4544,13 +4750,63 @@ function primaryArtistName(name) {
     .trim() || name;
 }
 
+function canonicalizeArtistName(name) {
+  if (!name) return name;
+  let canonical = String(name).trim().replace(/\s+/g, " ");
+  canonical = primaryArtistName(canonical)
+    .replace(/\s+\((?:feat\.|ft\.|featuring)[^)]+\)$/i, "")
+    .trim();
+
+  // Track-credit style artist strings are poison for entity caches and country pools.
+  // Only split on strong collaboration markers; avoid collapsing legitimate artist names.
+  if (/\s*,\s*/.test(canonical) && /\b(?:feat\.|ft\.|featuring)\b/i.test(canonical)) {
+    canonical = canonical.split(",")[0].trim();
+  }
+  if (/\s+\b(?:with|x)\b\s+/i.test(canonical) && /\b(?:feat\.|ft\.|featuring)\b/i.test(String(name))) {
+    canonical = canonical.split(/\s+\b(?:with|x)\b\s+/i)[0].trim();
+  }
+
+  // If Claude returns a collab credit, keep the lead artist instead of storing the track-style string.
+  if (canonical.includes(",")) {
+    const parts = canonical.split(",").map(s => s.trim()).filter(Boolean);
+    if (parts.length > 1 && /\b(?:feat\.|ft\.|featuring)\b/i.test(parts.slice(1).join(" "))) canonical = parts[0];
+  }
+
+  return canonical || name;
+}
+
 // Apply any name normalization to every artist object in a list.
 function normalizeArtistNames(artists) {
-  return artists.map(a => ({ ...a, name: a.name.trim() }));
+  return artists
+    .filter(a => a?.name)
+    .map(a => ({ ...a, name: canonicalizeArtistName(a.name) }));
 }
 
 function normalizeArtistKey(name) {
   return (name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function normalizeCountryName(name) {
+  return (name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+const COUNTRY_NAME_ALIASES = new Map([
+  ["usa", "USA"],
+  ["unitedstates", "USA"],
+  ["us", "USA"],
+  ["uk", "United Kingdom"],
+  ["greatbritain", "United Kingdom"],
+  ["britain", "United Kingdom"],
+  ["uae", "UAE"],
+  ["unitedarabemirates", "UAE"],
+]);
+
+function canonicalCountryName(name) {
+  if (!name) return name;
+  const trimmed = String(name).trim();
+  if (ALL_ENRICHABLE_COUNTRIES.includes(trimmed)) return trimmed;
+  const alias = COUNTRY_NAME_ALIASES.get(normalizeCountryName(trimmed));
+  return alias || trimmed;
 }
 
 function mergeArtistPools(existingPool = [], incomingPool = [], limit = 40) {
@@ -4575,6 +4831,42 @@ function mergeArtistPools(existingPool = [], incomingPool = [], limit = 40) {
   }
 
   return [...merged.values()].slice(0, limit);
+}
+
+function dedupeArtistsByName(artists = [], limit = 100) {
+  return [...artists.reduce((map, artist) => {
+    if (!artist?.name) return map;
+    const key = normalizeArtistKey(artist.name);
+    const previous = map.get(key) || {};
+    map.set(key, {
+      ...previous,
+      ...artist,
+      imageUrl: artist.imageUrl || previous.imageUrl,
+      knownTracks: artist.knownTracks?.length ? artist.knownTracks : previous.knownTracks,
+      hasVerifiedTracks: previous.hasVerifiedTracks || artist.hasVerifiedTracks || false,
+    });
+    return map;
+  }, new Map()).values()].slice(0, limit);
+}
+
+function isAmbiguousArtistName(name) {
+  if (!name) return false;
+  const trimmed = String(name).trim();
+  const tokenCount = trimmed.split(/\s+/).filter(Boolean).length;
+  const normalized = normalizeArtistKey(trimmed);
+  if (!normalized) return false;
+  if (/^[A-Z.&-]{2,5}$/.test(trimmed)) return true;
+  return tokenCount === 1 && normalized.length <= 5;
+}
+
+function hasStrongArtistEvidence(meta, artist) {
+  return !!(
+    meta?.mbid ||
+    meta?.countryCode ||
+    (meta?.discogsYears?.length || 0) > 0 ||
+    (artist?.knownTracks?.length || 0) >= 2 ||
+    artist?.hasVerifiedTracks
+  );
 }
 
 // Allow 1-character difference for names of similar length — handles transliteration
@@ -5311,7 +5603,7 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     const d = await res.json();
     if (!d.error) {
       const raw = (d.content[0].text || "").replace(/```json|```/g, "").trim();
-      annotated = normalizeArtistNames(JSON.parse(raw).artists || []);
+      annotated = await applyArtistEvidence(JSON.parse(raw).artists || []);
     }
   } catch (err) {
     console.error(`[pool-grow] ${country}: annotation failed —`, err.message);
@@ -5376,10 +5668,19 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
 async function verifyArtistMetadata(artists, country, apiKey) {
   if (!artists?.length) return { misattributed: [], eraCorrections: new Map() };
 
+  const artistsWithEvidence = await applyArtistEvidence(artists);
+  const evidenceByName = new Map();
+  for (const artist of artistsWithEvidence) {
+    const meta = await getArtistMetaEvidence(artist.name);
+    evidenceByName.set(artist.name.toLowerCase(), meta);
+  }
+
   const artistsBlock = artists
     .map(a => {
-      const era = normalizeDecade(a.era) || "unknown";
-      return `- ${a.name} | currentEra=${era}`;
+      const evidence = evidenceByName.get(canonicalizeArtistName(a.name).toLowerCase());
+      const currentEra = normalizeDecade(a.era) || "unknown";
+      const evidenceEra = normalizeDecade(evidence?.inferredEra) || "unknown";
+      return `- ${canonicalizeArtistName(a.name)} | currentEra=${currentEra} | evidenceEra=${evidenceEra}`;
     })
     .join("\n");
 
@@ -5435,8 +5736,24 @@ Return JSON:
     return { misattributed: [], eraCorrections: new Map() };
   }
 
-  const misattributed = (result.misattributed || []).filter(a => a?.name && a?.actualCountry);
+  const currentCountryNorm = normalizeCountryName(country);
+  const misattributed = (result.misattributed || []).filter(a => {
+    if (!a?.name || !a?.actualCountry) return false;
+    const actualCountry = String(a.actualCountry).trim();
+    if (!actualCountry) return false;
+    if (/[()/]/.test(actualCountry) || /\bmixed attribution\b/i.test(actualCountry)) return false;
+    if (normalizeCountryName(actualCountry) === currentCountryNorm) return false;
+    return true;
+  });
   const eraCorrections = new Map();
+  for (const artist of artistsWithEvidence) {
+    const evidence = evidenceByName.get(artist.name.toLowerCase());
+    const evidenceEra = normalizeDecade(evidence?.inferredEra);
+    if (!evidenceEra) continue;
+    if (evidence?.eraConfidence === "high" || !normalizeDecade(artist.era)) {
+      if (evidenceEra !== normalizeDecade(artist.era)) eraCorrections.set(artist.name.toLowerCase(), evidenceEra);
+    }
+  }
   for (const correction of (result.eraCorrections || [])) {
     const era = normalizeDecade(correction?.era);
     if (correction?.name && era) eraCorrections.set(correction.name.toLowerCase(), era);
@@ -5469,17 +5786,18 @@ async function auditCountryPool(artistPool, country, apiKey) {
 
   // Move each misattributed artist to their correct country's pool if we have one cached
   for (const { name, actualCountry } of misattributed) {
-    if (!ALL_ENRICHABLE_COUNTRIES.includes(actualCountry)) {
+    const canonicalTargetCountry = canonicalCountryName(actualCountry);
+    if (!ALL_ENRICHABLE_COUNTRIES.includes(canonicalTargetCountry)) {
       console.log(`  [pool-audit] ${name}: actualCountry "${actualCountry}" not in enrichable list — just removing`);
       continue;
     }
     const artist = artistPool.find(a => a.name.toLowerCase() === name.toLowerCase());
     if (!artist) continue;
 
-    const targetKey = makeCacheKey(["recommend", actualCountry]);
+    const targetKey = makeCacheKey(["recommend", canonicalTargetCountry]);
     const targetCache = await getCached(targetKey);
     if (!targetCache?.artist_pool) {
-      console.log(`  [pool-audit] ${name}: no cache for ${actualCountry} yet — just removing`);
+      console.log(`  [pool-audit] ${name}: no cache for ${canonicalTargetCountry} yet — just removing`);
       continue;
     }
 
@@ -5487,9 +5805,9 @@ async function auditCountryPool(artistPool, country, apiKey) {
     if (!alreadyPresent) {
       const correctedEra = eraCorrections.get(name.toLowerCase());
       await storeCache(targetKey, "recommend", targetCache.result, [...targetCache.artist_pool, { ...artist, ...(correctedEra ? { era: correctedEra } : {}) }]);
-      console.log(`  [pool-audit] ✓ moved ${name} → ${actualCountry}`);
+      console.log(`  [pool-audit] ✓ moved ${name} → ${canonicalTargetCountry}`);
     } else {
-      console.log(`  [pool-audit] ${name} already in ${actualCountry} pool — just removing from ${country}`);
+      console.log(`  [pool-audit] ${name} already in ${canonicalTargetCountry} pool — just removing from ${country}`);
     }
   }
 
@@ -5584,7 +5902,7 @@ Also include:
     console.error(`[country-enrich] JSON.parse failed for ${country}:`, parseErr.message, "\nRaw:", raw.slice(0, 200));
     throw parseErr;
   }
-  research.artists = normalizeArtistNames(research.artists);
+  research.artists = await applyArtistEvidence(research.artists);
   const verifiedResearch = await verifyArtistMetadata(research.artists, country, apiKey);
   const researchRemovals = new Set(verifiedResearch.misattributed.map(a => a.name.toLowerCase()));
   research.artists = research.artists
