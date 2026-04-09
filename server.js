@@ -2235,7 +2235,7 @@ app.post("/api/enrich-decade", async (req, res) => {
           system: "You are a world music curator and ethnomusicologist. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
           messages: [{
             role: "user",
-            content: `Give me ${needed + 3} real artists from ${country} who were most active in the ${decade}.
+            content: `Give me ${needed + 3} real artists from ${country} who were most active in the ${decade} AND whose music is currently available on Apple Music or Spotify.
 
 Artists already in our database (do NOT include these): ${existingNames.join(", ")}
 
@@ -2253,10 +2253,11 @@ Return exactly this JSON:
 
 Rules:
 - Only artists genuinely from ${country} who were primarily active in the ${decade}
+- CRITICAL: The artist's recordings must actually be streamable on Apple Music or Spotify today. If ${decade} recordings from ${country} are not available on modern streaming platforms, return an empty artists array rather than guessing names that could match unrelated modern artists.
 - era must be exactly "${decade}"
-- Use exact names as they appear on streaming platforms
+- The name must match exactly how the artist appears on streaming platforms — if you are not certain of the exact streaming name, omit the artist
 - Do not include any artist from the exclusion list above
-- Return between ${needed} and ${needed + 3} artists`,
+- Return between ${needed} and ${needed + 3} artists, or an empty array if genuine streaming-available ${decade} artists from ${country} do not exist`,
           }],
         }),
       });
@@ -2280,9 +2281,9 @@ Rules:
       // Filter flagged, verify tracks, fetch images — same pipeline as /api/recommend
       const unflagged = await filterOutFlaggedArtists(newArtists);
       const verified = await verifyArtistTracksForRecommend(unflagged, country);
-      const verifiedNames = new Set(verified.map(a => a.name));
-      const toAdd = verified.length >= 1 ? verified : unflagged.slice(0, needed);
-      const withVerification = toAdd.map(a => ({ ...a, era: decade, hasVerifiedTracks: verifiedNames.has(a.name) }));
+      // No fallback to unverified — we only add artists confirmed to have streaming tracks.
+      // An unverified name can match a completely different modern artist on Apple Music/Spotify.
+      const withVerification = verified.map(a => ({ ...a, era: decade, hasVerifiedTracks: true }));
 
       const imageUrls = await Promise.all(
         withVerification.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null))
