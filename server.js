@@ -2180,6 +2180,146 @@ IMPORTANT: Use each artist's exact real name as it appears on streaming platform
   }
 });
 
+// ── Decade enrichment ──────────────────────────────────────────────────────
+// Called in the background when a country+decade filter returns fewer than 5
+// era-matching artists. Generates more artists for that specific decade and
+// merges them into the existing country pool without replacing anything.
+const decadeEnrichInFlight = new Set();
+
+app.post("/api/enrich-decade", async (req, res) => {
+  const { country, decade } = req.body;
+  if (!country || !decade) return res.status(400).json({ error: "Missing country or decade" });
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: "No API key" });
+
+  const inflightKey = `${country}::${decade}`;
+  if (decadeEnrichInFlight.has(inflightKey)) {
+    return res.json({ status: "in_progress" });
+  }
+
+  const cacheKey = makeCacheKey(["recommend", country]);
+  const cached = await getCached(cacheKey);
+  if (!cached?.artist_pool) return res.json({ status: "no_pool", added: 0 });
+
+  const pool = cached.artist_pool;
+  const decadeYear = decade.slice(0, 4); // "1990" from "1990s"
+  const existingDecadeArtists = pool.filter(a => a.era && a.era.includes(decadeYear));
+
+  if (existingDecadeArtists.length >= 5) {
+    return res.json({ status: "sufficient", count: existingDecadeArtists.length, added: 0 });
+  }
+
+  const needed = 5 - existingDecadeArtists.length;
+  console.log(`[enrich-decade] ${country} ${decade}: have ${existingDecadeArtists.length}, need ${needed} more`);
+
+  decadeEnrichInFlight.add(inflightKey);
+  // Respond immediately so the client does not block
+  res.json({ status: "started", needed });
+
+  // Do the enrichment work asynchronously after responding
+  (async () => {
+    try {
+      const existingNames = pool.map(a => a.name);
+
+      const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 800,
+          system: "You are a world music curator and ethnomusicologist. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+          messages: [{
+            role: "user",
+            content: `Give me ${needed + 3} real artists from ${country} who were most active in the ${decade}.
+
+Artists already in our database (do NOT include these): ${existingNames.join(", ")}
+
+Return exactly this JSON:
+{
+  "artists": [
+    {
+      "name": "Artist Name",
+      "genre": "specific genre",
+      "era": "${decade}",
+      "similarTo": "One well-known international artist name"
+    }
+  ]
+}
+
+Rules:
+- Only artists genuinely from ${country} who were primarily active in the ${decade}
+- era must be exactly "${decade}"
+- Use exact names as they appear on streaming platforms
+- Do not include any artist from the exclusion list above
+- Return between ${needed} and ${needed + 3} artists`,
+          }],
+        }),
+      });
+
+      const aiData = await aiRes.json();
+      const raw = (aiData.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
+      let newArtists;
+      try { newArtists = JSON.parse(raw).artists || []; } catch { return; }
+
+      newArtists = normalizeArtistNames(newArtists);
+
+      // Deduplicate against existing pool
+      const normExisting = new Set(pool.map(a => a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+      newArtists = newArtists.filter(a => !normExisting.has(a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+
+      if (!newArtists.length) {
+        console.log(`[enrich-decade] ${country} ${decade}: no new artists after dedup`);
+        return;
+      }
+
+      // Filter flagged, verify tracks, fetch images — same pipeline as /api/recommend
+      const unflagged = await filterOutFlaggedArtists(newArtists);
+      const verified = await verifyArtistTracksForRecommend(unflagged, country);
+      const verifiedNames = new Set(verified.map(a => a.name));
+      const toAdd = verified.length >= 1 ? verified : unflagged.slice(0, needed);
+      const withVerification = toAdd.map(a => ({ ...a, era: decade, hasVerifiedTracks: verifiedNames.has(a.name) }));
+
+      const imageUrls = await Promise.all(
+        withVerification.map(a => fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null))
+      );
+      const withImages = withVerification.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || undefined }));
+
+      if (!withImages.length) {
+        console.log(`[enrich-decade] ${country} ${decade}: no artists survived verification`);
+        return;
+      }
+
+      // Re-fetch latest cached pool (may have changed since we started)
+      const latestCached = await getCached(cacheKey);
+      const latestPool = latestCached?.artist_pool || pool;
+      const latestNames = new Set(latestPool.map(a => a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+      const trulyNew = withImages.filter(a => !latestNames.has(a.name.toLowerCase().replace(/[^a-z0-9]/g, "")));
+
+      if (!trulyNew.length) {
+        console.log(`[enrich-decade] ${country} ${decade}: all new artists already in pool`);
+        return;
+      }
+
+      const mergedPool = [...latestPool, ...trulyNew].slice(0, 40);
+      await storeCache(cacheKey, "recommend", latestCached?.result ?? cached.result, mergedPool);
+
+      const finalCount = mergedPool.filter(a => a.era && a.era.includes(decadeYear)).length;
+      console.log(`[enrich-decade] ✓ ${country} ${decade}: added ${trulyNew.length}, pool now has ${finalCount} from this decade`);
+
+      backfillDeezerForArtists(trulyNew.map(a => a.name)).catch(() => {});
+    } catch (err) {
+      console.error(`[enrich-decade] error ${country} ${decade}:`, err.message);
+    } finally {
+      decadeEnrichInFlight.delete(inflightKey);
+    }
+  })();
+});
+
 // Shared: given a pool of { title, artist } tracks from a real data source,
 // ask Claude to label the genre and pick the best, then verify on streaming.
 // Returns { genre, tracks, source } or null if not enough land on streaming.
