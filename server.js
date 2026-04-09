@@ -1500,6 +1500,17 @@ function yearToDecade(year) {
   return `${Math.floor(y / 10) * 10}s`;
 }
 function decadeIndex(decade) { return DECADES_LIST.indexOf(decade); }
+function normalizeDecade(decade) {
+  if (!decade) return null;
+  const clean = String(decade).trim();
+  if (DECADES_LIST.includes(clean)) return clean;
+  const yearMatch = clean.match(/\b(19|20)\d0s\b/);
+  return yearMatch && DECADES_LIST.includes(yearMatch[0]) ? yearMatch[0] : null;
+}
+function nextDecade(decade) {
+  const idx = decadeIndex(normalizeDecade(decade));
+  return idx >= 0 && idx < DECADES_LIST.length - 1 ? DECADES_LIST[idx + 1] : null;
+}
 
 // Patch streamingFloor in-place without touching other cache fields (preserves expires_at, cached_at, etc.)
 async function patchStreamingFloor(country, floor) {
@@ -1537,6 +1548,21 @@ async function maybeImproveStreamingFloor(country, tracks) {
       .eq("cache_key", cacheKey);
     console.log(`[streaming-floor] ${country}: floor improved ${data.result.streamingFloor} → ${improved}`);
   }
+}
+
+async function maybeRaiseStreamingFloorAfterEmptyDecade(country, attemptedDecade, currentFloor, existingCount, addedCount) {
+  const normalizedAttempt = normalizeDecade(attemptedDecade);
+  const normalizedFloor = normalizeDecade(currentFloor);
+  if (!country || !normalizedAttempt || !normalizedFloor) return false;
+  if (existingCount > 0 || addedCount > 0) return false;
+  if (normalizedAttempt !== normalizedFloor) return false;
+
+  const bumped = nextDecade(normalizedFloor);
+  if (!bumped || bumped === normalizedFloor) return false;
+
+  await patchStreamingFloor(country, bumped);
+  console.log(`[enrich-decade] ${country} ${normalizedAttempt}: no viable artists found, raised streaming floor → ${bumped}`);
+  return true;
 }
 
 // Reverse map: ISO-2 → canonical country name (built once from COUNTRY_ISO)
@@ -2220,6 +2246,7 @@ app.post("/api/enrich-decade", async (req, res) => {
   // Do the enrichment work asynchronously after responding
   (async () => {
     try {
+      const currentFloor = cached.result?.streamingFloor;
       const existingNames = pool.map(a => a.name);
 
       const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -2274,6 +2301,7 @@ Rules:
 
       if (!newArtists.length) {
         console.log(`[enrich-decade] ${country} ${decade}: no new artists after dedup`);
+        await maybeRaiseStreamingFloorAfterEmptyDecade(country, decade, currentFloor, existingDecadeArtists.length, 0);
         return;
       }
 
@@ -2291,6 +2319,7 @@ Rules:
 
       if (!withImages.length) {
         console.log(`[enrich-decade] ${country} ${decade}: no artists survived verification`);
+        await maybeRaiseStreamingFloorAfterEmptyDecade(country, decade, currentFloor, existingDecadeArtists.length, 0);
         return;
       }
 
@@ -2302,6 +2331,7 @@ Rules:
 
       if (!trulyNew.length) {
         console.log(`[enrich-decade] ${country} ${decade}: all new artists already in pool`);
+        await maybeRaiseStreamingFloorAfterEmptyDecade(country, decade, currentFloor, existingDecadeArtists.length, 0);
         return;
       }
 
@@ -4519,6 +4549,34 @@ function normalizeArtistNames(artists) {
   return artists.map(a => ({ ...a, name: a.name.trim() }));
 }
 
+function normalizeArtistKey(name) {
+  return (name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function mergeArtistPools(existingPool = [], incomingPool = [], limit = 40) {
+  const merged = new Map();
+
+  for (const artist of existingPool) {
+    if (!artist?.name) continue;
+    merged.set(normalizeArtistKey(artist.name), { ...artist });
+  }
+
+  for (const artist of incomingPool) {
+    if (!artist?.name) continue;
+    const key = normalizeArtistKey(artist.name);
+    const previous = merged.get(key) || {};
+    merged.set(key, {
+      ...previous,
+      ...artist,
+      imageUrl: artist.imageUrl || previous.imageUrl,
+      knownTracks: artist.knownTracks?.length ? artist.knownTracks : previous.knownTracks,
+      hasVerifiedTracks: previous.hasVerifiedTracks || artist.hasVerifiedTracks || false,
+    });
+  }
+
+  return [...merged.values()].slice(0, limit);
+}
+
 // Allow 1-character difference for names of similar length — handles transliteration
 // variants like "Beqele" vs "Bekele" (Amharic q/k) without risking false positives.
 function fuzzyArtistMatch(a, b) {
@@ -5265,6 +5323,22 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     return [];
   }
 
+  const verifiedAnnotated = await verifyArtistMetadata(annotated, country, apiKey);
+  const annotatedToRemove = new Set(verifiedAnnotated.misattributed.map(a => a.name.toLowerCase()));
+  annotated = annotated
+    .filter(a => !annotatedToRemove.has(a.name.toLowerCase()))
+    .map(a => {
+      const correctedEra = verifiedAnnotated.eraCorrections.get(a.name.toLowerCase());
+      return correctedEra && correctedEra !== a.era ? { ...a, era: correctedEra } : a;
+    });
+  if (verifiedAnnotated.eraCorrections.size > 0) {
+    console.log(`[pool-grow] ${country}: corrected ${verifiedAnnotated.eraCorrections.size} era tag(s) in candidate batch`);
+  }
+  if (!annotated.length) {
+    console.log(`[pool-grow] ${country}: no verified candidates remained after metadata check`);
+    return [];
+  }
+
   // Verify each annotated artist has playable tracks before adding to pool
   const added = [];
   for (const artist of annotated) {
@@ -5299,12 +5373,15 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
   return added;
 }
 
-// Audits the existing artist_pool for a country, identifying misattributed artists.
-// Moves them to their real country's pool, then returns their lowercased names for removal.
-async function auditCountryPool(artistPool, country, apiKey) {
-  if (!artistPool?.length) return [];
-  const names = artistPool.map(a => a.name);
-  console.log(`[pool-audit] ${country}: auditing ${names.length} artists…`);
+async function verifyArtistMetadata(artists, country, apiKey) {
+  if (!artists?.length) return { misattributed: [], eraCorrections: new Map() };
+
+  const artistsBlock = artists
+    .map(a => {
+      const era = normalizeDecade(a.era) || "unknown";
+      return `- ${a.name} | currentEra=${era}`;
+    })
+    .join("\n");
 
   let result;
   try {
@@ -5313,49 +5390,79 @@ async function auditCountryPool(artistPool, country, apiKey) {
       headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 800,
-        system: "You are a music geography expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+        max_tokens: 1200,
+        system: "You are a music geography and music history expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
         messages: [{
           role: "user",
-          content: `These artists are stored in a music database for "${country}".
+          content: `These artists are currently stored for "${country}".
 
-Check each artist and identify any who are clearly misattributed to ${country}.
+For each artist, verify two things:
+1. Are they genuinely from ${country}?
+2. If they are from ${country}, is their currentEra the correct decade they are MOST associated with or most active in?
 
-Artists to check: ${names.join(", ")}
+Artists to verify:
+${artistsBlock}
 
 Rules:
-- Only flag an artist if they were BORN IN and PRIMARILY ASSOCIATED WITH a different country.
-- Diaspora artists, dual-heritage artists, or artists who spent part of their career abroad but are rooted in ${country}'s music tradition should NOT be flagged — keep them.
-- Artists who moved to another country but whose musical identity and output is still tied to ${country} should NOT be flagged.
-- Soviet-era artists born in a Soviet republic should be attributed to that republic (e.g. an artist born in Baku belongs to Azerbaijan, not the USSR or Russia), even if they had a USSR-wide career.
-- Only flag clear-cut cases (e.g. a Canadian band appearing in a French database). When in doubt, omit.
-
-For artists you are flagging, provide their actual country as a plain English country name only — no explanations, parentheses, or qualifiers.
+- Only mark an artist as misattributed if they are clearly born in or primarily associated with a different country.
+- Diaspora artists, dual-heritage artists, or artists whose musical identity remains rooted in ${country} should stay.
+- Soviet-era artists belong to their birth republic, not USSR/Russia, unless they are clearly rooted elsewhere.
+- For era corrections, only return a correction when the currentEra is clearly wrong.
+- era must be exactly one of: ${DECADES_LIST.join(", ")}.
+- Do not guess. If uncertain, omit the artist from both arrays.
 
 Return JSON:
 {
   "misattributed": [
-    { "name": "Exact Artist Name As Listed Above", "actualCountry": "Country Name" }
+    { "name": "Exact Artist Name", "actualCountry": "Country Name" }
+  ],
+  "eraCorrections": [
+    { "name": "Exact Artist Name", "era": "1970s" }
   ]
-}
-
-If all artists are correctly attributed to ${country}, return: { "misattributed": [] }`
+}`
         }],
       }),
     });
     const data = await res.json();
-    if (data.error) { console.error(`[pool-audit] Claude error: ${data.error.message}`); return []; }
-    const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
+    if (data.error) {
+      console.error(`[artist-verify] Claude error for ${country}: ${data.error.message}`);
+      return { misattributed: [], eraCorrections: new Map() };
+    }
+    const raw = (data.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
     result = JSON.parse(raw);
   } catch (err) {
-    console.error(`[pool-audit] ${country}: failed —`, err.message);
-    return [];
+    console.error(`[artist-verify] ${country}: failed —`, err.message);
+    return { misattributed: [], eraCorrections: new Map() };
   }
 
-  const misattributed = result.misattributed || [];
+  const misattributed = (result.misattributed || []).filter(a => a?.name && a?.actualCountry);
+  const eraCorrections = new Map();
+  for (const correction of (result.eraCorrections || [])) {
+    const era = normalizeDecade(correction?.era);
+    if (correction?.name && era) eraCorrections.set(correction.name.toLowerCase(), era);
+  }
+  return { misattributed, eraCorrections };
+}
+
+// Audits the existing artist_pool for a country, identifying misattributed artists
+// and correcting any clearly wrong era tags in place.
+async function auditCountryPool(artistPool, country, apiKey) {
+  if (!artistPool?.length) return { removedNames: [], correctedPool: artistPool, changed: false };
+  const names = artistPool.map(a => a.name);
+  console.log(`[pool-audit] ${country}: auditing ${names.length} artists…`);
+
+  const { misattributed, eraCorrections } = await verifyArtistMetadata(artistPool, country, apiKey);
   if (!misattributed.length) {
-    console.log(`[pool-audit] ${country}: all artists verified ✓`);
-    return [];
+    if (eraCorrections.size === 0) {
+      console.log(`[pool-audit] ${country}: artists and eras verified ✓`);
+      return { removedNames: [], correctedPool: artistPool, changed: false };
+    }
+    const correctedPool = artistPool.map(artist => {
+      const correctedEra = eraCorrections.get(artist.name.toLowerCase());
+      return correctedEra && correctedEra !== artist.era ? { ...artist, era: correctedEra } : artist;
+    });
+    console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
+    return { removedNames: [], correctedPool, changed: true };
   }
 
   console.log(`[pool-audit] ${country}: ${misattributed.length} misattributed — ${misattributed.map(m => `${m.name} → ${m.actualCountry}`).join(", ")}`);
@@ -5378,14 +5485,27 @@ If all artists are correctly attributed to ${country}, return: { "misattributed"
 
     const alreadyPresent = targetCache.artist_pool.some(a => a.name.toLowerCase() === name.toLowerCase());
     if (!alreadyPresent) {
-      await storeCache(targetKey, "recommend", targetCache.result, [...targetCache.artist_pool, { ...artist }]);
+      const correctedEra = eraCorrections.get(name.toLowerCase());
+      await storeCache(targetKey, "recommend", targetCache.result, [...targetCache.artist_pool, { ...artist, ...(correctedEra ? { era: correctedEra } : {}) }]);
       console.log(`  [pool-audit] ✓ moved ${name} → ${actualCountry}`);
     } else {
       console.log(`  [pool-audit] ${name} already in ${actualCountry} pool — just removing from ${country}`);
     }
   }
 
-  return misattributed.map(m => m.name.toLowerCase());
+  const removedNames = misattributed.map(m => m.name.toLowerCase());
+  const correctedPool = artistPool
+    .filter(artist => !removedNames.includes(artist.name.toLowerCase()))
+    .map(artist => {
+      const correctedEra = eraCorrections.get(artist.name.toLowerCase());
+      return correctedEra && correctedEra !== artist.era ? { ...artist, era: correctedEra } : artist;
+    });
+
+  if (eraCorrections.size > 0) {
+    console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
+  }
+
+  return { removedNames, correctedPool, changed: removedNames.length > 0 || eraCorrections.size > 0 };
 }
 
 async function deepEnrichCountry(country, apiKey) {
@@ -5395,12 +5515,15 @@ async function deepEnrichCountry(country, apiKey) {
   // Step 0: Audit existing pool — remove misattributed artists and move them to the right country
   const cacheKey = makeCacheKey(["recommend", country]);
   const existingCache = await getCached(cacheKey);
+  let currentPool = existingCache?.artist_pool || [];
   if (existingCache?.artist_pool?.length) {
-    const toRemove = await auditCountryPool(existingCache.artist_pool, country, apiKey);
-    if (toRemove.length) {
-      const cleanedPool = existingCache.artist_pool.filter(a => !toRemove.includes(a.name.toLowerCase()));
-      await storeCache(cacheKey, "recommend", existingCache.result, cleanedPool);
-      console.log(`[pool-audit] ${country}: removed ${toRemove.length} artist(s) from pool`);
+    const audit = await auditCountryPool(existingCache.artist_pool, country, apiKey);
+    if (audit.changed) {
+      await storeCache(cacheKey, "recommend", existingCache.result, audit.correctedPool);
+      currentPool = audit.correctedPool;
+      if (audit.removedNames.length) {
+        console.log(`[pool-audit] ${country}: removed ${audit.removedNames.length} artist(s) from pool`);
+      }
     }
   }
 
@@ -5462,6 +5585,20 @@ Also include:
     throw parseErr;
   }
   research.artists = normalizeArtistNames(research.artists);
+  const verifiedResearch = await verifyArtistMetadata(research.artists, country, apiKey);
+  const researchRemovals = new Set(verifiedResearch.misattributed.map(a => a.name.toLowerCase()));
+  research.artists = research.artists
+    .filter(a => !researchRemovals.has(a.name.toLowerCase()))
+    .map(a => {
+      const correctedEra = verifiedResearch.eraCorrections.get(a.name.toLowerCase());
+      return correctedEra && correctedEra !== a.era ? { ...a, era: correctedEra } : a;
+    });
+  if (verifiedResearch.misattributed.length > 0) {
+    console.log(`[country-enrich] ${country}: removed ${verifiedResearch.misattributed.length} misattributed artist(s) from fresh research`);
+  }
+  if (verifiedResearch.eraCorrections.size > 0) {
+    console.log(`[country-enrich] ${country}: corrected ${verifiedResearch.eraCorrections.size} era tag(s) from fresh research`);
+  }
 
   console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
 
@@ -5496,17 +5633,20 @@ Also include:
 
   // Step 2: Fetch image URLs for all artists (preserve any already cached)
   const existingImageMap = {};
-  for (const a of (existingCache?.artist_pool || [])) {
+  for (const a of currentPool) {
     if (a.name && a.imageUrl) existingImageMap[a.name.toLowerCase()] = a.imageUrl;
   }
 
-  const artistsWithImages = await Promise.all(research.artists.map(async (a) => {
+  const researchArtistsWithImages = await Promise.all(research.artists.map(async (a) => {
     const existing = existingImageMap[a.name.toLowerCase()];
     if (existing) return { ...a, imageUrl: existing };
     const imageUrl = await fetchArtistImageUrl(a.name, { genre: a.genre }).catch(() => null);
     return imageUrl ? { ...a, imageUrl } : a;
   }));
-  console.log(`[country-enrich] ${country}: fetched images for ${artistsWithImages.filter(a => a.imageUrl).length}/${artistsWithImages.length} artists`);
+  console.log(`[country-enrich] ${country}: fetched images for ${researchArtistsWithImages.filter(a => a.imageUrl).length}/${researchArtistsWithImages.length} artists`);
+
+  const artistsWithImages = mergeArtistPools(currentPool, researchArtistsWithImages);
+  console.log(`[country-enrich] ${country}: merged pool base ${currentPool.length} + fresh ${researchArtistsWithImages.length} → ${artistsWithImages.length}`);
 
   await storeCache(cacheKey, "recommend",
     { genres: research.genres, didYouKnow: research.didYouKnow, streamingFloor },
