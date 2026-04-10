@@ -66,6 +66,62 @@ async function getClientAccessToken() {
   return tokenFetchInFlight;
 }
 
+function extractBalancedJsonBlock(text) {
+  if (!text) return "";
+  const cleaned = String(text).replace(/```json|```/gi, "").trim();
+  const start = cleaned.search(/[\[{]/);
+  if (start === -1) return cleaned;
+
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{" || ch === "[") {
+      stack.push(ch);
+      continue;
+    }
+
+    if (ch === "}" || ch === "]") {
+      const expected = ch === "}" ? "{" : "[";
+      if (stack[stack.length - 1] !== expected) break;
+      stack.pop();
+      if (stack.length === 0) return cleaned.slice(start, i + 1);
+    }
+  }
+
+  return cleaned;
+}
+
+function parseClaudeJson(text, label = "Claude response") {
+  const candidate = extractBalancedJsonBlock(text);
+  try {
+    return JSON.parse(candidate);
+  } catch (err) {
+    const preview = String(text || "").replace(/\s+/g, " ").trim().slice(0, 240);
+    err.message = `${err.message} [${label}] Raw: ${preview}`;
+    throw err;
+  }
+}
+
 // ── Artist image URL fetching (Spotify → Apple Music → Last.fm fallback) ──
 // Priority: Apple Music → Last.fm → Spotify (last resort, dev-mode quota is precious).
 // Spotify is only tried if not currently rate-limited and skipSpotify is false.
@@ -533,7 +589,7 @@ const CACHE_TTL = {
   'recommend':          30  * 24 * 60 * 60 * 1000,
   'genre-spotlight':    180 * 24 * 60 * 60 * 1000,
   'genre-deeper':       180 * 24 * 60 * 60 * 1000,
-  'time-machine':       14  * 24 * 60 * 60 * 1000,
+  'time-machine': 14 * 24 * 60 * 60 * 1000,
   'artist-tracks':      90  * 24 * 60 * 60 * 1000,
   'artist-tracks-apple':90  * 24 * 60 * 60 * 1000,
   'artist-meta':        180 * 24 * 60 * 60 * 1000,
@@ -1256,7 +1312,7 @@ function artistNamesMatch(expected, actual) {
 
 // ── Discogs helpers ──────────────────────────────────────
 const DISCOGS_BASE = "https://api.discogs.com";
-const DISCOGS_UA   = "MusicalPassport/1.0 (contact@musicalpassport.app)";
+const DISCOGS_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 
 // Some country names differ between our app and Discogs
 const DISCOGS_COUNTRY_NAME = {
@@ -1362,37 +1418,117 @@ const MB_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 // Rate-limit queue: MusicBrainz allows 1 req/sec. Keep one global queue for all
 // user/background work so requests never hit MB concurrently.
 const MB_TIMEOUT_MS = 7000;
+const MB_REQUEST_GAP_MS = 1100;
+const MB_MAX_RETRIES = 2;
+const MB_RETRY_BASE_MS = 2500;
+const MB_MAX_RETRY_AFTER_MS = 10000;
 const mbQueue = [];
 let mbBusy = false;
+
+async function logMbHttpIssue(url, response, elapsedMs) {
+  const headers = {
+    retryAfter: response.headers.get("retry-after") || null,
+    contentType: response.headers.get("content-type") || null,
+    server: response.headers.get("server") || null,
+  };
+
+  let bodySnippet = "";
+  try {
+    bodySnippet = (await response.clone().text()).replace(/\s+/g, " ").trim().slice(0, 240);
+  } catch {
+    bodySnippet = "";
+  }
+
+  const details = [
+    `status=${response.status}`,
+    response.statusText ? `statusText=${JSON.stringify(response.statusText)}` : null,
+    `elapsedMs=${elapsedMs}`,
+    headers.retryAfter ? `retryAfter=${headers.retryAfter}` : null,
+    headers.contentType ? `contentType=${JSON.stringify(headers.contentType)}` : null,
+    headers.server ? `server=${JSON.stringify(headers.server)}` : null,
+  ].filter(Boolean).join(" ");
+
+  console.warn(`[MB] HTTP issue: ${url} ${details}`);
+  if (bodySnippet) console.warn(`[MB] Response body: ${bodySnippet}`);
+  if (response.status === 503) {
+    console.warn("[MB] 503 from MusicBrainz. Per MB docs, throttling/load shedding is returned as 503 Service Unavailable.");
+  }
+}
+
 function mbFetch(url) {
   return new Promise((resolve, reject) => {
     mbQueue.push({ url, resolve, reject });
     if (!mbBusy) drainMbQueue();
   });
 }
+
+function parseRetryAfterMs(value) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(value);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - Date.now());
+}
+
 async function drainMbQueue() {
   mbBusy = true;
   while (mbQueue.length > 0) {
     const { url, resolve, reject } = mbQueue.shift();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), MB_TIMEOUT_MS);
     try {
-      const r = await fetch(url, {
-        headers: { "User-Agent": MB_UA, Accept: "application/json" },
-        signal: controller.signal,
-      });
-      resolve(r);
-    } catch (e) {
-      if (e.name === "AbortError") {
-        console.warn(`[MB] Request timed out: ${url}`);
-        resolve({ ok: false, status: 408 }); // resolve (not reject) so callers degrade gracefully
-      } else {
-        reject(e);
+      let finalResponse = null;
+      for (let attempt = 0; attempt <= MB_MAX_RETRIES; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), MB_TIMEOUT_MS);
+        const startedAt = Date.now();
+        try {
+          const r = await fetch(url, {
+            headers: { "User-Agent": MB_UA, Accept: "application/json" },
+            signal: controller.signal,
+          });
+          const elapsedMs = Date.now() - startedAt;
+          if (!r.ok) await logMbHttpIssue(url, r, elapsedMs);
+          if (r.ok || !isMbTransientStatus(r.status) || attempt === MB_MAX_RETRIES) {
+            finalResponse = r;
+            break;
+          }
+
+          const retryAfterMs = parseRetryAfterMs(r.headers.get("retry-after"));
+          const backoffMs = Math.min(
+            retryAfterMs ?? MB_RETRY_BASE_MS * (attempt + 1),
+            MB_MAX_RETRY_AFTER_MS
+          );
+          console.warn(
+            `[MB] Retrying after transient HTTP ${r.status} in ${backoffMs}ms (attempt ${attempt + 1}/${MB_MAX_RETRIES}): ${url}`
+          );
+          await new Promise(r => setTimeout(r, Math.max(backoffMs, MB_REQUEST_GAP_MS)));
+          continue;
+        } catch (e) {
+          if (e.name === "AbortError") {
+            const elapsedMs = Date.now() - startedAt;
+            console.warn(
+              `[MB] Request timed out after ${elapsedMs}ms (timeout=${MB_TIMEOUT_MS}ms, queued=${mbQueue.length}, attempt=${attempt + 1}/${MB_MAX_RETRIES + 1}): ${url}`
+            );
+            if (attempt === MB_MAX_RETRIES) {
+              finalResponse = { ok: false, status: 408 };
+              break;
+            }
+            const backoffMs = MB_RETRY_BASE_MS * (attempt + 1);
+            console.warn(`[MB] Retrying after timeout in ${backoffMs}ms: ${url}`);
+            await new Promise(r => setTimeout(r, Math.max(backoffMs, MB_REQUEST_GAP_MS)));
+            continue;
+          }
+          throw e;
+        } finally {
+          clearTimeout(timer);
+        }
       }
-    } finally {
-      clearTimeout(timer);
+
+      resolve(finalResponse ?? { ok: false, status: 520 });
+    } catch (e) {
+      reject(e);
     }
-    if (mbQueue.length > 0) await new Promise(r => setTimeout(r, 1100));
+    if (mbQueue.length > 0) await new Promise(r => setTimeout(r, MB_REQUEST_GAP_MS));
   }
   mbBusy = false;
 }
@@ -5570,8 +5706,9 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     });
     const d = await res.json();
     if (!d.error) {
-      const raw = (d.content[0].text || "").replace(/```json|```/g, "").trim();
-      annotated = await applyArtistEvidence(JSON.parse(raw).artists || []);
+      annotated = await applyArtistEvidence(
+        parseClaudeJson(d.content?.[0]?.text || "", `pool-grow ${country}`).artists || []
+      );
     }
   } catch (err) {
     console.error(`[pool-grow] ${country}: annotation failed —`, err.message);
@@ -5697,8 +5834,7 @@ Return JSON:
       console.error(`[artist-verify] Claude error for ${country}: ${data.error.message}`);
       return { misattributed: [], eraCorrections: new Map() };
     }
-    const raw = (data.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
-    result = JSON.parse(raw);
+    result = parseClaudeJson(data.content?.[0]?.text || "", `artist-verify ${country}`);
   } catch (err) {
     console.error(`[artist-verify] ${country}: failed —`, err.message);
     return { misattributed: [], eraCorrections: new Map() };

@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Support — Musical Passport</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Playfair+Display:ital,wght@0,600;1,500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0e0e0e;
+      --surface: #161616;
+      --surface2: #1e1e1e;
+      --border: #2a2a2a;
+      --border2: #383838;
+      --text: #e8e6e0;
+      --text2: #8a8a8a;
+      --text3: #555;
+      --gold: #c9a84c;
+      --gold-bg: #c9a84c18;
+      --gold-border: #c9a84c44;
+      --blue: #4a9eff;
+      --blue-bg: #4a9eff18;
+      --blue-border: #4a9eff44;
+      --red: #f06565;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    a { color: var(--gold); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Layout ── */
+    .page {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 48px 24px 96px;
+    }
+
+    /* ── Header ── */
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 64px;
+    }
+    .nav-logo {
+      font-family: 'Playfair Display', serif;
+      font-size: 18px;
+      color: var(--gold);
+      letter-spacing: 0.3px;
+    }
+    .nav-sep { color: var(--text3); }
+    .nav-page { color: var(--text2); font-size: 15px; }
+
+    .hero { margin-bottom: 56px; }
+    .hero h1 {
+      font-family: 'Playfair Display', serif;
+      font-size: clamp(32px, 6vw, 48px);
+      font-weight: 600;
+      line-height: 1.15;
+      margin-bottom: 14px;
+    }
+    .hero p {
+      color: var(--text2);
+      font-size: 16px;
+      max-width: 520px;
+    }
+
+    /* ── Contact card ── */
+    .contact-card {
+      background: var(--gold-bg);
+      border: 1px solid var(--gold-border);
+      border-radius: 16px;
+      padding: 28px 32px;
+      margin-bottom: 56px;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .contact-icon {
+      font-size: 32px;
+      flex-shrink: 0;
+    }
+    .contact-body h2 {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--gold);
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+    .contact-body p { color: var(--text2); font-size: 14px; margin-bottom: 10px; }
+    .contact-email {
+      display: inline-block;
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .contact-email:hover { border-color: var(--gold); text-decoration: none; }
+
+    /* ── FAQ ── */
+    .section-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text3);
+      margin-bottom: 20px;
+    }
+
+    .faq { display: flex; flex-direction: column; gap: 2px; margin-bottom: 56px; }
+
+    details {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      transition: border-color 0.15s;
+    }
+    details[open] { border-color: var(--border2); }
+    details + details { border-top-left-radius: 4px; border-top-right-radius: 4px; }
+
+    summary {
+      list-style: none;
+      padding: 18px 20px;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      user-select: none;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::after {
+      content: '+';
+      font-size: 20px;
+      font-weight: 300;
+      color: var(--text3);
+      flex-shrink: 0;
+      transition: transform 0.2s;
+    }
+    details[open] summary::after {
+      transform: rotate(45deg);
+      color: var(--gold);
+    }
+
+    .faq-body {
+      padding: 0 20px 20px;
+      color: var(--text2);
+      font-size: 14px;
+      line-height: 1.7;
+      border-top: 1px solid var(--border);
+      padding-top: 16px;
+    }
+    .faq-body p + p { margin-top: 10px; }
+
+    /* ── Footer ── */
+    .footer {
+      border-top: 1px solid var(--border);
+      padding-top: 32px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .footer-copy { color: var(--text3); font-size: 13px; }
+    .footer-links { display: flex; gap: 20px; }
+    .footer-links a { color: var(--text2); font-size: 13px; }
+    .footer-links a:hover { color: var(--text); }
+
+    @media (max-width: 480px) {
+      .contact-card { flex-direction: column; align-items: flex-start; }
+      .footer { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+
+    <nav class="nav">
+      <span class="nav-logo">Musical Passport</span>
+      <span class="nav-sep">/</span>
+      <span class="nav-page">Support</span>
+    </nav>
+
+    <div class="hero">
+      <h1>How can we help?</h1>
+      <p>Questions about the app, missing features, or something not working? We're here.</p>
+    </div>
+
+    <div class="contact-card">
+      <div class="contact-icon">✉️</div>
+      <div class="contact-body">
+        <h2>Contact Us</h2>
+        <p>We typically respond within 1–2 business days.</p>
+        <a href="mailto:musicalpassportapp@gmail.com" class="contact-email">musicalpassportapp@gmail.com</a>
+      </div>
+    </div>
+
+    <p class="section-label">Frequently Asked Questions</p>
+
+    <div class="faq">
+
+      <details>
+        <summary>What is Musical Passport?</summary>
+        <div class="faq-body">
+          <p>Musical Passport is a music discovery app that helps you explore music from countries around the world. Pick any country, and we'll surface artists and tracks you probably haven't heard before — verified on streaming platforms and enriched with cultural context.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Which streaming services are supported?</summary>
+        <div class="faq-body">
+          <p>Musical Passport supports Apple Music, Spotify, and Deezer. You can open any track directly in your preferred streaming app. Preview clips are also available for many tracks within the app itself.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>How do I save songs I like?</summary>
+        <div class="faq-body">
+          <p>Tap the heart icon on any track to save it to your Liked Songs. You can view all your saved tracks by tapping the heart button in the floating navigation bar. To unlike a song, swipe right on it in your Liked Songs list.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Why can't I find a track on my streaming service?</summary>
+        <div class="faq-body">
+          <p>Streaming availability varies by country and catalog licensing. Some tracks — especially from smaller regions or older recordings — may be on one platform but not another. Try tapping the three-dot menu on a track and choosing a different service.</p>
+          <p>If a track is consistently missing or incorrectly matched, please email us and we'll look into it.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>How does the Genre Spotlight work?</summary>
+        <div class="faq-body">
+          <p>Tapping a genre tag on any artist opens the Genre Spotlight — a curated view of artists and tracks representing that genre from the same country. It's a great way to go deeper into a sound you've discovered.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>What is the Passport / Insights screen?</summary>
+        <div class="faq-body">
+          <p>Your Passport tracks every country you've explored. The Insights screen shows your listening history as a world map — countries you've visited light up, and you can see stats about your musical journey over time.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>A track or artist seems wrong for that country. How do I report it?</summary>
+        <div class="faq-body">
+          <p>Tap the three-dot (…) menu next to any track, then select <strong>Flag for Review</strong> (available to beta testers). Alternatively, email us at <a href="mailto:musicalpassportapp@gmail.com">musicalpassportapp@gmail.com</a> with the artist name, track title, and country — we'll investigate and fix it promptly.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>My data or saved songs disappeared. What happened?</summary>
+        <div class="faq-body">
+          <p>Liked songs and passport stamps are stored locally on your device. If you reinstall the app or switch devices, this data will not transfer automatically. We're working on cloud sync for a future update. If something disappeared unexpectedly without a reinstall, please contact us.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>How do I delete my data?</summary>
+        <div class="faq-body">
+          <p>Musical Passport does not create user accounts or store personal data on our servers. All your saved songs and stamps live on your device. To delete everything, simply uninstall the app. For any questions about data, see our <a href="/privacy.html">Privacy Policy</a> or email us.</p>
+        </div>
+      </details>
+
+    </div>
+
+    <footer class="footer">
+      <span class="footer-copy">© 2026 Musical Passport</span>
+      <nav class="footer-links">
+        <a href="/privacy.html">Privacy Policy</a>
+        <a href="mailto:musicalpassportapp@gmail.com">Contact</a>
+      </nav>
+    </footer>
+
+  </div>
+</body>
+</html>
