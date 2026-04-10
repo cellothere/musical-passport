@@ -1461,7 +1461,7 @@ const COUNTRY_ISO = {
   "Armenia":"AM","Australia":"AU","Austria":"AT","Azerbaijan":"AZ",
   // B
   "Bahrain":"BH","Bangladesh":"BD","Barbados":"BB","Belarus":"BY","Belgium":"BE",
-  "Belize":"BZ","Benin":"BJ","Bolivia":"BO","Bosnia":"BA","Botswana":"BW",
+  "Belize":"BZ","Benin":"BJ","Bhutan":"BT","Bolivia":"BO","Bosnia":"BA","Botswana":"BW",
   "Brazil":"BR","Brunei":"BN","Bulgaria":"BG","Burkina Faso":"BF","Burundi":"BI",
   // C
   "Cambodia":"KH","Cameroon":"CM","Canada":"CA","Cape Verde":"CV",
@@ -1469,7 +1469,7 @@ const COUNTRY_ISO = {
   "Colombia":"CO","Comoros":"KM","Congo":"CG","DR Congo":"CD","Costa Rica":"CR",
   "Croatia":"HR","Cuba":"CU","Cyprus":"CY","Czechia":"CZ","Czech Republic":"CZ",
   // D
-  "Denmark":"DK","Djibouti":"DJ","Dominican Republic":"DO",
+  "Denmark":"DK","Djibouti":"DJ","Dominica":"DM","Dominican Republic":"DO",
   // E
   "East Timor":"TL","Ecuador":"EC","Egypt":"EG","El Salvador":"SV",
   "England":"GB","Equatorial Guinea":"GQ","Eritrea":"ER","Estonia":"EE","Eswatini":"SZ",
@@ -1478,7 +1478,7 @@ const COUNTRY_ISO = {
   "Fiji":"FJ","Finland":"FI","France":"FR",
   // G
   "Gabon":"GA","Gambia":"GM","Georgia":"GE","Germany":"DE","Ghana":"GH",
-  "Greece":"GR","Guadeloupe":"GP","Guatemala":"GT","Guinea":"GN",
+  "Greece":"GR","Grenada":"GD","Guadeloupe":"GP","Guatemala":"GT","Guinea":"GN",
   "Guinea-Bissau":"GW","Guyana":"GY",
   // H
   "Haiti":"HT","Honduras":"HN","Hong Kong":"HK","Hungary":"HU",
@@ -1492,19 +1492,19 @@ const COUNTRY_ISO = {
   "Kyrgyzstan":"KG",
   // L
   "Laos":"LA","Latvia":"LV","Lebanon":"LB","Lesotho":"LS","Liberia":"LR",
-  "Libya":"LY","Lithuania":"LT","Luxembourg":"LU",
+  "Libya":"LY","Liechtenstein":"LI","Lithuania":"LT","Luxembourg":"LU",
   // M
-  "Madagascar":"MG","Malawi":"MW","Malaysia":"MY","Mali":"ML","Malta":"MT",
-  "Martinique":"MQ","Mauritania":"MR","Mauritius":"MU","Mexico":"MX",
-  "Moldova":"MD","Mongolia":"MN","Montenegro":"ME","Morocco":"MA","Mozambique":"MZ",
+  "Madagascar":"MG","Malawi":"MW","Malaysia":"MY","Maldives":"MV","Mali":"ML","Malta":"MT",
+  "Marshall Islands":"MH","Martinique":"MQ","Mauritania":"MR","Mauritius":"MU","Mexico":"MX",
+  "Micronesia":"FM","Moldova":"MD","Monaco":"MC","Mongolia":"MN","Montenegro":"ME","Morocco":"MA","Mozambique":"MZ",
   "Myanmar":"MM",
   // N
-  "Namibia":"NA","Nepal":"NP","Netherlands":"NL","New Zealand":"NZ",
-  "Nicaragua":"NI","Niger":"NE","Nigeria":"NG","North Macedonia":"MK","Norway":"NO",
+  "Namibia":"NA","Nauru":"NR","Nepal":"NP","Netherlands":"NL","New Zealand":"NZ",
+  "Nicaragua":"NI","Niger":"NE","Nigeria":"NG","North Korea":"KP","North Macedonia":"MK","Norway":"NO",
   // O
   "Oman":"OM",
   // P
-  "Pakistan":"PK","Palestine":"PS","Panama":"PA","Papua New Guinea":"PG",
+  "Pakistan":"PK","Palau":"PW","Palestine":"PS","Panama":"PA","Papua New Guinea":"PG",
   "Paraguay":"PY","Peru":"PE","Philippines":"PH","Poland":"PL","Portugal":"PT",
   "Puerto Rico":"PR",
   // Q
@@ -1512,19 +1512,19 @@ const COUNTRY_ISO = {
   // R
   "Romania":"RO","Russia":"RU","Rwanda":"RW","Réunion":"RE",
   // S
-  "Samoa":"WS","Saudi Arabia":"SA","Scotland":"GB","Senegal":"SN","Serbia":"RS",
+  "Samoa":"WS","San Marino":"SM","Sao Tome & Principe":"ST","Saudi Arabia":"SA","Scotland":"GB","Senegal":"SN","Serbia":"RS",
   "Seychelles":"SC","Sierra Leone":"SL","Singapore":"SG","Slovakia":"SK",
   "Slovenia":"SI","Solomon Islands":"SB","Somalia":"SO","South Africa":"ZA",
-  "South Korea":"KR","Spain":"ES","Sri Lanka":"LK","Sudan":"SD","Suriname":"SR",
+  "South Korea":"KR","South Sudan":"SS","Spain":"ES","Sri Lanka":"LK","Sudan":"SD","Suriname":"SR",
   "Sweden":"SE","Switzerland":"CH","Syria":"SY",
   // T
   "Taiwan":"TW","Tajikistan":"TJ","Tanzania":"TZ","Thailand":"TH","Togo":"TG",
   "Tonga":"TO","Trinidad & Tobago":"TT","Tunisia":"TN","Turkey":"TR",
-  "Turkmenistan":"TM",
+  "Turkmenistan":"TM","Tuvalu":"TV","Timor-Leste":"TL",
   // U
-  "UAE":"AE","Uganda":"UG","Ukraine":"UA","Uruguay":"UY","USA":"US","Uzbekistan":"UZ",
+  "UAE":"AE","Uganda":"UG","Ukraine":"UA","United Kingdom":"GB","Uruguay":"UY","USA":"US","Uzbekistan":"UZ",
   // V
-  "Vanuatu":"VU","Venezuela":"VE","Vietnam":"VN",
+  "Vanuatu":"VU","Vatican City":"VA","Venezuela":"VE","Vietnam":"VN",
   // W
   "Wales":"GB",
   // Y
@@ -4655,47 +4655,15 @@ async function getOrCreateCountryOfDay(dateStr) {
 // researches and stores tracks so users never hit an empty screen.
 
 const ALL_ENRICHABLE_COUNTRIES = [
-  'Brazil','Japan','Nigeria','Cuba','Ethiopia','Colombia','Jamaica','Iran','Mali',
-  'South Korea','Portugal','Iceland','Greece','Algeria','India','Senegal','Vietnam',
-  'Argentina','Ghana','Turkey','Lebanon','Morocco','Peru','Georgia','Mongolia',
-  'Cambodia','Cape Verde','Trinidad & Tobago','Armenia','Azerbaijan','Laos',
-  'Papua New Guinea','Togo','Benin','Burkina Faso','Niger','Chad','Sudan','Eritrea',
-  'Djibouti','Somalia','Mozambique','Zambia','Malawi','Rwanda','Burundi','Uganda',
-  'Tanzania','Cameroon','Congo','DR Congo','Ivory Coast','Sierra Leone','Guinea',
-  'Guinea-Bissau','Gambia','Mauritania','Liberia','Equatorial Guinea','Gabon',
-  'Central African Republic','Angola','Namibia','Botswana','Zimbabwe','Lesotho',
-  'Eswatini','Madagascar','Comoros','Seychelles','Mauritius','Réunion',
-  'Kazakhstan','Uzbekistan','Turkmenistan','Tajikistan','Kyrgyzstan','Afghanistan',
-  'Pakistan','Bangladesh','Nepal','Sri Lanka','Myanmar','Thailand','Philippines',
-  'Indonesia','Malaysia','Brunei','East Timor','Papua New Guinea',
-  'Fiji','Tonga','Samoa','Vanuatu','Solomon Islands','Kiribati','Palau',
-  'Bolivia','Paraguay','Uruguay','Ecuador','Venezuela','Guyana','Suriname',
-  'Honduras','El Salvador','Guatemala','Nicaragua','Costa Rica','Panama',
-  'Dominican Republic','Haiti','Barbados','Trinidad & Tobago','Martinique','Guadeloupe',
-  'Tunisia','Libya','Egypt','Jordan','Iraq','Syria','Yemen','Oman','Kuwait',
-  'Qatar','Bahrain','UAE','Saudi Arabia','Palestine','Cyprus','Malta',
-  'Albania','Bosnia','North Macedonia','Kosovo','Moldova','Belarus',
-  'Latvia','Lithuania','Estonia','Slovenia','Croatia','Serbia','Montenegro',
-  'Slovakia','Czechia','Hungary','Romania','Bulgaria','Ukraine',
-  'Russia','Finland','Sweden','Norway','Denmark','Poland','Switzerland','Austria',
-  'Belgium','Netherlands','Ireland','England','Scotland','Wales','Spain','Italy','France','Germany',
-  'Luxembourg',
-  // Latin America additions
-  'Chile','Puerto Rico','Belize',
-  // Africa additions
-  'South Africa','Kenya',
-  // Middle East additions
-  'Israel',
-  // Asia additions
-  'China','Taiwan','Singapore','Hong Kong',
-  // Oceania additions
-  'Hawaii',
-  // Historical civilizations
-  'Soviet Union','Yugoslavia','Ottoman Empire','East Germany','Ceylon','Rhodesia','Zaire',
-  'Siam','Byzantine Empire','Prussia','Austro-Hungarian Empire','Ancient Rome','Ancient Greece',
-  'Mesopotamia','Viking Scandinavia','Moorish Spain','Weimar Republic',
-  'Republic of South Vietnam','Meiji Japan',
-  'New Zealand','Australia','Canada','Mexico','USA',
+  ...new Set([
+    ...Object.keys(COUNTRY_ISO),
+    'Hawaii',
+    // Historical civilizations
+    'Soviet Union','Yugoslavia','Ottoman Empire','East Germany','Ceylon','Rhodesia','Zaire',
+    'Siam','Byzantine Empire','Prussia','Austro-Hungarian Empire','Ancient Rome','Ancient Greece',
+    'Mesopotamia','Viking Scandinavia','Moorish Spain','Weimar Republic',
+    'Republic of South Vietnam','Meiji Japan',
+  ]),
 ];
 
 async function findWeakCountries(limit = 2) {
