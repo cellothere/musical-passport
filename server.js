@@ -1418,7 +1418,7 @@ const MB_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 // Rate-limit queue: MusicBrainz allows 1 req/sec. Keep one global queue for all
 // user/background work so requests never hit MB concurrently.
 const MB_TIMEOUT_MS = 7000;
-const MB_REQUEST_GAP_MS = 1100;
+const MB_REQUEST_GAP_MS = 1500;
 const MB_MAX_RETRIES = 2;
 const MB_RETRY_BASE_MS = 2500;
 const MB_MAX_RETRY_AFTER_MS = 10000;
@@ -1498,10 +1498,11 @@ async function drainMbQueue() {
             retryAfterMs ?? MB_RETRY_BASE_MS * (attempt + 1),
             MB_MAX_RETRY_AFTER_MS
           );
+          const actualWaitMs = Math.max(backoffMs, MB_REQUEST_GAP_MS);
           console.warn(
-            `[MB] Retrying after transient HTTP ${r.status} in ${backoffMs}ms (attempt ${attempt + 1}/${MB_MAX_RETRIES}): ${url}`
+            `[MB] Retrying after transient HTTP ${r.status} in ${actualWaitMs}ms (attempt ${attempt + 1}/${MB_MAX_RETRIES}): ${url}`
           );
-          await new Promise(r => setTimeout(r, Math.max(backoffMs, MB_REQUEST_GAP_MS)));
+          await new Promise(r => setTimeout(r, actualWaitMs));
           continue;
         } catch (e) {
           if (e.name === "AbortError") {
@@ -4977,13 +4978,24 @@ function hasStrongArtistEvidence(meta, artist) {
 // variants like "Beqele" vs "Bekele" (Amharic q/k) without risking false positives.
 function fuzzyArtistMatch(a, b) {
   if (a === b) return true;
-  if (Math.abs(a.length - b.length) > 1 || a.length < 7) return false;
-  let diffs = 0;
-  const minLen = Math.min(a.length, b.length);
-  for (let i = 0; i < minLen; i++) {
-    if (a[i] !== b[i] && ++diffs > 1) return false;
+  const lenDiff = Math.abs(a.length - b.length);
+  if (lenDiff > 1 || Math.min(a.length, b.length) < 7) return false;
+  if (lenDiff === 0) {
+    // Same length: allow 1 substitution
+    let diffs = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i] && ++diffs > 1) return false;
+    }
+    return true;
   }
-  return diffs <= 1;
+  // Lengths differ by 1: allow 1 insertion/deletion via subsequence check
+  const [shorter, longer] = a.length < b.length ? [a, b] : [b, a];
+  let si = 0, li = 0, skips = 0;
+  while (si < shorter.length && li < longer.length) {
+    if (shorter[si] === longer[li]) { si++; li++; }
+    else { if (++skips > 1) return false; li++; }
+  }
+  return skips + (longer.length - li) <= 1;
 }
 
 // Storefronts tried in order — covers US, Europe, Middle East, South Asia, East Asia, Latin America.
@@ -5035,10 +5047,11 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
         if (!r.ok) continue;
         const d = await r.json();
         const artists = d.results?.artists?.data || [];
+        const stripParens = s => s.replace(/\s*\([^)]*\)/g, "").trim();
         const matched = artists.find(a => normalise(a.attributes?.name || "") === target)
           ?? artists.find(a => {
-            const n = normalise(a.attributes?.name || "");
-            return n.includes(target) || (n.length >= 6 && target.includes(n)) || fuzzyArtistMatch(n, target);
+            const n = normalise(stripParens(a.attributes?.name || ""));
+            return n === target || n.includes(target) || (n.length >= 6 && target.includes(n)) || fuzzyArtistMatch(n, target);
           });
 
         if (matched) {
@@ -5082,7 +5095,8 @@ async function proactiveArtistTracks(artistName, knownTracks = [], appleToken) {
             embedUrl: match.attributes.url.replace("music.apple.com", "embed.music.apple.com"),
           });
         }
-        if (results.length > 0) return results;
+        const deduped = [...new Map(results.map(t => [t.appleId, t])).values()];
+        if (deduped.length > 0) return deduped;
       }
     } catch { /* fall through to Deezer */ }
   }
@@ -5587,7 +5601,7 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
           );
           if (match) results.push({ title: match.name, spotifyId: match.id, previewUrl: match.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${match.id}` });
         }
-        return results;
+        return [...new Map(results.map(t => [t.spotifyId, t])).values()];
       })();
     }
 
@@ -5720,13 +5734,31 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     return [];
   }
 
+  // Re-filter after annotation — applyArtistEvidence can canonicalize names to match
+  // artists already in the pool, or Haiku may return names not in the candidate list.
+  const preVerifyCount = annotated.length;
+  annotated = annotated.filter(a => !currentNames.has(normName(a.name)));
+  if (annotated.length < preVerifyCount) {
+    console.log(`[pool-grow] ${country}: dropped ${preVerifyCount - annotated.length} post-annotation duplicate(s) already in pool`);
+  }
+  if (!annotated.length) return [];
+
   const verifiedAnnotated = await verifyArtistMetadata(annotated, country, apiKey);
   const annotatedToRemove = new Set(verifiedAnnotated.misattributed.map(a => a.name.toLowerCase()));
+  if (verifiedAnnotated.misattributed.length > 0) {
+    for (const m of verifiedAnnotated.misattributed) {
+      console.log(`  [pool-grow] removed candidate ${m.name} → actually from ${m.actualCountry}`);
+    }
+  }
   annotated = annotated
     .filter(a => !annotatedToRemove.has(a.name.toLowerCase()))
     .map(a => {
       const correctedEra = verifiedAnnotated.eraCorrections.get(a.name.toLowerCase());
-      return correctedEra && correctedEra !== a.era ? { ...a, era: correctedEra } : a;
+      if (correctedEra && correctedEra !== a.era) {
+        console.log(`  [pool-grow] era fix: ${a.name} ${a.era} → ${correctedEra}`);
+        return { ...a, era: correctedEra };
+      }
+      return a;
     });
   if (verifiedAnnotated.eraCorrections.size > 0) {
     console.log(`[pool-grow] ${country}: corrected ${verifiedAnnotated.eraCorrections.size} era tag(s) in candidate batch`);
@@ -5745,7 +5777,9 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     const existing = await getCached(ck);
     let tracks = existing?.result?.tracks || [];
 
-    if (!tracks.length) {
+    if (tracks.length) {
+      console.log(`  [pool-grow] ↩ ${artist.name} → ${tracks.length} tracks (cached)`);
+    } else {
       const lfTitles = await lastfmArtistTopTracks(artist.name, 5);
       tracks = await proactiveArtistTracks(artist.name, lfTitles, appleToken);
       if (tracks.length) {
@@ -5880,7 +5914,11 @@ async function auditCountryPool(artistPool, country, apiKey) {
     }
     const correctedPool = artistPool.map(artist => {
       const correctedEra = eraCorrections.get(artist.name.toLowerCase());
-      return correctedEra && correctedEra !== artist.era ? { ...artist, era: correctedEra } : artist;
+      if (correctedEra && correctedEra !== artist.era) {
+        console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${correctedEra}`);
+        return { ...artist, era: correctedEra };
+      }
+      return artist;
     });
     console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
     return { removedNames: [], correctedPool, changed: true };
@@ -5920,7 +5958,11 @@ async function auditCountryPool(artistPool, country, apiKey) {
     .filter(artist => !removedNames.includes(artist.name.toLowerCase()))
     .map(artist => {
       const correctedEra = eraCorrections.get(artist.name.toLowerCase());
-      return correctedEra && correctedEra !== artist.era ? { ...artist, era: correctedEra } : artist;
+      if (correctedEra && correctedEra !== artist.era) {
+        console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${correctedEra}`);
+        return { ...artist, era: correctedEra };
+      }
+      return artist;
     });
 
   if (eraCorrections.size > 0) {
@@ -6013,16 +6055,26 @@ Also include:
     .filter(a => !researchRemovals.has(a.name.toLowerCase()))
     .map(a => {
       const correctedEra = verifiedResearch.eraCorrections.get(a.name.toLowerCase());
-      return correctedEra && correctedEra !== a.era ? { ...a, era: correctedEra } : a;
+      if (correctedEra && correctedEra !== a.era) {
+        console.log(`  [country-enrich] era fix: ${a.name} ${a.era} → ${correctedEra}`);
+        return { ...a, era: correctedEra };
+      }
+      return a;
     });
   if (verifiedResearch.misattributed.length > 0) {
     console.log(`[country-enrich] ${country}: removed ${verifiedResearch.misattributed.length} misattributed artist(s) from fresh research`);
+    for (const m of verifiedResearch.misattributed) {
+      console.log(`  [country-enrich] removed ${m.name} → actually from ${m.actualCountry}`);
+    }
   }
   if (verifiedResearch.eraCorrections.size > 0) {
     console.log(`[country-enrich] ${country}: corrected ${verifiedResearch.eraCorrections.size} era tag(s) from fresh research`);
   }
 
   console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
+  for (const a of research.artists) {
+    console.log(`  [country-enrich] Claude: ${a.name} (${a.era}, ${a.genre})`);
+  }
 
   // Step 1c: Auto-improve Claude's streamingFloor estimate by cross-checking knownTracks on Spotify
   let streamingFloor = DECADES_LIST.includes(research.streamingFloor) ? research.streamingFloor : '1980s';
@@ -6085,6 +6137,7 @@ Also include:
     // Skip if already cached
     const existing = await getCached(artistCacheKey);
     if (existing?.result?.tracks?.length > 0) {
+      console.log(`  [country-enrich] ↩ ${artist.name} → ${existing.result.tracks.length} tracks (cached)`);
       successfulArtists.push(artist);
       continue;
     }
