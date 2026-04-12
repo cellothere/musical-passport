@@ -1421,10 +1421,15 @@ const MB_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 const MB_TIMEOUT_MS = 7000;
 const MB_REQUEST_GAP_MS = 1500;
 const MB_MAX_RETRIES = 2;
-const MB_RETRY_BASE_MS = 2500;
-const MB_MAX_RETRY_AFTER_MS = 10000;
+const MB_RETRY_BASE_MS = 8000;    // fallback backoff when Retry-After is absent/zero
+const MB_MAX_RETRY_AFTER_MS = 30000;
 const mbQueue = [];
 let mbBusy = false;
+let mbLastRequestAt = 0; // timestamp of the last fired request (including retries)
+// When a 503 is received, stamp the earliest time the next request may fire.
+// This persists across item boundaries so the queue doesn't charge straight
+// into a rate-limited MB after finishing the retried item.
+let mbRateLimitedUntil = 0;
 
 async function logMbHttpIssue(url, response, elapsedMs) {
   const headers = {
@@ -1466,7 +1471,9 @@ function mbFetch(url) {
 function parseRetryAfterMs(value) {
   if (!value) return null;
   const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  // Treat 0 as "no meaningful hint" so the backoff formula kicks in instead.
+  // MB sends Retry-After: 0 when it can't compute a real delay — not as "retry now".
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
   const at = Date.parse(value);
   if (Number.isNaN(at)) return null;
   return Math.max(0, at - Date.now());
@@ -1479,6 +1486,14 @@ async function drainMbQueue() {
     try {
       let finalResponse = null;
       for (let attempt = 0; attempt <= MB_MAX_RETRIES; attempt++) {
+        // Enforce minimum gap before every fire — including retries and queue-idle → refill.
+        // The old bottom-of-loop gap only ran between consecutive queued items, so requests
+        // arriving after an idle period fired immediately and could exceed 1 req/sec.
+        const sinceLastMs = Date.now() - mbLastRequestAt;
+        const gapNeeded = Math.max(0, MB_REQUEST_GAP_MS - sinceLastMs, mbRateLimitedUntil - Date.now());
+        if (gapNeeded > 0) await new Promise(r => setTimeout(r, gapNeeded));
+        mbLastRequestAt = Date.now();
+
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), MB_TIMEOUT_MS);
         const startedAt = Date.now();
@@ -1500,6 +1515,9 @@ async function drainMbQueue() {
             MB_MAX_RETRY_AFTER_MS
           );
           const actualWaitMs = Math.max(backoffMs, MB_REQUEST_GAP_MS);
+          // Stamp the global cooldown so subsequent queue items don't fire into a
+          // still-rate-limited MB immediately after this item finishes its retries.
+          mbRateLimitedUntil = Math.max(mbRateLimitedUntil, Date.now() + actualWaitMs);
           console.warn(
             `[MB] Retrying after transient HTTP ${r.status} in ${actualWaitMs}ms (attempt ${attempt + 1}/${MB_MAX_RETRIES}): ${url}`
           );
@@ -1530,7 +1548,7 @@ async function drainMbQueue() {
     } catch (e) {
       reject(e);
     }
-    if (mbQueue.length > 0) await new Promise(r => setTimeout(r, MB_REQUEST_GAP_MS));
+    // Gap is now enforced at the top of each fire — no bottom-of-loop wait needed.
   }
   mbBusy = false;
 }
