@@ -1779,17 +1779,20 @@ ISO_TO_COUNTRY["CI"] = "Ivory Coast";
 
 // Verify and correct country info for each artist in a pool using MusicBrainz.
 // Runs lookups in the existing MB queue (rate-limited to 1/sec), so it's slow but accurate.
-// Conservative policy: only fill missing country data. Do not overwrite an
-// existing country assignment from the curated pool, because ambiguous MB
-// matches can be wrong for diaspora/borderline artists and bands.
-async function verifyPoolCountries(pool) {
+// Conservative by default: only fill missing country data. Similar-artist pools
+// can opt into overwrites because Claude country labels are untrusted there.
+async function verifyPoolCountries(pool, { overwriteExisting = false } = {}) {
   return Promise.all(pool.map(async (artist) => {
-    if (artist.countryCode) return artist;
+    if (artist.countryCode && !overwriteExisting) return artist;
     const mbCode = await mbArtistCountry(artist.name);
     if (!mbCode) return artist; // no change needed
     const mbName = ISO_TO_COUNTRY[mbCode];
     if (!mbName) return artist; // unknown ISO code, keep Claude's answer
-    console.log(`[verify-country] ${artist.name}: filled ${mbCode}(${mbName})`);
+    if (artist.countryCode && artist.countryCode !== mbCode) {
+      console.log(`[verify-country] ${artist.name}: corrected ${artist.countryCode} → ${mbCode}(${mbName})`);
+    } else if (!artist.countryCode) {
+      console.log(`[verify-country] ${artist.name}: filled ${mbCode}(${mbName})`);
+    }
     return { ...artist, country: mbName, countryCode: mbCode };
   }));
 }
@@ -4310,11 +4313,19 @@ app.post("/api/similar-artists", async (req, res) => {
     return updated;
   }
 
+  async function ensureVerifiedSimilarCountries(pool, cacheKey, cacheResult) {
+    if (cacheResult?.countryVerified) return pool;
+    const verified = await verifyPoolCountries(pool, { overwriteExisting: true });
+    await storeCache(cacheKey, "similar-artists", { ...cacheResult, countryVerified: true }, verified).catch(() => {});
+    return verified;
+  }
+
   // 1. Direct cache hit
   const simCached = await getCached(simCacheKey);
   if (simCached && simCached.artist_pool && simCached.artist_pool.length >= 4) {
     console.log(`[similar-artists] cache hit → ${artistName}`);
-    const pool = await ensurePoolImages(simCached.artist_pool, simCacheKey, simCached.result);
+    let pool = await ensureVerifiedSimilarCountries(simCached.artist_pool, simCacheKey, simCached.result);
+    pool = await ensurePoolImages(pool, simCacheKey, { ...simCached.result, countryVerified: true });
     return res.json({
       baseArtist: simCached.result.baseArtist,
       artists: pickDiverse(pool, 5),
@@ -4330,8 +4341,9 @@ app.post("/api/similar-artists", async (req, res) => {
       const filtered = sourcePool.artist_pool.filter(
         a => makeCacheKey([a.name]) !== makeCacheKey([sourcePool.result.baseArtist])
       );
-      const pool = await ensurePoolImages(filtered, simCacheKey, { baseArtist: artistName });
-      await storeCache(simCacheKey, "similar-artists", { baseArtist: artistName }, pool);
+      let pool = await ensureVerifiedSimilarCountries(filtered, simCacheKey, { baseArtist: artistName, countryVerified: sourcePool.result.countryVerified });
+      pool = await ensurePoolImages(pool, simCacheKey, { baseArtist: artistName, countryVerified: true });
+      await storeCache(simCacheKey, "similar-artists", { baseArtist: artistName, countryVerified: true }, pool);
       return res.json({ baseArtist: artistName, artists: pickDiverse(pool, 5) });
     }
   }
@@ -4461,9 +4473,10 @@ Their profile:
 - Primary genres: ${genres.length > 0 ? genres.join(', ') : 'inferred from artist name'}
 ${lastfmLines}${deezerLines}${alreadyCoveredLines}
 
-Rules:
-- Each artist must be from a DIFFERENT country (and different from any already listed above)
-- HARD LIMIT: No more than 2 artists from the same continent (Asia, Europe, Americas, Africa, Oceania)
+	Rules:
+	- Each artist must be from a DIFFERENT country (and different from any already listed above)
+	- "From" means the artist's own country of origin: where the solo artist was born/raised or where the band formed. Do NOT use ancestry, a parent's country, residence, fanbase, label market, or cultural influence as the country.
+	- HARD LIMIT: No more than 2 artists from the same continent (Asia, Europe, Americas, Africa, Oceania)
 - ${gapInstruction}
 - Mix of contemporary and classic artists
 - Avoid globally mainstream acts (no top-10 global chart artists)
@@ -4522,19 +4535,20 @@ Return ONLY valid JSON:
     // Fetch images for the full merged pool — skip Spotify to avoid rate limit bleed from backfill script
     const imageUrls = await Promise.all(rawPool.map(a => fetchArtistImageUrl(a.name, { genre: a.genre, skipSpotify: true }).catch(() => null)));
     const poolWithImages = rawPool.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || null }));
+    const verifiedPool = await verifyPoolCountries(poolWithImages, { overwriteExisting: true });
 
-    // Store pool immediately (with images, without MB country verification)
-    await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, poolWithImages);
-    await storeSimilarIndex(poolWithImages, simCacheKey);
-    console.log(`[similar-artists] → ${foundName} (${poolWithImages.length} in pool)`);
-    const _simResult = { baseArtist: foundName, artists: pickDiverse(poolWithImages, 5) };
+    // Store pool after country verification so untrusted Claude country codes do not leak to UI.
+    await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName, countryVerified: true }, verifiedPool);
+    await storeSimilarIndex(verifiedPool, simCacheKey);
+    console.log(`[similar-artists] → ${foundName} (${verifiedPool.length} in pool)`);
+    const _simResult = { baseArtist: foundName, artists: pickDiverse(verifiedPool, 5) };
     if (_simResolve) { _simResolve(_simResult); similarInFlight.delete(_simKey); }
     res.json(_simResult);
 
     // Background 1: validate Claude artists via Last.fm (hallucination filter) then re-cache
     // This runs after res.json so it never blocks the response or starves lfFetch queue.
     if (lastfmKey) {
-      const claudeOnly = poolWithImages.filter(a => !directPool.some(d => d.name === a.name));
+      const claudeOnly = verifiedPool.filter(a => !directPool.some(d => d.name === a.name));
       if (claudeOnly.length > 0) {
         (async () => {
           const validated = (await Promise.all(claudeOnly.map(async (artist) => {
@@ -4554,10 +4568,10 @@ Return ONLY valid JSON:
           const removedCount = claudeOnly.length - validated.length;
           if (removedCount > 0) {
             const validatedNames = new Set(validated.map(a => a.name));
-            const cleanPool = poolWithImages.filter(a =>
+            const cleanPool = verifiedPool.filter(a =>
               directPool.some(d => d.name === a.name) || validatedNames.has(a.name)
             );
-            await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, cleanPool);
+            await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName, countryVerified: true }, cleanPool);
             await storeSimilarIndex(cleanPool, simCacheKey);
             console.log(`[similar-artists] bg-validation: removed ${removedCount} hallucinations for ${foundName}`);
           } else {
@@ -4568,10 +4582,10 @@ Return ONLY valid JSON:
     }
 
     // Background 2: country verification — corrects & re-caches without blocking the response
-    verifyPoolCountries(poolWithImages).then(async verified => {
-      const changed = verified.some((a, i) => a.countryCode !== poolWithImages[i]?.countryCode);
+    verifyPoolCountries(verifiedPool, { overwriteExisting: true }).then(async verified => {
+      const changed = verified.some((a, i) => a.countryCode !== verifiedPool[i]?.countryCode);
       if (changed) {
-        await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, verified);
+        await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName, countryVerified: true }, verified);
         console.log(`[similar-artists] background country verify updated cache for ${foundName}`);
       }
     }).catch(() => {});
