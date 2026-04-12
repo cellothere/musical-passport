@@ -4509,28 +4509,9 @@ Return ONLY valid JSON:
       const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
       const claudeArtists = (JSON.parse(raw).artists || []);
 
-      // Validate Claude-generated artists via Last.fm (hallucination filter)
-      const validatedClaude = lastfmKey
-        ? (await Promise.all(claudeArtists.map(async (artist) => {
-            try {
-              const r = await lfFetch(
-                `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artist.name)}&autocorrect=0&api_key=${lastfmKey}&format=json`
-              );
-              const d = await r.json();
-              if (d.error || !d.artist?.name) {
-                console.log(`[similar-artists] filtered hallucination: ${artist.name}`);
-                return null;
-              }
-              return artist;
-            } catch { return artist; }
-          }))).filter(Boolean)
-        : claudeArtists;
-
-      console.log(`[similar-artists] Claude validation: ${claudeArtists.length} → ${validatedClaude.length} artists`);
-
-      // Merge: directPool (Last.fm, already verified) + Claude gap-fillers, deduplicating by country
+      // Merge immediately — validation runs in background after response is sent
       rawPool = [...directPool];
-      for (const a of validatedClaude) {
+      for (const a of claudeArtists) {
         const duplicate = rawPool.some(
           x => x.countryCode === a.countryCode || x.name.toLowerCase() === a.name.toLowerCase()
         );
@@ -4550,7 +4531,43 @@ Return ONLY valid JSON:
     if (_simResolve) { _simResolve(_simResult); similarInFlight.delete(_simKey); }
     res.json(_simResult);
 
-    // Country verification runs in background — corrects & re-caches without blocking the response
+    // Background 1: validate Claude artists via Last.fm (hallucination filter) then re-cache
+    // This runs after res.json so it never blocks the response or starves lfFetch queue.
+    if (lastfmKey) {
+      const claudeOnly = poolWithImages.filter(a => !directPool.some(d => d.name === a.name));
+      if (claudeOnly.length > 0) {
+        (async () => {
+          const validated = (await Promise.all(claudeOnly.map(async (artist) => {
+            try {
+              const r = await lfFetch(
+                `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artist.name)}&autocorrect=0&api_key=${lastfmKey}&format=json`
+              );
+              const d = await r.json();
+              if (d.error || !d.artist?.name) {
+                console.log(`[similar-artists] bg-filtered hallucination: ${artist.name}`);
+                return null;
+              }
+              return artist;
+            } catch { return artist; }
+          }))).filter(Boolean);
+
+          const removedCount = claudeOnly.length - validated.length;
+          if (removedCount > 0) {
+            const validatedNames = new Set(validated.map(a => a.name));
+            const cleanPool = poolWithImages.filter(a =>
+              directPool.some(d => d.name === a.name) || validatedNames.has(a.name)
+            );
+            await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, cleanPool);
+            await storeSimilarIndex(cleanPool, simCacheKey);
+            console.log(`[similar-artists] bg-validation: removed ${removedCount} hallucinations for ${foundName}`);
+          } else {
+            console.log(`[similar-artists] bg-validation: all ${claudeOnly.length} Claude artists confirmed for ${foundName}`);
+          }
+        })().catch(() => {});
+      }
+    }
+
+    // Background 2: country verification — corrects & re-caches without blocking the response
     verifyPoolCountries(poolWithImages).then(async verified => {
       const changed = verified.some((a, i) => a.countryCode !== poolWithImages[i]?.countryCode);
       if (changed) {
