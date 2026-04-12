@@ -4558,6 +4558,25 @@ Return ONLY valid JSON:
         console.log(`[similar-artists] background country verify updated cache for ${foundName}`);
       }
     }).catch(() => {});
+
+    // Seed artist_countries for the top Last.fm similar artists — not just pool members.
+    // This primes the fast path so future searches for these artists skip Claude entirely.
+    // Guards: top 10 by match score only; skip entirely if the MB queue is already busy
+    // (enrichment / real-pool builds take priority over speculative seeding).
+    if (lastfmSimilar.length > 0 && mbQueue.length === 0) {
+      const toSeed = [...lastfmSimilar].sort((a, b) => b.match - a.match).slice(0, 10);
+      (async () => {
+        let seeded = 0;
+        for (const a of toSeed) {
+          if (mbQueue.length > 3) break; // stop if other work has arrived
+          const existing = await getMbArtistCached(a.name);
+          if (existing !== undefined) continue; // already known
+          await mbArtistCountry(a.name);        // MB lookup → writes to artist_countries
+          seeded++;
+        }
+        if (seeded > 0) console.log(`[similar-artists] seeded ${seeded} artist countries for "${foundName}" Last.fm pool`);
+      })().catch(() => {});
+    }
   } catch (err) {
     if (_simReject) { _simReject(err); similarInFlight.delete(_simKey); }
     console.error("Similar artists error:", err);
