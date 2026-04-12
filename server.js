@@ -587,6 +587,7 @@ async function getCached(cacheKey) {
 
 const CACHE_TTL = {
   'recommend':          30  * 24 * 60 * 60 * 1000,
+  'real-pool':          7   * 24 * 60 * 60 * 1000,
   'genre-spotlight':    180 * 24 * 60 * 60 * 1000,
   'genre-deeper':       180 * 24 * 60 * 60 * 1000,
   'time-machine': 14 * 24 * 60 * 60 * 1000,
@@ -2005,6 +2006,15 @@ async function mbArtistsByCountry(country, isoCode) {
 // Artists in BOTH sources = high confidence. Single source = medium confidence.
 // Returns up to 20 artists sorted by confidence then listen count.
 async function buildRealArtistPool(country, isoCode) {
+  // Check Supabase cache before hitting LB + MB rate-limited queues.
+  // 7-day TTL — artist origin data is stable and rarely changes.
+  const realPoolCacheKey = makeCacheKey(['real-pool', country]);
+  const realPoolCached = await getCached(realPoolCacheKey);
+  if (realPoolCached?.artist_pool?.length > 0) {
+    console.log(`[real-pool] ${country}: Supabase cache hit (${realPoolCached.artist_pool.length} artists)`);
+    return realPoolCached.artist_pool;
+  }
+
   const [lbArtists, mbArtists] = await Promise.all([
     lbTopArtistsForCountry(country),
     mbArtistsByCountry(country, isoCode),
@@ -2043,6 +2053,8 @@ async function buildRealArtistPool(country, isoCode) {
 
   const result = pool.slice(0, 40);
   console.log(`[real-pool] ${country}: ${result.filter(a => a.confidence === "high").length} high-conf, ${result.filter(a => a.confidence !== "high").length} medium-conf artists`);
+  // Persist so the next cold request avoids re-querying LB + MB queues
+  storeCache(realPoolCacheKey, 'real-pool', {}, result).catch(() => {});
   return result;
 }
 
@@ -2068,7 +2080,19 @@ async function getMbArtistMBID(artistName) {
       return null;
     }
     const d = await r.json();
-    const top = (d.artists || []).find(a => (a.score || 0) >= 80);
+    const normKey = s => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const target  = normKey(artistName);
+    const top = (d.artists || []).find(a => {
+      if ((a.score || 0) < 80) return false;
+      const n = normKey(a.name || "");
+      if (n === target) return true;               // exact match
+      if (n.includes(target)) return true;         // MB name contains query
+      // Query contains MB name — only accept if MB name is ≥ 60% of query length.
+      // Blocks short tokens like "sting" (5/15 = 33%) matching "NautenStingBand",
+      // while still accepting "beatles" (7/10 = 70%) matching "thebeatles".
+      if (target.includes(n) && n.length >= Math.ceil(target.length * 0.6)) return true;
+      return false;
+    });
     const mbid = top?.id ?? null;
     mbidCache.set(artistName, { mbid, at: Date.now() });
     return mbid;
@@ -2374,6 +2398,7 @@ app.get("/api/spotify-status", (_req, res) => {
 // In-flight request coalescing — prevents cache stampedes when two requests
 // for the same country arrive simultaneously before either has been cached.
 const recommendInFlight = new Map(); // cacheKey → Promise
+const similarInFlight   = new Map(); // normalized artist name → Promise
 
 // Proxy endpoint for Anthropic API (with personalization)
 app.post("/api/recommend", async (req, res) => {
@@ -2432,10 +2457,27 @@ app.post("/api/recommend", async (req, res) => {
 
   try {
     const realPool = await realPoolPromise;
-    const realPoolNote = realPool.length > 0
+    // Split real pool into mandatory (high-conf = in both MB+LB) and supplemental
+    const highConf     = realPool.filter(a => a.confidence === "high");
+    const medConf      = realPool.filter(a => a.confidence !== "high");
+    const mandatoryPool  = [...highConf, ...medConf].slice(0, 8);
+    const suggestionPool = [...highConf, ...medConf].slice(8, 14);
+    const remaining      = Math.max(0, 12 - mandatoryPool.length);
+
+    const realPoolNote = mandatoryPool.length >= 4
+      // Strong mandatory block: Claude must use these artists verbatim
+      ? `\n\nMANDATORY ARTISTS — you MUST include ALL ${mandatoryPool.length} of these in your response.\nDo NOT omit, rename, or substitute any of them (they are database-verified as being from ${country}):\n${
+          mandatoryPool.map(a => `- ${a.name}${a.confidence === "high" ? " ✓✓" : " ✓"}${a.tags.length ? ` [${a.tags.slice(0, 2).join(", ")}]` : ""}`).join("\n")
+        }${suggestionPool.length > 0
+          ? `\n\nAdditional verified ${country} artists (use if they fit your era/genre balance):\n${suggestionPool.map(a => `- ${a.name}`).join("\n")}`
+          : ""}\n\n${remaining > 0
+          ? `Add exactly ${remaining} more artists from ${country} to reach 12 total. Every artist must genuinely be from ${country} — do NOT invent or misattribute.`
+          : "Use exactly these artists — no additions needed."}`
+      // Fallback for small real pools: weaker suggestion language
+      : realPool.length > 0
       ? `\n\nVERIFIED ARTISTS from MusicBrainz + ListenBrainz databases for ${country}:\n${
           realPool.map(a => `- ${a.name}${a.confidence === "high" ? " [verified in both MB+LB]" : ""}${a.tags.length ? ` (${a.tags.slice(0, 3).join(", ")})` : ""}`).join("\n")
-        }\n\nThese artists are confirmed to be from ${country} by music databases. Your 12 artists MUST include as many of these as fit the era/genre mix. You may add artists NOT in this list only if you are certain they are from ${country} — and you must include their name exactly as known. Do NOT invent or misattribute artists.`
+        }\n\nThese artists are confirmed to be from ${country}. Include as many as possible — prioritize high-confidence ones. You may add artists not in this list only if you are certain they are from ${country}.`
       : "";
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -4276,6 +4318,18 @@ app.post("/api/similar-artists", async (req, res) => {
     }
   }
 
+  // In-flight deduplication — if another request for this artist is already running,
+  // wait for its result instead of launching a duplicate Last.fm + Claude pipeline.
+  const _simKey = artistName.toLowerCase().trim();
+  if (similarInFlight.has(_simKey)) {
+    console.log(`[similar-artists] coalescing → ${artistName}`);
+    try { return res.json(await similarInFlight.get(_simKey)); }
+    catch (err) { return res.status(500).json({ error: err.message }); }
+  }
+  let _simResolve = null;
+  let _simReject  = null;
+  similarInFlight.set(_simKey, new Promise((ok, fail) => { _simResolve = ok; _simReject = fail; }));
+
   try {
     const lastfmKey = process.env.LASTFM_API_KEY;
     let foundName = artistName;
@@ -4289,8 +4343,8 @@ app.post("/api/similar-artists", async (req, res) => {
         if (!lastfmKey) return;
         try {
           const [infoRes, simRes] = await Promise.all([
-            fetch(`https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artistName)}&autocorrect=1&api_key=${lastfmKey}&format=json`),
-            fetch(`https://ws.audioscrobbler.com/2.0/?method=artist.getSimilar&artist=${encodeURIComponent(artistName)}&limit=30&autocorrect=1&api_key=${lastfmKey}&format=json`),
+            lfFetch(`https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artistName)}&autocorrect=1&api_key=${lastfmKey}&format=json`),
+            lfFetch(`https://ws.audioscrobbler.com/2.0/?method=artist.getSimilar&artist=${encodeURIComponent(artistName)}&limit=30&autocorrect=1&api_key=${lastfmKey}&format=json`),
           ]);
           const [infoData, simData] = await Promise.all([infoRes.json(), simRes.json()]);
 
@@ -4395,6 +4449,7 @@ Rules:
 - ${gapInstruction}
 - Mix of contemporary and classic artists
 - Avoid globally mainstream acts (no top-10 global chart artists)
+- Only suggest professional musicians — exclude actors, TV personalities, athletes, or other celebrities who have released music as a side project
 - Even if the input artist is from a specific regional genre (K-pop, J-pop, etc.), find global equivalents who capture the same energy
 - Be precise about country of origin — do NOT guess
 
@@ -4428,7 +4483,10 @@ Return ONLY valid JSON:
       });
 
       const claudeData = await claudeRes.json();
-      if (claudeData.error) return res.status(500).json({ error: claudeData.error.message });
+      if (claudeData.error) {
+        if (_simReject) { _simReject(new Error(claudeData.error.message)); similarInFlight.delete(_simKey); }
+        return res.status(500).json({ error: claudeData.error.message });
+      }
 
       const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
       const claudeArtists = (JSON.parse(raw).artists || []);
@@ -4437,7 +4495,7 @@ Return ONLY valid JSON:
       const validatedClaude = lastfmKey
         ? (await Promise.all(claudeArtists.map(async (artist) => {
             try {
-              const r = await fetch(
+              const r = await lfFetch(
                 `https://ws.audioscrobbler.com/2.0/?method=artist.getInfo&artist=${encodeURIComponent(artist.name)}&autocorrect=0&api_key=${lastfmKey}&format=json`
               );
               const d = await r.json();
@@ -4470,7 +4528,9 @@ Return ONLY valid JSON:
     await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName }, poolWithImages);
     await storeSimilarIndex(poolWithImages, simCacheKey);
     console.log(`[similar-artists] → ${foundName} (${poolWithImages.length} in pool)`);
-    res.json({ baseArtist: foundName, artists: pickDiverse(poolWithImages, 5) });
+    const _simResult = { baseArtist: foundName, artists: pickDiverse(poolWithImages, 5) };
+    if (_simResolve) { _simResolve(_simResult); similarInFlight.delete(_simKey); }
+    res.json(_simResult);
 
     // Country verification runs in background — corrects & re-caches without blocking the response
     verifyPoolCountries(poolWithImages).then(async verified => {
@@ -4481,6 +4541,7 @@ Return ONLY valid JSON:
       }
     }).catch(() => {});
   } catch (err) {
+    if (_simReject) { _simReject(err); similarInFlight.delete(_simKey); }
     console.error("Similar artists error:", err);
     res.status(500).json({ error: err.message });
   }
