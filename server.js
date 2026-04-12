@@ -1418,7 +1418,7 @@ const MB_UA   = "MusicalPassport/1.0 (musicalpassportapp@gmail.com)";
 
 // Rate-limit queue: MusicBrainz allows 1 req/sec. Keep one global queue for all
 // user/background work so requests never hit MB concurrently.
-const MB_TIMEOUT_MS = 7000;
+const MB_TIMEOUT_MS = 15000;
 const MB_REQUEST_GAP_MS = 1500;
 const MB_MAX_RETRIES = 2;
 const MB_RETRY_BASE_MS = 8000;    // fallback backoff when Retry-After is absent/zero
