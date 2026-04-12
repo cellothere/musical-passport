@@ -4911,12 +4911,36 @@ const ALL_ENRICHABLE_COUNTRIES = [
     ...Object.keys(COUNTRY_ISO),
     'Hawaii',
     // Historical civilizations
-    'Soviet Union','Yugoslavia','Ottoman Empire','East Germany','Ceylon','Rhodesia','Zaire',
+    'Soviet Union','Yugoslavia','Czechoslovakia','Ottoman Empire','East Germany','Ceylon','Rhodesia','Zaire',
     'Siam','Byzantine Empire','Prussia','Austro-Hungarian Empire','Ancient Rome','Ancient Greece',
     'Mesopotamia','Viking Scandinavia','Moorish Spain','Weimar Republic',
     'Republic of South Vietnam','Meiji Japan',
   ]),
 ];
+
+const HISTORICAL_MUSIC_REGIONS = new Set([
+  'Yugoslavia',
+  'Soviet Union',
+  'Czechoslovakia',
+  'East Germany',
+  'Ottoman Empire',
+  'Ceylon',
+  'Zaire',
+  'Byzantine Empire',
+  'Austro-Hungarian Empire',
+  'Ancient Rome',
+  'Ancient Greece',
+  'Viking Scandinavia',
+  'Moorish Spain',
+  'Weimar Republic',
+  'Meiji Japan',
+  // Other legacy names already supported by enrichment.
+  'Rhodesia',
+  'Siam',
+  'Prussia',
+  'Mesopotamia',
+  'Republic of South Vietnam',
+]);
 
 async function findWeakCountries(limit = 2) {
   if (!supabase) return ALL_ENRICHABLE_COUNTRIES.slice(0, limit);
@@ -5019,6 +5043,17 @@ const COUNTRY_NAME_ALIASES = new Map([
   ["britain", "United Kingdom"],
   ["uae", "UAE"],
   ["unitedarabemirates", "UAE"],
+  ["ancientrome", "Ancient Rome"],
+  ["ancientgreece", "Ancient Greece"],
+  ["vikingscandinavia", "Viking Scandinavia"],
+  ["moorishspain", "Moorish Spain"],
+  ["weimarrepublic", "Weimar Republic"],
+  ["meijijapan", "Meiji Japan"],
+  ["sovietunion", "Soviet Union"],
+  ["eastgermany", "East Germany"],
+  ["ottomanempire", "Ottoman Empire"],
+  ["byzantineempire", "Byzantine Empire"],
+  ["austrohungarianempire", "Austro-Hungarian Empire"],
 ]);
 
 function canonicalCountryName(name) {
@@ -5027,6 +5062,12 @@ function canonicalCountryName(name) {
   if (ALL_ENRICHABLE_COUNTRIES.includes(trimmed)) return trimmed;
   const alias = COUNTRY_NAME_ALIASES.get(normalizeCountryName(trimmed));
   return alias || trimmed;
+}
+
+function historicalMusicRegionGuidance(country) {
+  const canonical = canonicalCountryName(country);
+  if (!HISTORICAL_MUSIC_REGIONS.has(canonical)) return "";
+  return `Historical-region rule for ${canonical}: this is not a modern nationality bucket. Include real artists, ensembles, scholars, or tradition bearers who either (a) were active in or directly tied to the historical polity/period, (b) come from its successor regions and perform that specific tradition, or (c) make scholarly or historically grounded reconstructions of that tradition. For ancient civilizations, modern reconstruction ensembles are expected; do not imply they are literal ancient-era performers.`;
 }
 
 function mergeArtistPools(existingPool = [], incomingPool = [], limit = 40) {
@@ -5921,6 +5962,8 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
 
 async function verifyArtistMetadata(artists, country, apiKey) {
   if (!artists?.length) return { misattributed: [], eraCorrections: new Map() };
+  country = canonicalCountryName(country);
+  const historicalGuidance = historicalMusicRegionGuidance(country);
 
   const artistsWithEvidence = await applyArtistEvidence(artists);
   const evidenceByName = new Map();
@@ -5952,15 +5995,18 @@ async function verifyArtistMetadata(artists, country, apiKey) {
           content: `These artists are currently stored for "${country}".
 
 For each artist, verify two things:
-1. Are they genuinely from ${country}?
-2. If they are from ${country}, is their currentEra the correct decade they are MOST associated with or most active in?
+1. ${historicalGuidance ? `Do they genuinely belong in the ${country} historical/reconstruction tradition described below?` : `Are they genuinely from ${country}?`}
+2. If they belong here, is their currentEra the correct decade they are MOST associated with or most active in?
+
+${historicalGuidance}
 
 Artists to verify:
 ${artistsBlock}
 
 Rules:
-- Only mark an artist as misattributed if they are clearly born in or primarily associated with a different country.
-- Diaspora artists, dual-heritage artists, or artists whose musical identity remains rooted in ${country} should stay.
+- Only mark an artist as misattributed if they clearly do not fit the stated geographic, historical, or reconstruction scope.
+- For modern countries, diaspora artists, dual-heritage artists, or artists whose musical identity remains rooted in ${country} should stay.
+- For historical regions, modern reconstruction ensembles and scholars should stay when their work is specifically rooted in that historical tradition.
 - Soviet-era artists belong to their birth republic, not USSR/Russia, unless they are clearly rooted elsewhere.
 - For era corrections, only return a correction when the currentEra is clearly wrong.
 - era must be exactly one of: ${DECADES_LIST.join(", ")}.
@@ -6088,6 +6134,8 @@ async function auditCountryPool(artistPool, country, apiKey) {
 }
 
 async function deepEnrichCountry(country, apiKey) {
+  country = canonicalCountryName(country);
+  const historicalGuidance = historicalMusicRegionGuidance(country);
   console.log(`[country-enrich] Researching ${country}...`);
   const appleToken = generateAppleMusicToken();
 
@@ -6109,7 +6157,9 @@ async function deepEnrichCountry(country, apiKey) {
   // Step 1a: Pull Last.fm geo.getTopArtists to ground Claude in real scrobble data
   const lfArtists = await lastfmGeoTopArtists(country, 25);
   const lfNote = lfArtists.length > 0
-    ? `\n\nLast.fm top artists for ${country} (verified by global scrobbling data — these artists are genuinely associated with ${country}):\n${lfArtists.join(', ')}\n\nPrioritize these artists in your response. You may add others not on this list only if you are certain they are from ${country}.`
+    ? historicalGuidance
+      ? `\n\nLast.fm top artists for ${country} (global scrobbling signal — treat as candidates, then apply the historical-region rule):\n${lfArtists.join(', ')}\n\nPrioritize these artists only when they fit ${country}'s historical tradition or reconstruction lineage.`
+      : `\n\nLast.fm top artists for ${country} (verified by global scrobbling data — these artists are genuinely associated with ${country}):\n${lfArtists.join(', ')}\n\nPrioritize these artists in your response. You may add others not on this list only if you are certain they are from ${country}.`
     : '';
   if (lfArtists.length > 0) console.log(`[country-enrich] Last.fm → ${lfArtists.length} artists for ${country}`);
 
@@ -6120,12 +6170,12 @@ async function deepEnrichCountry(country, apiKey) {
     body: JSON.stringify({
       model: "claude-opus-4-5-20251101",
       max_tokens: 3500,
-      system: "You are a world music ethnomusicologist with encyclopedic knowledge of music from every country. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
+      system: "You are a world music ethnomusicologist with encyclopedic knowledge of music from every country and historical region. Return ONLY valid JSON — no markdown, no backticks, no preamble.",
       messages: [{
         role: "user",
         content: `Deep music research for "${country}".
 
-Every artist MUST be genuinely from ${country} — born there or the group formed there. No exceptions.
+${historicalGuidance || `Every artist MUST be genuinely from ${country} — born there or the group formed there. No exceptions.`}
 
 Return exactly this JSON:
 {
@@ -6486,8 +6536,9 @@ app.get("/api/enrich-countries", async (req, res) => {
   try {
     let targets;
     if (req.query.country) {
-      targets = [req.query.country];
-      console.log(`[country-enrich] Targeting specific country: ${req.query.country}`);
+      const targetCountry = canonicalCountryName(req.query.country);
+      targets = [targetCountry];
+      console.log(`[country-enrich] Targeting specific country: ${targetCountry}`);
     } else {
       const count = Math.min(parseInt(req.query.count || "2", 10), 5);
       targets = await findWeakCountries(count);
