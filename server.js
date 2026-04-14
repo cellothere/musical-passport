@@ -1131,35 +1131,43 @@ function regionOf(artist) {
 // Pick n artists from pool ensuring each comes from a different country,
 // and maximising regional diversity.
 function pickDiverse(arr, n) {
-  const shuffled = [...arr].sort(() => Math.random() - 0.5);
+  // Sort deterministically: best match score first, then alphabetical by name as tiebreaker.
+  // This ensures the same pool always produces the same 5 results.
+  const sorted = [...arr].sort((a, b) => {
+    const matchDiff = (b.match || 0) - (a.match || 0);
+    return matchDiff !== 0 ? matchDiff : (a.name || '').localeCompare(b.name || '');
+  });
 
   // Group by region
   const byRegion = {};
-  for (const a of shuffled) {
+  for (const a of sorted) {
     const r = regionOf(a);
     (byRegion[r] = byRegion[r] || []).push(a);
   }
 
-  const regions = Object.keys(byRegion).sort(() => Math.random() - 0.5);
+  // Sort regions deterministically: most candidates first, then alphabetical
+  const regions = Object.keys(byRegion).sort((a, b) => {
+    const diff = byRegion[b].length - byRegion[a].length;
+    return diff !== 0 ? diff : a.localeCompare(b);
+  });
+
   const chosen = [];
   const usedCountries = new Set();
 
-  // Round-robin across regions
-  let pass = 0;
+  // Round-robin across regions — each pass picks the best remaining candidate per region
   while (chosen.length < n) {
     let added = false;
     for (const region of regions) {
       if (chosen.length >= n) break;
       const candidates = byRegion[region].filter(a => !usedCountries.has(a.country || a.countryCode));
       if (candidates.length === 0) continue;
-      const pick = candidates[Math.floor(Math.random() * candidates.length)];
+      const pick = candidates[0]; // already sorted by match score
       chosen.push(pick);
       usedCountries.add(pick.country || pick.countryCode);
       added = true;
     }
     // Safety: if a full pass added nothing, break to avoid infinite loop
     if (!added) break;
-    pass++;
   }
 
   return chosen;
@@ -1689,23 +1697,66 @@ ISO_TO_COUNTRY["VN"] = "Vietnam";
 ISO_TO_COUNTRY["IR"] = "Iran";
 ISO_TO_COUNTRY["CI"] = "Ivory Coast";
 
+// Extract an ISO country code from a genre string when it explicitly names a country/region.
+// Used as a fallback when MusicBrainz can't resolve an artist.
+function countryHintFromGenre(genre) {
+  if (!genre) return null;
+  const g = genre.toLowerCase();
+  const hints = [
+    ['south african', 'ZA'], ['amapiano', 'ZA'], ['kwaito', 'ZA'], ['afro house', 'ZA'],
+    ['nigerian', 'NG'], ['afrobeats', 'NG'], ['afropop', 'NG'], ['naija', 'NG'],
+    ['ghanaian', 'GH'], ['highlife', 'GH'],
+    ['grime', 'GB'], ['uk rap', 'GB'], ['uk hip-hop', 'GB'], ['british hip hop', 'GB'], ['afroswing', 'GB'],
+    ['k-pop', 'KR'], ['k-rap', 'KR'], ['k-hip-hop', 'KR'], ['korean hip', 'KR'], ['korean r&b', 'KR'],
+    ['j-pop', 'JP'], ['j-rock', 'JP'], ['j-rap', 'JP'], ['japanese hip', 'JP'],
+    ['french rap', 'FR'], ['french hip-hop', 'FR'], ['french pop', 'FR'],
+    ['german rap', 'DE'], ['deutschrap', 'DE'],
+    ['australian hip', 'AU'], ['aussie hip', 'AU'], ['australian pop', 'AU'],
+    ['brazilian', 'BR'], ['baile funk', 'BR'], ['funk carioca', 'BR'], ['pagode', 'BR'], ['samba', 'BR'],
+    ['jamaican', 'JM'], ['dancehall', 'JM'], ['reggae', 'JM'],
+    ['cuban', 'CU'], ['son cubano', 'CU'], ['timba', 'CU'],
+    ['turkish', 'TR'], ['arabesque', 'TR'],
+    ['congolese', 'CD'], ['soukous', 'CD'],
+    ['ethiopian', 'ET'],
+  ];
+  for (const [kw, code] of hints) {
+    if (g.includes(kw)) return code;
+  }
+  return null;
+}
+
 // Verify and correct country info for each artist in a pool using MusicBrainz.
 // Runs lookups in the existing MB queue (rate-limited to 1/sec), so it's slow but accurate.
 // Conservative by default: only fill missing country data. Similar-artist pools
 // can opt into overwrites because Claude country labels are untrusted there.
+// Sets mbVerified:true when MB confirms, mbVerified:'genre' when genre hint is used,
+// leaves mbVerified unset (falsy) when neither source can confirm.
 async function verifyPoolCountries(pool, { overwriteExisting = false } = {}) {
   return Promise.all(pool.map(async (artist) => {
+    // Artists already confirmed by MusicBrainz are authoritative — never re-query them.
+    if (artist.mbVerified === true) return artist;
+    // Without overwrite, also skip anything that already has a country code.
     if (artist.countryCode && !overwriteExisting) return artist;
     const mbCode = await mbArtistCountry(artist.name);
-    if (!mbCode) return artist; // no change needed
-    const mbName = ISO_TO_COUNTRY[mbCode];
-    if (!mbName) return artist; // unknown ISO code, keep Claude's answer
-    if (artist.countryCode && artist.countryCode !== mbCode) {
-      console.log(`[verify-country] ${artist.name}: corrected ${artist.countryCode} → ${mbCode}(${mbName})`);
-    } else if (!artist.countryCode) {
-      console.log(`[verify-country] ${artist.name}: filled ${mbCode}(${mbName})`);
+    if (mbCode) {
+      const mbName = ISO_TO_COUNTRY[mbCode];
+      if (!mbName) return artist; // unknown ISO code, keep existing
+      if (artist.countryCode && artist.countryCode !== mbCode) {
+        console.log(`[verify-country] ${artist.name}: corrected ${artist.countryCode} → ${mbCode}(${mbName})`);
+      } else if (!artist.countryCode) {
+        console.log(`[verify-country] ${artist.name}: filled ${mbCode}(${mbName})`);
+      }
+      return { ...artist, country: mbName, countryCode: mbCode, mbVerified: true };
     }
-    return { ...artist, country: mbName, countryCode: mbCode };
+    // MB returned null — try genre-based country hint as a secondary signal
+    const genreCode = countryHintFromGenre(artist.genre);
+    if (genreCode && ISO_TO_COUNTRY[genreCode] && (!artist.mbVerified || overwriteExisting)) {
+      if (artist.countryCode && artist.countryCode !== genreCode) {
+        console.log(`[verify-country] ${artist.name}: genre-hint corrected ${artist.countryCode} → ${genreCode}(${ISO_TO_COUNTRY[genreCode]})`);
+      }
+      return { ...artist, country: ISO_TO_COUNTRY[genreCode], countryCode: genreCode, mbVerified: 'genre' };
+    }
+    return artist; // could not verify — keep existing data as-is
   }));
 }
 
@@ -4229,7 +4280,10 @@ app.post("/api/similar-artists", async (req, res) => {
   }
 
   async function ensureVerifiedSimilarCountries(pool, cacheKey, cacheResult) {
-    if (cacheResult?.countryVerified) return pool;
+    // Re-verify any artist that MB couldn't confirm on the previous pass (mbVerified !== true).
+    // These may have had wrong Claude-guessed countries stored; a fresh MB lookup can now fix them.
+    const needsCheck = pool.filter(a => a.mbVerified !== true);
+    if (cacheResult?.countryVerified && needsCheck.length === 0) return pool;
     const verified = await verifyPoolCountries(pool, { overwriteExisting: true });
     await storeCache(cacheKey, "similar-artists", { ...cacheResult, countryVerified: true }, verified).catch(() => {});
     return verified;
@@ -4241,9 +4295,11 @@ app.post("/api/similar-artists", async (req, res) => {
     console.log(`[similar-artists] cache hit → ${artistName}`);
     let pool = await ensureVerifiedSimilarCountries(simCached.artist_pool, simCacheKey, simCached.result);
     pool = await ensurePoolImages(pool, simCacheKey, { ...simCached.result, countryVerified: true });
+    const baseNorm = artistName.toLowerCase().trim();
+    const filteredPool = pool.filter(a => a.name.toLowerCase().trim() !== baseNorm);
     return res.json({
       baseArtist: simCached.result.baseArtist,
-      artists: pickDiverse(pool, 5),
+      artists: pickDiverse(filteredPool, 5),
     });
   }
 
@@ -4259,7 +4315,9 @@ app.post("/api/similar-artists", async (req, res) => {
       let pool = await ensureVerifiedSimilarCountries(filtered, simCacheKey, { baseArtist: artistName, countryVerified: sourcePool.result.countryVerified });
       pool = await ensurePoolImages(pool, simCacheKey, { baseArtist: artistName, countryVerified: true });
       await storeCache(simCacheKey, "similar-artists", { baseArtist: artistName, countryVerified: true }, pool);
-      return res.json({ baseArtist: artistName, artists: pickDiverse(pool, 5) });
+      const baseNormRev = artistName.toLowerCase().trim();
+      const filteredForResponse = pool.filter(a => a.name.toLowerCase().trim() !== baseNormRev);
+      return res.json({ baseArtist: artistName, artists: pickDiverse(filteredForResponse, 5) });
     }
   }
 
@@ -4437,20 +4495,41 @@ Return ONLY valid JSON:
       const raw = (claudeData.content[0].text || "").replace(/```json|```/g, "").trim();
       const claudeArtists = (JSON.parse(raw).artists || []);
 
-      // Merge immediately — validation runs in background after response is sent
+      // Merge immediately — validation runs in background after response is sent.
+      // Dedup only by name (not country) so the pool retains multiple artists per country
+      // as backup candidates; pickDiverse enforces country uniqueness at output time.
       rawPool = [...directPool];
+      const poolNamesLower = new Set(directPool.map(a => a.name.toLowerCase()));
       for (const a of claudeArtists) {
-        const duplicate = rawPool.some(
-          x => x.countryCode === a.countryCode || x.name.toLowerCase() === a.name.toLowerCase()
-        );
-        if (!duplicate) rawPool.push(a);
+        if (!poolNamesLower.has(a.name.toLowerCase())) {
+          rawPool.push(a);
+          poolNamesLower.add(a.name.toLowerCase());
+        }
       }
     }
+
+    // Remove the base artist from their own similar-artists pool
+    const baseNameNorm = foundName.toLowerCase().trim();
+    const inputNameNorm = artistName.toLowerCase().trim();
+    rawPool = rawPool.filter(a => {
+      const n = a.name.toLowerCase().trim();
+      return n !== baseNameNorm && n !== inputNameNorm;
+    });
 
     // Fetch images for the full merged pool — skip Spotify to avoid rate limit bleed from backfill script
     const imageUrls = await Promise.all(rawPool.map(a => fetchArtistImageUrl(a.name, { genre: a.genre, skipSpotify: true }).catch(() => null)));
     const poolWithImages = rawPool.map((a, i) => ({ ...a, imageUrl: imageUrls[i] || null }));
-    const verifiedPool = await verifyPoolCountries(poolWithImages, { overwriteExisting: true });
+
+    // Only run the blocking MB verification on Claude-contributed artists.
+    // directPool artists already have MB-verified country codes from the cache step above —
+    // tag them so cache hits won't needlessly re-verify them.
+    const directPoolNames = new Set(directPool.map(a => a.name));
+    const directWithImages = poolWithImages
+      .filter(a => directPoolNames.has(a.name))
+      .map(a => ({ ...a, mbVerified: true }));
+    const claudeWithImages = poolWithImages.filter(a => !directPoolNames.has(a.name));
+    const verifiedClaude = await verifyPoolCountries(claudeWithImages, { overwriteExisting: true });
+    const verifiedPool = [...directWithImages, ...verifiedClaude];
 
     // Store pool after country verification so untrusted Claude country codes do not leak to UI.
     await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName, countryVerified: true }, verifiedPool);
@@ -4496,14 +4575,20 @@ Return ONLY valid JSON:
       }
     }
 
-    // Background 2: country verification — corrects & re-caches without blocking the response
-    verifyPoolCountries(verifiedPool, { overwriteExisting: true }).then(async verified => {
-      const changed = verified.some((a, i) => a.countryCode !== verifiedPool[i]?.countryCode);
-      if (changed) {
-        await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName, countryVerified: true }, verified);
-        console.log(`[similar-artists] background country verify updated cache for ${foundName}`);
-      }
-    }).catch(() => {});
+    // Background 2: re-verify artists where MB couldn't confirm on the synchronous pass.
+    // These may have genre-hinted or Claude-guessed countries that MB can now correct.
+    const stillUnverified = verifiedPool.filter(a => a.mbVerified !== true);
+    if (stillUnverified.length > 0) {
+      verifyPoolCountries(stillUnverified, { overwriteExisting: true }).then(async reVerified => {
+        const reVerifiedMap = new Map(reVerified.map(a => [a.name, a]));
+        const updated = verifiedPool.map(a => reVerifiedMap.get(a.name) || a);
+        const changed = updated.some((a, i) => a.countryCode !== verifiedPool[i]?.countryCode);
+        if (changed) {
+          await storeCache(simCacheKey, "similar-artists", { baseArtist: foundName, countryVerified: true }, updated);
+          console.log(`[similar-artists] background country verify updated ${reVerified.filter(a => a.mbVerified === true).length} artists for ${foundName}`);
+        }
+      }).catch(() => {});
+    }
 
     // Seed artist_countries for the top Last.fm similar artists — not just pool members.
     // This primes the fast path so future searches for these artists skip Claude entirely.
