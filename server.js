@@ -508,10 +508,14 @@ const CACHE_TTL = {
 
 async function storeCache(cacheKey, endpoint, result, artistPool = null) {
   if (!supabase) return;
+  // Strip previewUrl from any tracks before persisting — fetched on-demand at playback time
+  const sanitized = result?.tracks
+    ? { ...result, tracks: result.tracks.map(({ previewUrl, ...rest }) => rest) }
+    : result;
   const ttlMs = CACHE_TTL[endpoint];
   const expires_at = ttlMs ? new Date(Date.now() + ttlMs).toISOString() : null;
   await supabase.from("recommendation_cache").upsert(
-    { cache_key: cacheKey, endpoint, result, artist_pool: artistPool, expires_at },
+    { cache_key: cacheKey, endpoint, result: sanitized, artist_pool: artistPool, expires_at },
     { onConflict: "cache_key" }
   );
 }
@@ -3802,23 +3806,25 @@ async function _fetchArtistTracksImpl(artistName) {
 
   if (tracks.length > 0) {
     tracks = await enrichWithDeezer(tracks, artistName);
-    artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-    storeCache(cacheKey, "artist-tracks", { tracks }).catch(() => {});
+    const stripped = tracks.map(({ previewUrl, ...rest }) => rest);
+    artistTracksMemCache.set(cacheKey, { tracks: stripped, cachedAt: Date.now() });
+    storeCache(cacheKey, "artist-tracks", { tracks: stripped }).catch(() => {});
     console.log(`  [artist-tracks] Apple Music → ${tracks.length} tracks for "${artistName}"`);
-    return tracks;
+    return stripped;
   }
 
   // 4. ListenBrainz → Deezer/YouTube enrichment as final fallback
   const lbTracks = await fetchArtistTracksFromLB(artistName);
   const enriched = await enrichTracksWithYouTube(lbTracks, artistName);
   if (enriched.length > 0) {
-    artistTracksMemCache.set(cacheKey, { tracks: enriched, cachedAt: Date.now() });
-    storeCache(cacheKey, "artist-tracks", { tracks: enriched }).catch(() => {});
+    const strippedEnriched = enriched.map(({ previewUrl, ...rest }) => rest);
+    artistTracksMemCache.set(cacheKey, { tracks: strippedEnriched, cachedAt: Date.now() });
+    storeCache(cacheKey, "artist-tracks", { tracks: strippedEnriched }).catch(() => {});
   } else {
     storeCache(cacheKey, "artist-tracks", { tracks: [], flagged: true }).catch(() => {});
     console.log(`  [artist-tracks] no tracks found — flagged for deep enrich: "${artistName}"`);
   }
-  return enriched;
+  return enriched.length > 0 ? strippedEnriched : [];
 }
 
 // ── Spotify OAuth endpoints ──────────────────────────────
@@ -6418,6 +6424,114 @@ async function backfillArtistImageUrls() {
 
   console.log('[image-backfill] done');
 }
+
+// ── On-demand preview URL fetching ──────────────────────────────────────────
+// Short-TTL in-memory cache (10 min) + in-flight deduplication.
+// Collapses burst traffic (e.g. 10 users tapping same track) into 1 API call.
+const PREVIEW_CACHE_TTL_MS = 10 * 60 * 1000;
+const previewUrlCache = new Map(); // key → { url, cachedAt }
+const previewInFlight = new Map(); // key → Promise<string|null>
+
+function previewCacheKey({ deezerId, appleId, spotifyId }) {
+  return deezerId ? `dz:${deezerId}` : appleId ? `am:${appleId}` : spotifyId ? `sp:${spotifyId}` : null;
+}
+
+async function resolvePreviewUrl({ appleId, deezerId, spotifyId, title, artist }) {
+  // 1. Deezer by ID
+  if (deezerId) {
+    try {
+      const r = await deezerEnqueue(() => fetch(`${DEEZER_BASE}/track/${deezerId}`));
+      const d = await r.json();
+      if (d.preview) { console.log(`  [preview] Deezer by ID ${deezerId}`); return d.preview; }
+    } catch {}
+  }
+
+  // 2. Apple Music by ID
+  if (appleId) {
+    const appleToken = generateAppleMusicToken();
+    for (const sf of APPLE_STOREFRONTS) {
+      try {
+        const r = await appleEnqueue(() => fetch(
+          `https://api.music.apple.com/v1/catalog/${sf}/songs/${appleId}`,
+          { headers: { Authorization: `Bearer ${appleToken}` } }
+        ));
+        if (r.ok) {
+          const d = await r.json();
+          const preview = d.data?.[0]?.attributes?.previews?.[0]?.url;
+          if (preview) { console.log(`  [preview] Apple Music by ID ${appleId} (${sf})`); return preview; }
+        }
+      } catch {}
+    }
+  }
+
+  // 3. Spotify by ID
+  if (spotifyId) {
+    try {
+      const token = await getClientAccessToken();
+      if (token) {
+        const r = await spotifyEnqueue(() => fetch(
+          `https://api.spotify.com/v1/tracks/${spotifyId}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        ));
+        if (r.ok) {
+          const d = await r.json();
+          if (d.preview_url) { console.log(`  [preview] Spotify by ID ${spotifyId}`); return d.preview_url; }
+        }
+      }
+    } catch {}
+  }
+
+  // 4. Deezer search fallback
+  if (title && artist) {
+    const found = await deezerTrackSearch(String(title), String(artist));
+    if (found?.previewUrl) { console.log(`  [preview] Deezer search fallback for "${title}" – ${artist}`); return found.previewUrl; }
+  }
+
+  console.log(`  [preview] no preview found (appleId=${appleId}, deezerId=${deezerId}, spotifyId=${spotifyId})`);
+  return null;
+}
+
+app.get("/api/preview", async (req, res) => {
+  const { appleId, deezerId, spotifyId, title, artist } = req.query;
+
+  const key = previewCacheKey({ deezerId, appleId, spotifyId });
+
+  // Serve from short-TTL memory cache if available
+  if (key) {
+    const hit = previewUrlCache.get(key);
+    if (hit && Date.now() - hit.cachedAt < PREVIEW_CACHE_TTL_MS) {
+      return res.json({ previewUrl: hit.url });
+    }
+  }
+
+  // Deduplicate concurrent requests for the same track
+  if (key && previewInFlight.has(key)) {
+    const url = await previewInFlight.get(key);
+    return res.json({ previewUrl: url });
+  }
+
+  const promise = resolvePreviewUrl({ appleId, deezerId, spotifyId, title, artist })
+    .then(url => {
+      if (key) {
+        previewUrlCache.set(key, { url, cachedAt: Date.now() });
+        previewInFlight.delete(key);
+      }
+      return url;
+    })
+    .catch(err => {
+      if (key) previewInFlight.delete(key);
+      throw err;
+    });
+
+  if (key) previewInFlight.set(key, promise);
+
+  try {
+    const url = await promise;
+    return res.json({ previewUrl: url });
+  } catch {
+    return res.json({ previewUrl: null });
+  }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🎵 Musical Passport running at http://localhost:${PORT}\n`);
