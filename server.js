@@ -351,6 +351,36 @@ function makeCacheKey(parts) {
   return normalized;
 }
 
+// ── artist_metadata helpers ───────────────────────────────────────────────────
+// Persist a verified era correction so future enrichment runs don't re-correct
+// the same artist. Fire-and-forget — callers don't need to await this.
+function persistEraFix(name, era) {
+  if (!supabase) return;
+  const slug = makeCacheKey([name]);
+  supabase
+    .from("artist_metadata")
+    .upsert(
+      { slug, name, era, era_verified: true, updated_at: new Date().toISOString() },
+      { onConflict: "slug" }
+    )
+    .then(() => {})
+    .catch(err => console.warn(`[artist_metadata] write failed for ${name}:`, err.message));
+}
+
+// Batch-fetch all verified eras for a list of artist names.
+// Returns a Map<lowerCaseName, era> — only includes artists with era_verified=true.
+async function getVerifiedEras(names) {
+  if (!supabase || !names?.length) return new Map();
+  const slugs = [...new Set(names.map(n => makeCacheKey([n])))];
+  const { data } = await supabase
+    .from("artist_metadata")
+    .select("name, era")
+    .in("slug", slugs)
+    .eq("era_verified", true);
+  if (!data?.length) return new Map();
+  return new Map(data.map(r => [r.name.toLowerCase(), r.era]));
+}
+
 // ─── Genre canonicalization ───────────────────────────────────────────────────
 // Resolves user-facing genre strings to a consistent canonical form so that
 // "polo disco" and "disco polo", "drum 'n' bass" and "drum & bass", "kawwali"
@@ -2035,12 +2065,12 @@ async function mbArtistDetails(artistName) {
   }
 }
 
-async function discogsArtistReleaseYears(artistName, limit = 10) {
+async function discogsArtistReleaseYears(artistName, limit = 25) {
   if (!process.env.DISCOGS_TOKEN) return [];
   const searchName = canonicalizeArtistName(artistName);
   const target = normalizeArtistKey(searchName);
   try {
-    const searchUrl = `${DISCOGS_BASE}/database/search?artist=${encodeURIComponent(searchName)}&type=release&per_page=${Math.min(limit, 20)}&page=1`;
+    const searchUrl = `${DISCOGS_BASE}/database/search?artist=${encodeURIComponent(searchName)}&type=master&per_page=${Math.min(limit, 25)}&page=1`;
     const searchRes = await discogsFetch(searchUrl);
     if (!searchRes.ok) return [];
     const searchData = await searchRes.json();
@@ -2082,7 +2112,7 @@ async function getArtistMetaEvidence(artistName) {
   const correctedName = await lastfmArtistCorrection(canonical).catch(() => null) || canonical;
   const [mbDetails, discogsYears] = await Promise.all([
     mbArtistDetails(correctedName),
-    discogsArtistReleaseYears(correctedName),
+    discogsArtistReleaseYears(correctedName, 25), // 25 releases gives a reliable decade histogram
   ]);
 
   const inferred = inferArtistEraFromEvidence({
@@ -5549,6 +5579,8 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
       const correctedEra = verifiedAnnotated.eraCorrections.get(a.name.toLowerCase());
       if (correctedEra && correctedEra !== a.era) {
         console.log(`  [pool-grow] era fix: ${a.name} ${a.era} → ${correctedEra}`);
+        const hcEra = verifiedAnnotated.highConfidenceEras.get(a.name.toLowerCase());
+        if (hcEra && hcEra === correctedEra) persistEraFix(a.name, hcEra); // only persist when evidence and AI agree
         return { ...a, era: correctedEra };
       }
       return a;
@@ -5682,10 +5714,16 @@ Return JSON:
     return true;
   });
   const eraCorrections = new Map();
+  // highConfidenceEras: only eras backed by real MB/Discogs evidence — these are safe to persist
+  // as era_verified=true. Claude's opinion (below) is non-deterministic and must NOT mark verified.
+  const highConfidenceEras = new Map();
   for (const artist of artistsWithEvidence) {
     const evidence = evidenceByName.get(artist.name.toLowerCase());
     const evidenceEra = normalizeDecade(evidence?.inferredEra);
     if (!evidenceEra) continue;
+    if (evidence?.eraConfidence === "high") {
+      highConfidenceEras.set(artist.name.toLowerCase(), evidenceEra);
+    }
     if (evidence?.eraConfidence === "high" || !normalizeDecade(artist.era)) {
       if (evidenceEra !== normalizeDecade(artist.era)) eraCorrections.set(artist.name.toLowerCase(), evidenceEra);
     }
@@ -5694,26 +5732,40 @@ Return JSON:
     const era = normalizeDecade(correction?.era);
     if (correction?.name && era) eraCorrections.set(correction.name.toLowerCase(), era);
   }
-  return { misattributed, eraCorrections };
+  return { misattributed, eraCorrections, highConfidenceEras };
 }
 
 // Audits the existing artist_pool for a country, identifying misattributed artists
 // and correcting any clearly wrong era tags in place.
 async function auditCountryPool(artistPool, country, apiKey) {
   if (!artistPool?.length) return { removedNames: [], correctedPool: artistPool, changed: false };
-  const names = artistPool.map(a => a.name);
-  console.log(`[pool-audit] ${country}: auditing ${names.length} artists…`);
 
-  const { misattributed, eraCorrections } = await verifyArtistMetadata(artistPool, country, apiKey);
+  // Pre-apply any previously-verified eras so the audit starts from a clean baseline.
+  // Verified artists won't have their eras re-corrected by the AI below.
+  const preVerifiedEras = await getVerifiedEras(artistPool.map(a => a.name));
+  let poolToAudit = artistPool;
+  if (preVerifiedEras.size > 0) {
+    poolToAudit = artistPool.map(a => {
+      const ve = preVerifiedEras.get(a.name.toLowerCase());
+      return ve && ve !== a.era ? { ...a, era: ve } : a;
+    });
+  }
+
+  console.log(`[pool-audit] ${country}: auditing ${poolToAudit.length} artists…`);
+
+  const { misattributed, eraCorrections, highConfidenceEras } = await verifyArtistMetadata(poolToAudit, country, apiKey);
   if (!misattributed.length) {
     if (eraCorrections.size === 0) {
       console.log(`[pool-audit] ${country}: artists and eras verified ✓`);
-      return { removedNames: [], correctedPool: artistPool, changed: false };
+      return { removedNames: [], correctedPool: poolToAudit, changed: preVerifiedEras.size > 0 };
     }
-    const correctedPool = artistPool.map(artist => {
+    const correctedPool = poolToAudit.map(artist => {
+      if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
       const correctedEra = eraCorrections.get(artist.name.toLowerCase());
       if (correctedEra && correctedEra !== artist.era) {
         console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${correctedEra}`);
+        const hcEra = highConfidenceEras.get(artist.name.toLowerCase());
+        if (hcEra && hcEra === correctedEra) persistEraFix(artist.name, hcEra); // only persist when evidence and AI agree
         return { ...artist, era: correctedEra };
       }
       return artist;
@@ -5752,12 +5804,15 @@ async function auditCountryPool(artistPool, country, apiKey) {
   }
 
   const removedNames = misattributed.map(m => m.name.toLowerCase());
-  const correctedPool = artistPool
+  const correctedPool = poolToAudit
     .filter(artist => !removedNames.includes(artist.name.toLowerCase()))
     .map(artist => {
+      if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
       const correctedEra = eraCorrections.get(artist.name.toLowerCase());
       if (correctedEra && correctedEra !== artist.era) {
         console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${correctedEra}`);
+        const hcEra = highConfidenceEras.get(artist.name.toLowerCase());
+        if (hcEra && hcEra === correctedEra) persistEraFix(artist.name, hcEra); // only persist when evidence and AI agree
         return { ...artist, era: correctedEra };
       }
       return artist;
@@ -5859,6 +5914,8 @@ Also include:
       const correctedEra = verifiedResearch.eraCorrections.get(a.name.toLowerCase());
       if (correctedEra && correctedEra !== a.era) {
         console.log(`  [country-enrich] era fix: ${a.name} ${a.era} → ${correctedEra}`);
+        const hcEra = verifiedResearch.highConfidenceEras.get(a.name.toLowerCase());
+        if (hcEra && hcEra === correctedEra) persistEraFix(a.name, hcEra); // only persist when evidence and AI agree
         return { ...a, era: correctedEra };
       }
       return a;
@@ -5921,7 +5978,19 @@ Also include:
   }));
   console.log(`[country-enrich] ${country}: fetched images for ${researchArtistsWithImages.filter(a => a.imageUrl).length}/${researchArtistsWithImages.length} artists`);
 
-  const artistsWithImages = mergeArtistPools(currentPool, researchArtistsWithImages);
+  // Apply any previously-verified eras from artist_metadata before merging —
+  // prevents Claude / Last.fm from overwriting a confirmed correction on the next run.
+  const verifiedEraMap = await getVerifiedEras(
+    [...currentPool, ...researchArtistsWithImages].map(a => a.name)
+  );
+  const applyVerifiedEra = a => {
+    const ve = verifiedEraMap.get(a.name.toLowerCase());
+    return ve && ve !== a.era ? { ...a, era: ve } : a;
+  };
+  const poolForMerge  = verifiedEraMap.size > 0 ? currentPool.map(applyVerifiedEra)              : currentPool;
+  const freshForMerge = verifiedEraMap.size > 0 ? researchArtistsWithImages.map(applyVerifiedEra) : researchArtistsWithImages;
+
+  const artistsWithImages = mergeArtistPools(poolForMerge, freshForMerge);
   console.log(`[country-enrich] ${country}: merged pool base ${currentPool.length} + fresh ${researchArtistsWithImages.length} → ${artistsWithImages.length}`);
 
   await storeCache(cacheKey, "recommend",
