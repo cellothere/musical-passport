@@ -575,9 +575,10 @@ async function verifyArtistTracksForRecommend(artists, country) {
 
     if (uniqueTracks.length > 0) {
       const withDeezer = await enrichWithDeezer(uniqueTracks, artist.name);
-      artistTracksMemCache.set(cacheKey, { tracks: withDeezer, cachedAt: Date.now() });
-      storeCache(cacheKey, "artist-tracks-apple", { tracks: withDeezer }).catch(() => {});
-      return { artist, tracks: withDeezer };
+      const withDeezerStripped = withDeezer.map(({ previewUrl, ...rest }) => rest);
+      artistTracksMemCache.set(cacheKey, { tracks: withDeezerStripped, cachedAt: Date.now() });
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: withDeezerStripped }).catch(() => {});
+      return { artist, tracks: withDeezerStripped };
     }
 
     // Flag it — cron will deep-enrich; Spotify check runs when user taps the card
@@ -4069,15 +4070,16 @@ app.get("/api/artist-tracks-apple/:artistName", async (req, res) => {
       }
     }
 
-    artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-    if (tracks.length > 0) {
-      storeCache(cacheKey, "artist-tracks-apple", { tracks }).catch(() => {});
-      console.log(`  [artist-tracks-apple] cached ${tracks.length} tracks → ${artistName}`);
+    const tracksStripped = tracks.map(({ previewUrl, ...rest }) => rest);
+    artistTracksMemCache.set(cacheKey, { tracks: tracksStripped, cachedAt: Date.now() });
+    if (tracksStripped.length > 0) {
+      storeCache(cacheKey, "artist-tracks-apple", { tracks: tracksStripped }).catch(() => {});
+      console.log(`  [artist-tracks-apple] cached ${tracksStripped.length} tracks → ${artistName}`);
     } else {
       storeCache(cacheKey, "artist-tracks-apple", { tracks: [], flagged: true }).catch(() => {});
       console.log(`  [artist-tracks-apple] no tracks found — flagged for deep enrich: "${artistName}"`);
     }
-    res.json({ tracks });
+    res.json({ tracks: tracksStripped });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -5442,8 +5444,9 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
     if (tracks.length > 0) {
       // Clear flag — we found tracks
       const storeEndpoint = isApple ? "artist-tracks-apple" : "artist-tracks";
-      artistTracksMemCache.set(cacheKey, { tracks, cachedAt: Date.now() });
-      await storeCache(cacheKey, storeEndpoint, { tracks });
+      const tracksStripped = tracks.map(({ previewUrl, ...rest }) => rest);
+      artistTracksMemCache.set(cacheKey, { tracks: tracksStripped, cachedAt: Date.now() });
+      await storeCache(cacheKey, storeEndpoint, { tracks: tracksStripped });
       // Mark as complete in enrichment queue
       if (supabase) {
         await supabase.from("enrichment_queue")
@@ -6022,8 +6025,9 @@ Also include:
     const tracks = await proactiveArtistTracks(artist.name, artist.knownTracks || [], appleToken);
 
     if (tracks.length > 0) {
-      artistTracksMemCache.set(artistCacheKey, { tracks, cachedAt: Date.now() });
-      await storeCache(artistCacheKey, "artist-tracks-apple", { tracks });
+      const tracksStripped = tracks.map(({ previewUrl, ...rest }) => rest);
+      artistTracksMemCache.set(artistCacheKey, { tracks: tracksStripped, cachedAt: Date.now() });
+      await storeCache(artistCacheKey, "artist-tracks-apple", { tracks: tracksStripped });
       console.log(`  [country-enrich] ✓ ${artist.name} → ${tracks.length} tracks${tracks[0]?.appleId ? " (Apple Music)" : " (LB)"}`);
       successfulArtists.push(artist);
     } else {
