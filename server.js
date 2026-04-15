@@ -1739,29 +1739,43 @@ ISO_TO_COUNTRY["IR"] = "Iran";
 ISO_TO_COUNTRY["CI"] = "Ivory Coast";
 
 // Extract an ISO country code from a genre string when it explicitly names a country/region.
-// Used as a fallback when MusicBrainz can't resolve an artist.
+// Used as a fallback when MusicBrainz can't resolve an artist. Uses word-boundary
+// matching so "reggae"→JM does NOT falsely fire on "reggaeton" (a Puerto Rican /
+// Colombian genre), and "samba"→BR doesn't fire on "samba de roda" variants from
+// other countries.
+const GENRE_COUNTRY_HINTS = [
+  ['south african', 'ZA'], ['amapiano', 'ZA'], ['kwaito', 'ZA'], ['afro house', 'ZA'],
+  ['nigerian', 'NG'], ['afrobeats', 'NG'], ['afropop', 'NG'], ['naija', 'NG'],
+  ['ghanaian', 'GH'], ['highlife', 'GH'],
+  ['grime', 'GB'], ['uk rap', 'GB'], ['uk hip-hop', 'GB'], ['british hip hop', 'GB'], ['afroswing', 'GB'],
+  ['k-pop', 'KR'], ['k-rap', 'KR'], ['k-hip-hop', 'KR'], ['korean hip', 'KR'], ['korean r&b', 'KR'],
+  ['j-pop', 'JP'], ['j-rock', 'JP'], ['j-rap', 'JP'], ['japanese hip', 'JP'],
+  ['french rap', 'FR'], ['french hip-hop', 'FR'], ['french pop', 'FR'],
+  ['german rap', 'DE'], ['deutschrap', 'DE'],
+  ['australian hip', 'AU'], ['aussie hip', 'AU'], ['australian pop', 'AU'],
+  ['brazilian', 'BR'], ['baile funk', 'BR'], ['funk carioca', 'BR'], ['pagode', 'BR'], ['samba', 'BR'],
+  ['jamaican', 'JM'], ['dancehall', 'JM'], ['reggae', 'JM'],
+  ['cuban', 'CU'], ['son cubano', 'CU'], ['timba', 'CU'],
+  ['turkish', 'TR'], ['arabesque', 'TR'],
+  ['congolese', 'CD'], ['soukous', 'CD'],
+  ['ethiopian', 'ET'],
+];
+// Pre-compile word-boundary regexes for each hint. The character-class custom
+// boundary handles hyphens and apostrophes (e.g. "k-pop", "j-rock") since \b
+// treats them as word boundaries anyway; we just need to prevent "reggae" from
+// matching inside "reggaeton".
+const GENRE_COUNTRY_HINT_REGEXES = GENRE_COUNTRY_HINTS.map(([kw, code]) => {
+  const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // (^|[^a-z0-9]) and ([^a-z0-9]|$) — require non-alphanumeric boundary so
+  // "reggae" doesn't match the "reggae" prefix of "reggaeton".
+  return { re: new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i'), code };
+});
+
 function countryHintFromGenre(genre) {
   if (!genre) return null;
   const g = genre.toLowerCase();
-  const hints = [
-    ['south african', 'ZA'], ['amapiano', 'ZA'], ['kwaito', 'ZA'], ['afro house', 'ZA'],
-    ['nigerian', 'NG'], ['afrobeats', 'NG'], ['afropop', 'NG'], ['naija', 'NG'],
-    ['ghanaian', 'GH'], ['highlife', 'GH'],
-    ['grime', 'GB'], ['uk rap', 'GB'], ['uk hip-hop', 'GB'], ['british hip hop', 'GB'], ['afroswing', 'GB'],
-    ['k-pop', 'KR'], ['k-rap', 'KR'], ['k-hip-hop', 'KR'], ['korean hip', 'KR'], ['korean r&b', 'KR'],
-    ['j-pop', 'JP'], ['j-rock', 'JP'], ['j-rap', 'JP'], ['japanese hip', 'JP'],
-    ['french rap', 'FR'], ['french hip-hop', 'FR'], ['french pop', 'FR'],
-    ['german rap', 'DE'], ['deutschrap', 'DE'],
-    ['australian hip', 'AU'], ['aussie hip', 'AU'], ['australian pop', 'AU'],
-    ['brazilian', 'BR'], ['baile funk', 'BR'], ['funk carioca', 'BR'], ['pagode', 'BR'], ['samba', 'BR'],
-    ['jamaican', 'JM'], ['dancehall', 'JM'], ['reggae', 'JM'],
-    ['cuban', 'CU'], ['son cubano', 'CU'], ['timba', 'CU'],
-    ['turkish', 'TR'], ['arabesque', 'TR'],
-    ['congolese', 'CD'], ['soukous', 'CD'],
-    ['ethiopian', 'ET'],
-  ];
-  for (const [kw, code] of hints) {
-    if (g.includes(kw)) return code;
+  for (const { re, code } of GENRE_COUNTRY_HINT_REGEXES) {
+    if (re.test(g)) return code;
   }
   return null;
 }
@@ -4529,6 +4543,7 @@ function rerankSimilarPool(pool, { seedTagSet }) {
 function applyGenreCountryHints(pool) {
   return pool.map(a => {
     if (a.mbVerified === true) return a;        // trust real MB verification
+    if (a.mbVerified === 'tag') return a;       // tag nationality is stronger than genre guess
     if (!a.genre) return a;
     const hintCode = countryHintFromGenre(a.genre);
     if (!hintCode || !ISO_TO_COUNTRY[hintCode]) return a;
@@ -4541,6 +4556,117 @@ function applyGenreCountryHints(pool) {
       countryCode: hintCode,
       country: ISO_TO_COUNTRY[hintCode],
       mbVerified: 'genre',
+    };
+  });
+}
+
+// Last.fm user-submitted tag → ISO-2 nationality map. Crowd-verified per
+// artist, so far more reliable than Claude for famous Anglosphere acts that
+// Claude sometimes "diversifies" with fabricated origins (ZAYN=PK because
+// his father is Pakistani, etc.). Checked BEFORE the genre-hint pass.
+const NATIONALITY_TAG_TO_CODE = {
+  british: 'GB', english: 'GB', welsh: 'GB', scottish: 'GB',
+  uk: 'GB', britain: 'GB', england: 'GB', scotland: 'GB', wales: 'GB',
+  american: 'US', usa: 'US', 'united states': 'US', 'u s a': 'US',
+  canadian: 'CA', canada: 'CA',
+  australian: 'AU', australia: 'AU', aussie: 'AU',
+  irish: 'IE', ireland: 'IE',
+  'new zealand': 'NZ', kiwi: 'NZ', nz: 'NZ',
+  french: 'FR', france: 'FR',
+  german: 'DE', germany: 'DE', deutsch: 'DE', deutsche: 'DE',
+  italian: 'IT', italy: 'IT', italia: 'IT',
+  spanish: 'ES', spain: 'ES',
+  portuguese: 'PT', portugal: 'PT',
+  swedish: 'SE', sweden: 'SE', sverige: 'SE',
+  norwegian: 'NO', norway: 'NO', norge: 'NO',
+  danish: 'DK', denmark: 'DK',
+  finnish: 'FI', finland: 'FI', suomi: 'FI',
+  icelandic: 'IS', iceland: 'IS',
+  dutch: 'NL', netherlands: 'NL', holland: 'NL',
+  belgian: 'BE', belgium: 'BE',
+  swiss: 'CH', switzerland: 'CH',
+  austrian: 'AT', austria: 'AT',
+  polish: 'PL', poland: 'PL',
+  russian: 'RU', russia: 'RU',
+  ukrainian: 'UA', ukraine: 'UA',
+  greek: 'GR', greece: 'GR',
+  turkish: 'TR', turkey: 'TR',
+  japanese: 'JP', japan: 'JP',
+  korean: 'KR', korea: 'KR', 'south korea': 'KR',
+  chinese: 'CN', china: 'CN',
+  indian: 'IN', india: 'IN',
+  pakistani: 'PK', pakistan: 'PK',
+  indonesian: 'ID', indonesia: 'ID',
+  thai: 'TH', thailand: 'TH',
+  vietnamese: 'VN', vietnam: 'VN',
+  filipino: 'PH', philippines: 'PH',
+  brazilian: 'BR', brazil: 'BR', brasil: 'BR',
+  mexican: 'MX', mexico: 'MX',
+  argentine: 'AR', argentina: 'AR', argentinian: 'AR',
+  colombian: 'CO', colombia: 'CO',
+  chilean: 'CL', chile: 'CL',
+  peruvian: 'PE', peru: 'PE',
+  cuban: 'CU', cuba: 'CU',
+  'puerto rican': 'PR', 'puerto rico': 'PR',
+  jamaican: 'JM', jamaica: 'JM',
+  'south african': 'ZA', 'south africa': 'ZA',
+  nigerian: 'NG', nigeria: 'NG',
+  ghanaian: 'GH', ghana: 'GH',
+  ethiopian: 'ET', ethiopia: 'ET',
+  kenyan: 'KE', kenya: 'KE',
+  egyptian: 'EG', egypt: 'EG',
+  moroccan: 'MA', morocco: 'MA',
+  algerian: 'DZ', algeria: 'DZ',
+  lebanese: 'LB', lebanon: 'LB',
+  israeli: 'IL', israel: 'IL',
+  iranian: 'IR', iran: 'IR', persian: 'IR',
+};
+
+// Pre-pass: override Claude country codes when the candidate's Last.fm tags
+// explicitly name a nationality AND the existing country has no tag support
+// of its own. Catches Claude's "ancestry, not origin" failure mode (ZAYN=PK
+// because his father is Pakistani, RAYE=ZA, Wallows=NZ etc.) without
+// breaking artists whose tags legitimately mention multiple nationalities
+// (Tinashe has both 'british' and 'american' tags — Claude said US, we
+// keep US because 'american' is in the list).
+//
+// Rule:
+//   1. Collect the set of ISO codes implied by all nationality tags.
+//   2. If the existing countryCode is in that set, KEEP it (corroborated).
+//   3. Otherwise, override to the FIRST matched code (tag-order consensus).
+function applyTagNationalityHints(pool) {
+  return pool.map(a => {
+    if (a.mbVerified === true) return a;
+    const tags = Array.isArray(a.tags) ? a.tags : [];
+    if (tags.length === 0) return a;
+    // Scan all tags, collect every nationality code mentioned and remember
+    // the first one (which is the most-voted consensus per Last.fm ordering).
+    const tagCodes = new Set();
+    let firstCode = null;
+    for (const tag of tags) {
+      const norm = (tag || '').toLowerCase().trim();
+      if (!norm) continue;
+      const code = NATIONALITY_TAG_TO_CODE[norm];
+      if (code && ISO_TO_COUNTRY[code]) {
+        tagCodes.add(code);
+        if (!firstCode) firstCode = code;
+      }
+    }
+    if (!firstCode) return a;
+    // If the existing country is corroborated by ANY nationality tag, keep it.
+    // This prevents the Tinashe-style false positive where tags include both
+    // 'british' (position 4) and 'american' (position 7) — Claude correctly
+    // says US and 'american' supports it, so we don't flip to GB.
+    if (a.countryCode && tagCodes.has(a.countryCode)) return a;
+    // No corroboration — use the first (most-voted) nationality tag.
+    if (a.countryCode) {
+      console.log(`[tag-hint] ${a.name}: ${a.countryCode} → ${firstCode} (tag match, no corroboration)`);
+    }
+    return {
+      ...a,
+      countryCode: firstCode,
+      country: ISO_TO_COUNTRY[firstCode],
+      mbVerified: 'tag',
     };
   });
 }
@@ -4671,6 +4797,7 @@ app.post("/api/similar-artists", async (req, res) => {
         try {
           let pool = simCached.artist_pool;
           if (needsVerify) {
+            pool = applyTagNationalityHints(pool);
             pool = applyGenreCountryHints(pool);
             pool = await verifyPoolCountries(pool);
           }
@@ -4858,16 +4985,17 @@ app.post("/api/similar-artists", async (req, res) => {
         ? `\nLast.fm similar artists (sonic reference, already ranked):\n${lastfmSimilar.slice(0, 15).map(a => `- ${a.name} (${(a.match * 100).toFixed(0)}%)`).join('\n')}`
         : '';
 
-      const prompt = `Find up to ${needCount} artists from different countries who sound genuinely similar to ${foundName}.
+      const prompt = `Find up to ${needCount} artists who sound genuinely similar to ${foundName}.
 
 Their profile:
 ${tagLines}${lfLines}${alreadyLines}
 
 Rules:
-- Each artist must be from a DIFFERENT country than the ones already listed above
-- Sort by sonic similarity, not by geographic coverage
-- When you have 5+ equally-strong Anglosphere matches (US/UK/Canada/Australia/New Zealand/Ireland), include 2–3 artists from OUTSIDE the Anglosphere (continental Europe, Latin America, Asia, Africa, Middle East, Oceania) who genuinely share the sonic profile. Scandinavian pop, French chanson, Belgian/German/Spanish pop, Latin pop singer-songwriters, J-pop/K-pop indie, and African/Middle Eastern equivalents all count. NEVER invent stretches to fill regions — but do reach for real peers before defaulting to yet another US indie artist
-- Return fewer than ${needCount} if you don't know enough real sonic matches — NEVER invent filler`;
+- Sort by sonic similarity. Country of origin is secondary.
+- Prefer avoiding duplicate countries when you have equally-strong options, but it's completely fine to return multiple artists from the same country when that country is where the genre actually lives (e.g. multiple British rock bands, multiple American country artists, multiple French house producers).
+- NEVER fabricate an artist's country of origin to satisfy a diversity constraint. Report each artist's REAL country where they were born/raised or where the band formed — ancestry, parents' origin, or fanbase do not count. If you're not sure of a real country, omit the artist.
+- When you have 5+ equally-strong Anglosphere matches (US/UK/Canada/Australia/New Zealand/Ireland), include 2–3 artists from OUTSIDE the Anglosphere (continental Europe, Latin America, Asia, Africa, Middle East, Oceania) who genuinely share the sonic profile. Scandinavian pop, French chanson, Belgian/German/Spanish pop, Latin pop singer-songwriters, J-pop/K-pop indie, and African/Middle Eastern equivalents all count. NEVER invent stretches to fill regions — but do reach for real peers before defaulting to yet another US indie artist.
+- Return fewer than ${needCount} if you don't know enough real sonic matches — NEVER invent filler.`;
 
       try {
         const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
@@ -4997,14 +5125,20 @@ Rules:
     }
 
     // ── Country verification ──────────────────────────────────────────
-    // Two-step so we don't inherit the old "MB is authoritative" failure
+    // Three-step so we don't inherit the old "MB is authoritative" failure
     // mode (e.g. MB has a single exact match for "Nick Drake" in Canada that
-    // outranks the famous British one). Step 1 rewrites obviously-wrong
-    // Claude countries using the genre string itself — catches Nasty C=JP
-    // (genre says "South African Hip-Hop") without touching ambiguous names.
-    // Step 2 fills in MISSING codes from MB but leaves Claude's stated
-    // countries alone for artists with a region-neutral genre.
-    const genreHinted = applyGenreCountryHints(pool);
+    // outranks the famous British one).
+    //   Step 1: tag-nationality hints — overrides Claude when a candidate's
+    //           Last.fm tags explicitly name a nationality ("british",
+    //           "american", etc.). Catches Claude's "ancestry not origin"
+    //           failure like ZAYN=PK, RAYE=ZA.
+    //   Step 2: genre-country hints — catches Nasty C=JP (genre says
+    //           "South African Hip-Hop") without touching ambiguous names.
+    //   Step 3: verifyPoolCountries — fills MISSING codes from MB but
+    //           leaves Claude's stated countries alone for artists with
+    //           no nationality tag and a region-neutral genre.
+    const tagHinted = applyTagNationalityHints(pool);
+    const genreHinted = applyGenreCountryHints(tagHinted);
     const fullyVerified = await verifyPoolCountries(genreHinted);
     let finalPool = fullyVerified.filter(a => a.countryCode && ISO_TO_COUNTRY[a.countryCode]);
     finalPool = filterBase(finalPool, foundName);
