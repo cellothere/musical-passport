@@ -1354,6 +1354,16 @@ let mbLastRequestAt = 0; // timestamp of the last fired request (including retri
 // into a rate-limited MB after finishing the retried item.
 let mbRateLimitedUntil = 0;
 
+// Circuit breaker: after MB_CIRCUIT_THRESHOLD consecutive transient failures
+// (503/429/5xx/timeout) across queue items, open the circuit for
+// MB_CIRCUIT_OPEN_MS. While open, every queued mbFetch resolves immediately
+// with { ok:false, status:503 } — no network request fires. Callers already
+// handle this via isMbTransientStatus → null fallback.
+const MB_CIRCUIT_THRESHOLD  = 3;
+const MB_CIRCUIT_OPEN_MS    = 5 * 60 * 1000; // 5 minutes
+let mbConsecutiveFailures   = 0;
+let mbCircuitOpenUntil      = 0;
+
 async function logMbHttpIssue(url, response, elapsedMs) {
   const headers = {
     retryAfter: response.headers.get("retry-after") || null,
@@ -1406,6 +1416,15 @@ async function drainMbQueue() {
   mbBusy = true;
   while (mbQueue.length > 0) {
     const { url, resolve, reject } = mbQueue.shift();
+
+    // ── Circuit breaker: if open, short-circuit without hitting the network ──
+    if (Date.now() < mbCircuitOpenUntil) {
+      const remainingS = Math.ceil((mbCircuitOpenUntil - Date.now()) / 1000);
+      console.warn(`[MB] circuit open — skipping queued call (${remainingS}s remaining, ${mbQueue.length} more queued)`);
+      resolve({ ok: false, status: 503 });
+      continue;
+    }
+
     try {
       let finalResponse = null;
       for (let attempt = 0; attempt <= MB_MAX_RETRIES; attempt++) {
@@ -1467,8 +1486,27 @@ async function drainMbQueue() {
         }
       }
 
+      // ── Circuit breaker bookkeeping ──
+      const succeeded = finalResponse?.ok === true;
+      if (succeeded) {
+        if (mbConsecutiveFailures > 0) mbConsecutiveFailures = 0;
+      } else {
+        mbConsecutiveFailures++;
+        if (mbConsecutiveFailures >= MB_CIRCUIT_THRESHOLD && Date.now() >= mbCircuitOpenUntil) {
+          mbCircuitOpenUntil = Date.now() + MB_CIRCUIT_OPEN_MS;
+          console.warn(
+            `[MB] circuit OPEN after ${mbConsecutiveFailures} consecutive failures — suspending MB requests for ${MB_CIRCUIT_OPEN_MS / 1000}s (${mbQueue.length} queued calls will be skipped)`
+          );
+        }
+      }
+
       resolve(finalResponse ?? { ok: false, status: 520 });
     } catch (e) {
+      mbConsecutiveFailures++;
+      if (mbConsecutiveFailures >= MB_CIRCUIT_THRESHOLD && Date.now() >= mbCircuitOpenUntil) {
+        mbCircuitOpenUntil = Date.now() + MB_CIRCUIT_OPEN_MS;
+        console.warn(`[MB] circuit OPEN after ${mbConsecutiveFailures} consecutive failures (exception: ${e.message})`);
+      }
       reject(e);
     }
     // Gap is now enforced at the top of each fire — no bottom-of-loop wait needed.
