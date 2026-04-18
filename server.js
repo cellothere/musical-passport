@@ -122,10 +122,15 @@ function parseClaudeJson(text, label = "Claude response") {
   }
 }
 
-// ── Artist image URL fetching (Spotify → Apple Music → Last.fm fallback) ──
-// Priority: Apple Music → Last.fm → Spotify (last resort, dev-mode quota is precious).
-// Spotify is only tried if not currently rate-limited and skipSpotify is false.
-async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = null } = {}) {
+// ── Artist image URL fetching (Apple Music → Last.fm → Deezer) ──
+// Priority: Apple Music → Last.fm → Deezer.
+// Spotify is intentionally NOT used as a source: Spotify Developer Terms §IV.4
+// prohibit caching Spotify Content (which includes images) beyond what is
+// necessary for direct end-user use, and our recommendation_cache persists
+// imageUrl values long-term inside artist_pool JSON.
+// The skipSpotify parameter is retained for backwards compatibility with
+// callers but is now a no-op.
+async function fetchArtistImageUrl(artistName, { skipSpotify: _skipSpotify = false, genre = null } = {}) {
   const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const target = normalise(artistName);
 
@@ -192,36 +197,6 @@ async function fetchArtistImageUrl(artistName, { skipSpotify = false, genre = nu
       if (deezerImageUrl) return deezerImageUrl;
     } catch {}
   }
-
-  // 4. Spotify — last resort only; dev-mode quota is very limited (30 req/30s window)
-  if (!skipSpotify && Date.now() >= spotifyRateLimitedUntil) try {
-    const spotifyImageUrl = await spotifyEnqueue(async () => {
-      const token = await getClientAccessToken();
-      if (!token) return null;
-      const normalize = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const qNorm = normalize(artistName);
-      const r = await spotifyFetch(
-        `https://api.spotify.com/v1/search?q=${encodeURIComponent(artistName)}&type=artist&limit=5`,
-        { headers: { Authorization: 'Bearer ' + token } }
-      );
-      if (!r.ok) return null;
-      const data = await r.json();
-      const candidates = data.artists?.items || [];
-      if (candidates.length === 0) return null;
-      const match = candidates.find(a => normalize(a.name) === qNorm)
-        || candidates.find(a => normalize(a.name).startsWith(qNorm) || qNorm.startsWith(normalize(a.name)))
-        || candidates[0];
-      if (!match || !(normalize(match.name).includes(qNorm) || qNorm.includes(normalize(match.name)))) return null;
-      if (genre && match.genres && match.genres.length > 0) {
-        const spotifyGenreStr = match.genres.join(' ').toLowerCase();
-        const genreWords = genre.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 3);
-        const hasOverlap = genreWords.length === 0 || genreWords.some(w => spotifyGenreStr.includes(w));
-        if (!hasOverlap) return null;
-      }
-      return match.images?.[0]?.url || null;
-    });
-    if (spotifyImageUrl) return spotifyImageUrl;
-  } catch {}
 
   return null;
 }
