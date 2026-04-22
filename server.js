@@ -481,12 +481,16 @@ const CACHE_TTL = {
   'genre-artists':      180 * 24 * 60 * 60 * 1000,
 };
 
+// Strip previewUrl from any tracks in a result — applied before both DB persistence
+// and HTTP responses. Third-party CDN preview URLs must only be resolved on-demand via /api/preview.
+function stripPreviewUrls(result) {
+  if (!result?.tracks) return result;
+  return { ...result, tracks: result.tracks.map(({ previewUrl, ...rest }) => rest) };
+}
+
 async function storeCache(cacheKey, endpoint, result, artistPool = null) {
   if (!supabase) return;
-  // Strip previewUrl from any tracks before persisting — fetched on-demand at playback time
-  const sanitized = result?.tracks
-    ? { ...result, tracks: result.tracks.map(({ previewUrl, ...rest }) => rest) }
-    : result;
+  const sanitized = stripPreviewUrls(result);
   const ttlMs = CACHE_TTL[endpoint];
   const expires_at = ttlMs ? new Date(Date.now() + ttlMs).toISOString() : null;
   await supabase.from("recommendation_cache").upsert(
@@ -2947,7 +2951,7 @@ app.post("/api/time-machine", async (req, res) => {
         const tmResult = { country, decade, ...resolved };
         await storeCache(tmCacheKey, "time-machine", tmResult);
         console.log(`[LB] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
-        return res.json(tmResult);
+        return res.json(stripPreviewUrls(tmResult));
       }
       console.log(`[LB] Not enough tracks found on streaming, trying MusicBrainz`);
     }
@@ -2972,7 +2976,7 @@ app.post("/api/time-machine", async (req, res) => {
         const tmResult = { country, decade, ...resolved };
         await storeCache(tmCacheKey, "time-machine", tmResult);
         console.log(`[MB] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
-        return res.json(tmResult);
+        return res.json(stripPreviewUrls(tmResult));
       }
       console.log(`[MB] Not enough tracks found on streaming, trying Discogs`);
     }
@@ -2986,7 +2990,7 @@ app.post("/api/time-machine", async (req, res) => {
         const tmResult = { country, decade, ...resolved };
         await storeCache(tmCacheKey, "time-machine", tmResult);
         console.log(`[Discogs] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
-        return res.json(tmResult);
+        return res.json(stripPreviewUrls(tmResult));
       }
       console.log(`[Discogs] Not enough tracks on streaming, trying merged pool`);
     }
@@ -3007,7 +3011,7 @@ app.post("/api/time-machine", async (req, res) => {
         const tmResult = { country, decade, ...resolved };
         await storeCache(tmCacheKey, "time-machine", tmResult);
         console.log(`[merged] Time Machine served ${resolved.tracks.length} tracks for ${country} ${decade}`);
-        return res.json(tmResult);
+        return res.json(stripPreviewUrls(tmResult));
       }
     }
 
@@ -3182,7 +3186,7 @@ Include exactly 8 tracks. Every artist must be genuinely from or rooted in ${cou
     const tmResult = { country, decade, genre: spotlight.genre, tracks: validTracks };
     await storeCache(tmCacheKey, "time-machine", tmResult);
     console.log(`[time-machine] Claude → ${country} ${decade} (${validTracks.length} tracks)`);
-    res.json(tmResult);
+    res.json(stripPreviewUrls(tmResult));
   } catch (err) {
     console.error("Time machine error:", err);
     res.status(500).json({ error: err.message });
@@ -3245,7 +3249,7 @@ app.post("/api/genre-spotlight", async (req, res) => {
   if (gsCached) {
     console.log(`[genre-spotlight] cache hit → ${genre} / ${country}`);
     const supplemented = await supplementFromRelatedArtists(gsCached.result);
-    return res.json(supplemented);
+    return res.json(stripPreviewUrls(supplemented));
   }
 
   try {
@@ -3545,7 +3549,7 @@ Return exactly this JSON:
 
     await storeCache(gsCacheKey, "genre-spotlight", gsResult);
     console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${gsResult.tracks.length} tracks)`);
-    res.json(gsResult);
+    res.json(stripPreviewUrls(gsResult));
   } catch (err) {
     console.error("Genre spotlight error:", err);
     res.status(500).json({ error: err.message });
