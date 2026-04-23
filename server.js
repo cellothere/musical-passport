@@ -183,19 +183,15 @@ async function fetchArtistImageUrl(artistName, { skipSpotify: _skipSpotify = fal
 
   // 3. Deezer — high-quality artist images, no auth, no quota cost vs Spotify
   for (const term of terms) {
-    try {
-      const deezerImageUrl = await deezerEnqueue(async () => {
-        const r = await fetch(`${DEEZER_BASE}/search/artist?q=${encodeURIComponent(term)}&limit=5`);
-        if (!r.ok) return null;
-        const d = await r.json();
-        if (d.error?.code === 4) return null;
-        const artists = d.data || [];
-        const match = artists.find(a => normalise(a.name) === target)
-          ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || target.includes(n); });
-        return match?.picture_xl || match?.picture_big || null;
-      });
-      if (deezerImageUrl) return deezerImageUrl;
-    } catch {}
+    const d = await deezerEnqueue(() =>
+      deezerFetchJson(`/search/artist?q=${encodeURIComponent(term)}&limit=5`, 'Deezer image')
+    );
+    if (!d || d.error?.code === 4) continue;
+    const artists = d.data || [];
+    const match = artists.find(a => normalise(a.name) === target)
+      ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || target.includes(n); });
+    const url = match?.picture_xl || match?.picture_big || null;
+    if (url) return url;
   }
 
   return null;
@@ -5818,8 +5814,16 @@ async function lastfmArtistCorrection(artistName) {
 // No API key required. Rate limit: 50 req/5s per IP.
 // Preview URLs are plain 30s MP3s — work on iOS, Android, and web.
 const DEEZER_BASE = 'https://api.deezer.com';
+const DEEZER_UA = 'MusicalPassport/1.0 (+https://musicalpassport.app)';
 const deezerQueue = [];
 let deezerBusy = false;
+
+// Circuit breaker: when Deezer's edge starts returning HTML error pages
+// (common on shared Railway/egress IPs), stop hammering the API and flooding logs.
+let deezerConsecutiveFailures = 0;
+let deezerBlockedUntil = 0;
+const DEEZER_BLOCK_THRESHOLD = 5;
+const DEEZER_BLOCK_COOLDOWN_MS = 10 * 60 * 1000;
 
 function deezerEnqueue(fn) {
   return new Promise((resolve, reject) => {
@@ -5834,6 +5838,49 @@ async function drainDeezerQueue() {
   const { fn, resolve, reject } = deezerQueue.shift();
   try { resolve(await fn()); } catch (e) { reject(e); }
   setTimeout(drainDeezerQueue, 150); // 6.7/s → well within 50/5s limit
+}
+
+function deezerIsBlocked() {
+  return Date.now() < deezerBlockedUntil;
+}
+
+function noteDeezerFailure(label, status, contentType) {
+  deezerConsecutiveFailures++;
+  if (deezerConsecutiveFailures === 1 || deezerConsecutiveFailures % 10 === 0) {
+    console.warn(`  [${label}] non-JSON response (HTTP ${status || '?'}, ct=${contentType || 'none'}) — likely IP block`);
+  }
+  if (deezerConsecutiveFailures === DEEZER_BLOCK_THRESHOLD) {
+    deezerBlockedUntil = Date.now() + DEEZER_BLOCK_COOLDOWN_MS;
+    console.warn(`  [Deezer] cooling down for ${Math.round(DEEZER_BLOCK_COOLDOWN_MS / 60000)}m after ${deezerConsecutiveFailures} failures`);
+  }
+}
+
+function noteDeezerSuccess() {
+  if (deezerConsecutiveFailures > 0) console.log(`  [Deezer] recovered after ${deezerConsecutiveFailures} failures`);
+  deezerConsecutiveFailures = 0;
+  deezerBlockedUntil = 0;
+}
+
+// Fetches a Deezer endpoint and returns parsed JSON, or null if the response
+// is not JSON / not OK / we are currently circuit-broken. Never throws.
+async function deezerFetchJson(path, label = 'Deezer') {
+  if (deezerIsBlocked()) return null;
+  try {
+    const r = await fetch(`${DEEZER_BASE}${path}`, {
+      headers: { 'User-Agent': DEEZER_UA, 'Accept': 'application/json' },
+    });
+    const ct = r.headers.get('content-type') || '';
+    if (!r.ok || !ct.includes('json')) {
+      noteDeezerFailure(label, r.status, ct);
+      return null;
+    }
+    const data = await r.json();
+    noteDeezerSuccess();
+    return data;
+  } catch (err) {
+    noteDeezerFailure(label, 0, `err:${err.message}`);
+    return null;
+  }
 }
 
 // ── Apple Music API queue ─────────────────────────────────
@@ -5859,49 +5906,44 @@ async function drainAppleQueue() {
 
 // Returns top tracks for an artist from Deezer with 30s preview MP3 URLs.
 async function deezerArtistTopTracks(artistName, limit = 5) {
-  try {
-    const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const target = normalise(artistName);
+  const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const target = normalise(artistName);
 
-    // Step 1: find the artist
-    const searchRes = await deezerEnqueue(() =>
-      fetch(`${DEEZER_BASE}/search/artist?q=${encodeURIComponent(artistName)}&limit=5`)
-    );
-    const searchData = await searchRes.json();
-    if (searchData.error?.code === 4) { console.warn('  [Deezer] quota exceeded'); return []; }
+  // Step 1: find the artist
+  const searchData = await deezerEnqueue(() =>
+    deezerFetchJson(`/search/artist?q=${encodeURIComponent(artistName)}&limit=5`, 'Deezer')
+  );
+  if (!searchData) return [];
+  if (searchData.error?.code === 4) { console.warn('  [Deezer] quota exceeded'); return []; }
 
-    const artists = searchData.data || [];
-    const matched = artists.find(a => normalise(a.name) === target)
-      ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || (n.length >= 5 && target.includes(n)); });
+  const artists = searchData.data || [];
+  const matched = artists.find(a => normalise(a.name) === target)
+    ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || (n.length >= 5 && target.includes(n)); });
 
-    if (!matched) { console.log(`  [Deezer] no artist match for "${artistName}"`); return []; }
+  if (!matched) { console.log(`  [Deezer] no artist match for "${artistName}"`); return []; }
 
-    // Step 2: get top tracks
-    const topRes = await deezerEnqueue(() =>
-      fetch(`${DEEZER_BASE}/artist/${matched.id}/top?limit=${limit}`)
-    );
-    const topData = await topRes.json();
-    if (topData.error?.code === 4) return [];
+  // Step 2: get top tracks
+  const topData = await deezerEnqueue(() =>
+    deezerFetchJson(`/artist/${matched.id}/top?limit=${limit}`, 'Deezer')
+  );
+  if (!topData) return [];
+  if (topData.error?.code === 4) return [];
 
-    const allWithPreview = (topData.data || []).filter(t => t.preview);
-    // Prefer tracks where this artist is the main artist, not just a featured guest
-    const ownTracks = allWithPreview.filter(t => t.artist?.id === matched.id);
-    const tracks = (ownTracks.length >= 2 ? ownTracks : allWithPreview)
-      .slice(0, 3)
-      .map(t => ({
-        title: t.title_short || t.title,
-        artist: t.artist?.name || artistName,
-        previewUrl: t.preview,
-        deezerId: String(t.id),
-        deezerUrl: t.link,
-      }));
+  const allWithPreview = (topData.data || []).filter(t => t.preview);
+  // Prefer tracks where this artist is the main artist, not just a featured guest
+  const ownTracks = allWithPreview.filter(t => t.artist?.id === matched.id);
+  const tracks = (ownTracks.length >= 2 ? ownTracks : allWithPreview)
+    .slice(0, 3)
+    .map(t => ({
+      title: t.title_short || t.title,
+      artist: t.artist?.name || artistName,
+      previewUrl: t.preview,
+      deezerId: String(t.id),
+      deezerUrl: t.link,
+    }));
 
-    if (tracks.length > 0) console.log(`  [Deezer] ${tracks.length} tracks for "${artistName}"`);
-    return tracks;
-  } catch (err) {
-    console.error(`  [Deezer] error for "${artistName}":`, err.message);
-    return [];
-  }
+  if (tracks.length > 0) console.log(`  [Deezer] ${tracks.length} tracks for "${artistName}"`);
+  return tracks;
 }
 
 // Enriches any tracks missing a deezerId by calling deezerTrackSearch per track.
@@ -5915,56 +5957,47 @@ async function enrichWithDeezer(tracks, artistName) {
 
 // Search Deezer for a specific track by title + artist. Returns a track object with previewUrl or null.
 async function deezerTrackSearch(trackTitle, artistName) {
-  try {
-    const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const target = normalise(artistName);
-    const r = await deezerEnqueue(() =>
-      fetch(`${DEEZER_BASE}/search?q=artist:"${encodeURIComponent(artistName)}" track:"${encodeURIComponent(trackTitle)}"&limit=5`)
-    );
-    const d = await r.json();
-    if (d.error?.code === 4) return null;
-    const items = (d.data || []).filter(t =>
-      t.preview && (normalise(t.artist?.name || '').includes(target) || target.includes(normalise(t.artist?.name || '')))
-    );
-    const best = items[0];
-    if (!best) return null;
-    return {
-      title: best.title_short || best.title,
-      artist: best.artist?.name || artistName,
-      previewUrl: best.preview,
-      deezerId: String(best.id),
-      deezerUrl: best.link,
-    };
-  } catch { return null; }
+  const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const target = normalise(artistName);
+  const d = await deezerEnqueue(() =>
+    deezerFetchJson(`/search?q=artist:"${encodeURIComponent(artistName)}" track:"${encodeURIComponent(trackTitle)}"&limit=5`, 'Deezer')
+  );
+  if (!d || d.error?.code === 4) return null;
+  const items = (d.data || []).filter(t =>
+    t.preview && (normalise(t.artist?.name || '').includes(target) || target.includes(normalise(t.artist?.name || '')))
+  );
+  const best = items[0];
+  if (!best) return null;
+  return {
+    title: best.title_short || best.title,
+    artist: best.artist?.name || artistName,
+    previewUrl: best.preview,
+    deezerId: String(best.id),
+    deezerUrl: best.link,
+  };
 }
 
 async function deezerRelatedArtists(artistName) {
-  try {
-    const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const target = normalise(artistName);
+  const normalise = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const target = normalise(artistName);
 
-    const searchRes = await deezerEnqueue(() =>
-      fetch(`${DEEZER_BASE}/search/artist?q=${encodeURIComponent(artistName)}&limit=5`)
-    );
-    const searchData = await searchRes.json();
-    if (searchData.error?.code === 4) { console.warn('  [Deezer related] quota exceeded'); return []; }
+  const searchData = await deezerEnqueue(() =>
+    deezerFetchJson(`/search/artist?q=${encodeURIComponent(artistName)}&limit=5`, 'Deezer related')
+  );
+  if (!searchData) return [];
+  if (searchData.error?.code === 4) { console.warn('  [Deezer related] quota exceeded'); return []; }
 
-    const artists = searchData.data || [];
-    const matched = artists.find(a => normalise(a.name) === target)
-      ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || (n.length >= 5 && target.includes(n)); });
-    if (!matched) return [];
+  const artists = searchData.data || [];
+  const matched = artists.find(a => normalise(a.name) === target)
+    ?? artists.find(a => { const n = normalise(a.name); return n.includes(target) || (n.length >= 5 && target.includes(n)); });
+  if (!matched) return [];
 
-    const relRes = await deezerEnqueue(() =>
-      fetch(`${DEEZER_BASE}/artist/${matched.id}/related?limit=20`)
-    );
-    const relData = await relRes.json();
-    if (relData.error?.code === 4) return [];
+  const relData = await deezerEnqueue(() =>
+    deezerFetchJson(`/artist/${matched.id}/related?limit=20`, 'Deezer related')
+  );
+  if (!relData || relData.error?.code === 4) return [];
 
-    return (relData.data || []).map(a => a.name).filter(Boolean).slice(0, 20);
-  } catch (err) {
-    console.error(`  [Deezer related] error for "${artistName}":`, err.message);
-    return [];
-  }
+  return (relData.data || []).map(a => a.name).filter(Boolean).slice(0, 20);
 }
 
 // ── YouTube helpers ────────────────────────────────────────
@@ -7143,11 +7176,8 @@ function previewCacheKey({ deezerId, appleId, spotifyId }) {
 async function resolvePreviewUrl({ appleId, deezerId, spotifyId, title, artist }) {
   // 1. Deezer by ID
   if (deezerId) {
-    try {
-      const r = await deezerEnqueue(() => fetch(`${DEEZER_BASE}/track/${deezerId}`));
-      const d = await r.json();
-      if (d.preview) { console.log(`  [preview] Deezer by ID ${deezerId}`); return d.preview; }
-    } catch {}
+    const d = await deezerEnqueue(() => deezerFetchJson(`/track/${deezerId}`, 'Deezer preview'));
+    if (d?.preview) { console.log(`  [preview] Deezer by ID ${deezerId}`); return d.preview; }
   }
 
   // 2. Apple Music by ID
