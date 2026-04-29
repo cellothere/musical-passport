@@ -5441,7 +5441,7 @@ function historicalMusicRegionGuidance(country) {
   return `Historical-region rule for ${canonical}: this is not a modern nationality bucket. Include real artists, ensembles, scholars, or tradition bearers who either (a) were active in or directly tied to the historical polity/period, (b) come from its successor regions and perform that specific tradition, or (c) make scholarly or historically grounded reconstructions of that tradition. For ancient civilizations, modern reconstruction ensembles are expected; do not imply they are literal ancient-era performers.`;
 }
 
-function mergeArtistPools(existingPool = [], incomingPool = [], limit = 40) {
+function mergeArtistPools(existingPool = [], incomingPool = [], limit = 80) {
   const merged = new Map();
 
   for (const artist of existingPool) {
@@ -6200,7 +6200,7 @@ async function deepEnrichFlaggedArtists(apiKey, limit = 5) {
   return { processed, total: toEnrich.length };
 }
 
-const POOL_CAP = 40;
+const POOL_CAP = 80;
 const POOL_GROW_TARGET = 3; // additions per enrichment run
 
 // Tries to grow a country's artist pool toward POOL_CAP with verified additions.
