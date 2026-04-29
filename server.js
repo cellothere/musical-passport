@@ -6314,6 +6314,7 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     for (const m of verifiedAnnotated.misattributed) {
       console.log(`  [pool-grow] removed candidate ${m.name} → actually from ${m.actualCountry}`);
     }
+    await routeMisattributedToCorrectCountry(verifiedAnnotated.misattributed, annotated, verifiedAnnotated.eraCorrections, country);
   }
   annotated = annotated
     .filter(a => !annotatedToRemove.has(a.name.toLowerCase()))
@@ -6447,14 +6448,20 @@ Return JSON:
   }
 
   const currentCountryNorm = normalizeCountryName(country);
-  const misattributed = (result.misattributed || []).filter(a => {
-    if (!a?.name || !a?.actualCountry) return false;
-    const actualCountry = String(a.actualCountry).trim();
-    if (!actualCountry) return false;
-    if (/[()/]/.test(actualCountry) || /\bmixed attribution\b/i.test(actualCountry)) return false;
-    if (normalizeCountryName(actualCountry) === currentCountryNorm) return false;
-    return true;
-  });
+  // Each misattributed item is tagged internally with `source` so we can apply
+  // different downstream policies: MB-derived flags are deterministic and trusted;
+  // Claude-only flags get a tiebreaker pass before we act on them. Source is
+  // stripped before returning so callers see a clean shape.
+  const misattributed = (result.misattributed || [])
+    .filter(a => {
+      if (!a?.name || !a?.actualCountry) return false;
+      const actualCountry = String(a.actualCountry).trim();
+      if (!actualCountry) return false;
+      if (/[()/]/.test(actualCountry) || /\bmixed attribution\b/i.test(actualCountry)) return false;
+      if (normalizeCountryName(actualCountry) === currentCountryNorm) return false;
+      return true;
+    })
+    .map(a => ({ ...a, source: "claude" }));
 
   // Deterministic guardrail: if MusicBrainz has a country code on file for an
   // artist and it disagrees with the target country, treat that as authoritative
@@ -6462,17 +6469,62 @@ Return JSON:
   // these blind spots (e.g. proposing US artist "sombr" for Latvia).
   const targetIso = COUNTRY_ISO[country] || null;
   if (targetIso) {
-    const alreadyFlagged = new Set(misattributed.map(m => m.name.toLowerCase()));
+    const flagByName = new Map(misattributed.map(m => [m.name.toLowerCase(), m]));
     for (const artist of artistsWithEvidence) {
       const evidence = evidenceByName.get(artist.name.toLowerCase());
       const mbIso = evidence?.countryCode;
       if (!mbIso || mbIso === targetIso) continue;
-      if (alreadyFlagged.has(artist.name.toLowerCase())) continue;
       const actualCountry = ISO_TO_COUNTRY[mbIso];
       if (!actualCountry || normalizeCountryName(actualCountry) === currentCountryNorm) continue;
-      misattributed.push({ name: artist.name, actualCountry });
-      alreadyFlagged.add(artist.name.toLowerCase());
+      const existing = flagByName.get(artist.name.toLowerCase());
+      if (existing) {
+        // Claude and MB agree → upgrade to MB-source (deterministic) and prefer MB's actualCountry mapping.
+        existing.source = "mb";
+        existing.actualCountry = actualCountry;
+      } else {
+        const flag = { name: artist.name, actualCountry, source: "mb" };
+        misattributed.push(flag);
+        flagByName.set(artist.name.toLowerCase(), flag);
+      }
     }
+  }
+
+  // Strong rejection: if MB explicitly confirms the artist IS from the target country,
+  // Claude's misattribution flag is almost certainly wrong — drop it before any tiebreaker.
+  if (targetIso) {
+    for (let i = misattributed.length - 1; i >= 0; i--) {
+      const m = misattributed[i];
+      if (m.source !== "claude") continue;
+      const ev = evidenceByName.get(m.name.toLowerCase());
+      if (ev?.countryCode === targetIso) {
+        console.log(`  [artist-verify] MB confirms "${m.name}" is from ${country} — rejecting Claude's misattribution flag`);
+        misattributed.splice(i, 1);
+      }
+    }
+  }
+
+  // Opus tiebreaker — Claude-only flags where MB has no country evidence are the
+  // borderline case. Default to KEEPING the artist; Opus must explicitly confirm removal.
+  const borderline = misattributed.filter(m => {
+    if (m.source !== "claude") return false;
+    const ev = evidenceByName.get(m.name.toLowerCase());
+    return !ev?.countryCode;
+  });
+  if (borderline.length > 0) {
+    const confirmed = await opusMisattributionTiebreaker(borderline, country, apiKey, historicalGuidance);
+    let kept = 0;
+    for (let i = misattributed.length - 1; i >= 0; i--) {
+      const m = misattributed[i];
+      if (m.source !== "claude") continue;
+      const ev = evidenceByName.get(m.name.toLowerCase());
+      if (ev?.countryCode) continue; // not borderline
+      if (!confirmed.has(m.name.toLowerCase())) {
+        console.log(`  [artist-verify] tiebreaker kept "${m.name}" in ${country} pool (no MB evidence + Opus did not confirm removal)`);
+        misattributed.splice(i, 1);
+        kept++;
+      }
+    }
+    console.log(`[artist-verify] ${country}: tiebreaker reviewed ${borderline.length} borderline → ${confirmed.size} removed, ${kept} kept`);
   }
   const eraCorrections = new Map();
   // highConfidenceEras: only eras backed by real MB/Discogs evidence — these are safe to persist
@@ -6493,7 +6545,114 @@ Return JSON:
     const era = normalizeDecade(correction?.era);
     if (correction?.name && era) eraCorrections.set(correction.name.toLowerCase(), era);
   }
-  return { misattributed, eraCorrections, highConfidenceEras };
+  // Strip internal `source` tag so callers see a clean shape.
+  const cleanMisattributed = misattributed.map(({ source, ...rest }) => rest);
+  return { misattributed: cleanMisattributed, eraCorrections, highConfidenceEras };
+}
+
+// Routes misattributed artists into the correct country's cached pool.
+// - Skips when the destination country is not enrichable.
+// - Skips when the destination has no cached pool (would orphan the artist).
+// - Skips when the artist already exists in the destination pool (no duplicates).
+// Caller is still responsible for removing the artist from the source pool.
+async function routeMisattributedToCorrectCountry(misattributed, sourcePool, eraCorrections, fromCountry) {
+  if (!misattributed?.length) return { moved: 0, skipped: 0 };
+  let moved = 0;
+  let skipped = 0;
+  for (const { name, actualCountry } of misattributed) {
+    if (!name || !actualCountry) { skipped++; continue; }
+    const dest = canonicalCountryName(actualCountry);
+    if (!ALL_ENRICHABLE_COUNTRIES.includes(dest)) {
+      console.log(`  [reroute] ${name}: actualCountry "${actualCountry}" not in enrichable list — dropped from ${fromCountry}`);
+      skipped++;
+      continue;
+    }
+    if (normalizeCountryName(dest) === normalizeCountryName(fromCountry)) {
+      skipped++;
+      continue;
+    }
+    const artist = sourcePool.find(a => a?.name?.toLowerCase() === name.toLowerCase());
+    if (!artist) { skipped++; continue; }
+
+    const destKey = makeCacheKey(["recommend", dest]);
+    const destCache = await getCached(destKey);
+    if (!destCache?.artist_pool) {
+      console.log(`  [reroute] ${name}: no cache for ${dest} yet — dropped from ${fromCountry}`);
+      skipped++;
+      continue;
+    }
+    const alreadyPresent = destCache.artist_pool.some(a => a?.name?.toLowerCase() === name.toLowerCase());
+    if (alreadyPresent) {
+      console.log(`  [reroute] ${name} already in ${dest} pool — dropped from ${fromCountry}`);
+      skipped++;
+      continue;
+    }
+    const correctedEra = eraCorrections?.get(name.toLowerCase());
+    const artistToInsert = { ...artist, ...(correctedEra ? { era: correctedEra } : {}) };
+    await storeCache(destKey, "recommend", destCache.result, [...destCache.artist_pool, artistToInsert]);
+    console.log(`  [reroute] ✓ ${name} → ${dest} (from ${fromCountry})`);
+    moved++;
+  }
+  return { moved, skipped };
+}
+
+// Opus tiebreaker — for artists Claude flagged as misattributed but where MusicBrainz has no country
+// evidence to corroborate. Conservative by design: only confirm removal when highly confident.
+// One Claude Opus call per invocation, batched up to 8 items, to stay friendly with rate limits.
+async function opusMisattributionTiebreaker(items, country, apiKey, historicalGuidance) {
+  if (!items?.length || !apiKey) return new Set();
+  const batch = items.slice(0, 8);
+  const list = batch.map(m => `- ${m.name} (first-pass verifier said actually from: ${m.actualCountry})`).join("\n");
+  let parsed;
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: "claude-opus-4-5-20251101",
+        max_tokens: 800,
+        system: "You are a world music geography and history expert. Be conservative — only confirm misattribution when you are highly confident the artist does NOT belong to the stated country. When uncertain, REJECT the flag (i.e., keep them). Return ONLY valid JSON — no markdown, no preamble.",
+        messages: [{
+          role: "user",
+          content: `These artists are stored as being from "${country}". A first-pass verifier flagged them as misattributed, but MusicBrainz has no country evidence either way — this is the borderline case.
+
+${historicalGuidance ? historicalGuidance + "\n" : ""}For each artist, decide: should they be REMOVED from ${country}'s pool?
+- Only confirm removal if you are highly confident they are NOT from ${country} (or its historical/reconstruction tradition).
+- Diaspora artists, dual-heritage artists, or artists whose musical identity remains rooted in ${country} should NOT be removed.
+- If you are unsure or the artist could plausibly belong here, REJECT the removal.
+- Soviet-era artists belong to their birth republic, not USSR/Russia, unless they are clearly rooted elsewhere.
+
+Artists to review:
+${list}
+
+Return JSON:
+{
+  "confirmedRemovals": [
+    { "name": "Exact Name", "reason": "brief reason" }
+  ]
+}
+Only include artists you are confident should be removed. Omit any you are uncertain about.`
+        }],
+      }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      console.error(`[tiebreaker] Opus error for ${country}: ${data.error.message}`);
+      return new Set();
+    }
+    parsed = parseClaudeJson(data.content?.[0]?.text || "", `tiebreaker ${country}`);
+  } catch (err) {
+    console.error(`[tiebreaker] ${country} failed —`, err.message);
+    return new Set();
+  }
+  const confirmed = new Set();
+  for (const c of (parsed.confirmedRemovals || [])) {
+    if (c?.name) {
+      confirmed.add(c.name.toLowerCase());
+      console.log(`  [tiebreaker] confirmed removal: ${c.name} — ${c.reason || ''}`);
+    }
+  }
+  return confirmed;
 }
 
 // Audits the existing artist_pool for a country, identifying misattributed artists
@@ -6536,33 +6695,7 @@ async function auditCountryPool(artistPool, country, apiKey) {
   }
 
   console.log(`[pool-audit] ${country}: ${misattributed.length} misattributed — ${misattributed.map(m => `${m.name} → ${m.actualCountry}`).join(", ")}`);
-
-  // Move each misattributed artist to their correct country's pool if we have one cached
-  for (const { name, actualCountry } of misattributed) {
-    const canonicalTargetCountry = canonicalCountryName(actualCountry);
-    if (!ALL_ENRICHABLE_COUNTRIES.includes(canonicalTargetCountry)) {
-      console.log(`  [pool-audit] ${name}: actualCountry "${actualCountry}" not in enrichable list — just removing`);
-      continue;
-    }
-    const artist = artistPool.find(a => a.name.toLowerCase() === name.toLowerCase());
-    if (!artist) continue;
-
-    const targetKey = makeCacheKey(["recommend", canonicalTargetCountry]);
-    const targetCache = await getCached(targetKey);
-    if (!targetCache?.artist_pool) {
-      console.log(`  [pool-audit] ${name}: no cache for ${canonicalTargetCountry} yet — just removing`);
-      continue;
-    }
-
-    const alreadyPresent = targetCache.artist_pool.some(a => a.name.toLowerCase() === name.toLowerCase());
-    if (!alreadyPresent) {
-      const correctedEra = eraCorrections.get(name.toLowerCase());
-      await storeCache(targetKey, "recommend", targetCache.result, [...targetCache.artist_pool, { ...artist, ...(correctedEra ? { era: correctedEra } : {}) }]);
-      console.log(`  [pool-audit] ✓ moved ${name} → ${canonicalTargetCountry}`);
-    } else {
-      console.log(`  [pool-audit] ${name} already in ${canonicalTargetCountry} pool — just removing from ${country}`);
-    }
-  }
+  await routeMisattributedToCorrectCountry(misattributed, artistPool, eraCorrections, country);
 
   const removedNames = misattributed.map(m => m.name.toLowerCase());
   const correctedPool = poolToAudit
@@ -6584,6 +6717,73 @@ async function auditCountryPool(artistPool, country, apiKey) {
   }
 
   return { removedNames, correctedPool, changed: removedNames.length > 0 || eraCorrections.size > 0 };
+}
+
+// Picks the N least-recently-audited country pools and re-runs auditCountryPool on each.
+// Tracks audit recency in result.lastAuditedAt so we cycle through every country over time.
+// Each country: 1 Haiku call + (≤1 Opus tiebreaker) + queue-throttled MB/Discogs lookups.
+// 2-second pause between countries keeps Anthropic rate limits comfortable.
+async function rotateCountryPoolAudit(apiKey, count = 3) {
+  if (!supabase || !apiKey) return { audited: 0, removed: 0 };
+
+  const keyToCountry = {};
+  const cacheKeys = [];
+  for (const country of [...new Set(Object.keys(COUNTRY_ISO))]) {
+    const key = makeCacheKey(["recommend", country]);
+    keyToCountry[key] = country;
+    cacheKeys.push(key);
+  }
+
+  const { data: rows, error } = await supabase
+    .from("recommendation_cache")
+    .select("cache_key, result, artist_pool")
+    .eq("endpoint", "recommend")
+    .in("cache_key", cacheKeys)
+    .not("artist_pool", "is", null);
+  if (error) {
+    console.error("[rotate-audit] query error:", error.message);
+    return { audited: 0, removed: 0 };
+  }
+
+  // Sort by lastAuditedAt ASC, NULLs first so never-audited pools go to the front.
+  const sorted = (rows || [])
+    .filter(r => Array.isArray(r.artist_pool) && r.artist_pool.length > 0)
+    .sort((a, b) => {
+      const ax = a.result?.lastAuditedAt;
+      const bx = b.result?.lastAuditedAt;
+      if (!ax && !bx) return 0;
+      if (!ax) return -1;
+      if (!bx) return 1;
+      return ax.localeCompare(bx);
+    })
+    .slice(0, count);
+
+  if (!sorted.length) return { audited: 0, removed: 0 };
+
+  let audited = 0, removed = 0;
+  for (const row of sorted) {
+    const country = keyToCountry[row.cache_key];
+    if (!country) continue;
+    try {
+      console.log(`[rotate-audit] starting ${country} (last audited: ${row.result?.lastAuditedAt || 'never'})`);
+      const audit = await auditCountryPool(row.artist_pool, country, apiKey);
+      const newResult = { ...(row.result || {}), lastAuditedAt: new Date().toISOString() };
+      // Always touch lastAuditedAt — even when nothing changed — so the rotation moves on next run.
+      const poolToStore = audit.changed ? audit.correctedPool : row.artist_pool;
+      await storeCache(row.cache_key, "recommend", newResult, poolToStore);
+      if (audit.changed) {
+        console.log(`[rotate-audit] ${country}: ${audit.removedNames.length} removed, pool ${row.artist_pool.length} → ${audit.correctedPool.length}`);
+        removed += audit.removedNames.length;
+      }
+      audited++;
+    } catch (err) {
+      console.error(`[rotate-audit] ${country} failed:`, err.message);
+    }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  console.log(`[rotate-audit] done: ${audited} audited, ${removed} artists removed`);
+  return { audited, removed };
 }
 
 async function deepEnrichCountry(country, apiKey) {
@@ -6669,6 +6869,11 @@ Also include:
   research.artists = await applyArtistEvidence(research.artists);
   const verifiedResearch = await verifyArtistMetadata(research.artists, country, apiKey);
   const researchRemovals = new Set(verifiedResearch.misattributed.map(a => a.name.toLowerCase()));
+  // Reroute misattributed artists into the correct country's pool BEFORE we filter them out,
+  // so the helper can still find their original records in research.artists.
+  if (verifiedResearch.misattributed.length > 0) {
+    await routeMisattributedToCorrectCountry(verifiedResearch.misattributed, research.artists, verifiedResearch.eraCorrections, country);
+  }
   research.artists = research.artists
     .filter(a => !researchRemovals.has(a.name.toLowerCase()))
     .map(a => {
@@ -7103,12 +7308,22 @@ app.get("/api/enrich", async (req, res) => {
 
     let flagResult = { reviewed: 0, fixed: 0, skipped: skipFlagReview };
     if (!skipFlagReview) {
-      // Run flag review after enrichment. Max 2 contexts per cron run to
-      // avoid timeout — each context makes 2 Claude calls + Spotify lookups.
-      flagResult = await processFlaggedTracks(2);
+      // Each context makes 2 Claude calls + Spotify lookups. Cron has a 3-6 min budget,
+      // so 6 contexts comfortably fits and clears the flag queue faster.
+      flagResult = await processFlaggedTracks(6);
     }
 
-    res.json({ enrich: enrichResult, deepEnrich: deepResult, flagReview: flagResult, purged: purged ?? 0 });
+    // Priority 4: rotating pool re-audit — picks the few least-recently-audited country pools
+    // and re-runs auditCountryPool on each. Catches misattributions added under older logic
+    // and keeps accuracy from drifting over time.
+    let auditResult = { audited: 0, removed: 0 };
+    try {
+      auditResult = await rotateCountryPoolAudit(process.env.ANTHROPIC_API_KEY, 3);
+    } catch (err) {
+      console.error("[enrich] rotating audit error:", err.message);
+    }
+
+    res.json({ enrich: enrichResult, deepEnrich: deepResult, flagReview: flagResult, audit: auditResult, purged: purged ?? 0 });
   } catch (err) {
     console.error("[enrich] batch error:", err.message);
     res.status(500).json({ error: err.message });
