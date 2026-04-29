@@ -2041,7 +2041,7 @@ async function lbTopArtistsForCountry(countryName) {
     }
     const artists = [...artistMap.values()]
       .sort((a, b) => b.listenCount - a.listenCount)
-      .slice(0, 40);
+      .slice(0, 80);
     console.log(`[LB] ${artists.length} unique artists for "${countryName}"`);
     return artists;
   } catch (err) {
@@ -2119,7 +2119,7 @@ async function buildRealArtistPool(country, isoCode) {
     pool.push({ name: mbArtist.name, confidence: "medium-mb", listenCount: 0, tags: mbArtist.tags });
   }
 
-  const result = pool.slice(0, 40);
+  const result = pool.slice(0, 80);
   console.log(`[real-pool] ${country}: ${result.filter(a => a.confidence === "high").length} high-conf, ${result.filter(a => a.confidence !== "high").length} medium-conf artists`);
   // Persist so the next cold request avoids re-querying LB + MB queues
   storeCache(realPoolCacheKey, 'real-pool', {}, result).catch(() => {});
@@ -2789,7 +2789,7 @@ Rules:
         return;
       }
 
-      const mergedPool = [...latestPool, ...trulyNew].slice(0, 40);
+      const mergedPool = [...latestPool, ...trulyNew].slice(0, 80);
       await storeCache(cacheKey, "recommend", latestCached?.result ?? cached.result, mergedPool);
 
       const finalCount = mergedPool.filter(a => a.era && a.era.includes(decadeYear)).length;
@@ -6455,6 +6455,25 @@ Return JSON:
     if (normalizeCountryName(actualCountry) === currentCountryNorm) return false;
     return true;
   });
+
+  // Deterministic guardrail: if MusicBrainz has a country code on file for an
+  // artist and it disagrees with the target country, treat that as authoritative
+  // — Claude (the same model that may have invented the misattribution) can miss
+  // these blind spots (e.g. proposing US artist "sombr" for Latvia).
+  const targetIso = COUNTRY_ISO[country] || null;
+  if (targetIso) {
+    const alreadyFlagged = new Set(misattributed.map(m => m.name.toLowerCase()));
+    for (const artist of artistsWithEvidence) {
+      const evidence = evidenceByName.get(artist.name.toLowerCase());
+      const mbIso = evidence?.countryCode;
+      if (!mbIso || mbIso === targetIso) continue;
+      if (alreadyFlagged.has(artist.name.toLowerCase())) continue;
+      const actualCountry = ISO_TO_COUNTRY[mbIso];
+      if (!actualCountry || normalizeCountryName(actualCountry) === currentCountryNorm) continue;
+      misattributed.push({ name: artist.name, actualCountry });
+      alreadyFlagged.add(artist.name.toLowerCase());
+    }
+  }
   const eraCorrections = new Map();
   // highConfidenceEras: only eras backed by real MB/Discogs evidence — these are safe to persist
   // as era_verified=true. Claude's opinion (below) is non-deterministic and must NOT mark verified.
