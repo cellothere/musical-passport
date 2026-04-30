@@ -6557,6 +6557,11 @@ Return JSON:
 // Caller is still responsible for removing the artist from the source pool.
 async function routeMisattributedToCorrectCountry(misattributed, sourcePool, eraCorrections, fromCountry) {
   if (!misattributed?.length) return { moved: 0, skipped: 0 };
+  // Forgiving comparison — `verifyArtistMetadata` returns canonicalized names from
+  // `applyArtistEvidence`, but the source pool may hold the un-canonicalized form
+  // (e.g. cached as "E Street Band", returned as "The E Street Band"). Strip
+  // a leading "The " and all non-alphanumerics so the two forms still match.
+  const fuzzyKey = s => normalizeArtistKey(String(s || "").replace(/^the\s+/i, ""));
   let moved = 0;
   let skipped = 0;
   for (const { name, actualCountry } of misattributed) {
@@ -6571,8 +6576,14 @@ async function routeMisattributedToCorrectCountry(misattributed, sourcePool, era
       skipped++;
       continue;
     }
-    const artist = sourcePool.find(a => a?.name?.toLowerCase() === name.toLowerCase());
-    if (!artist) { skipped++; continue; }
+    const targetKey = fuzzyKey(name);
+    const artist = sourcePool.find(a => a?.name?.toLowerCase() === name.toLowerCase())
+      || sourcePool.find(a => fuzzyKey(a?.name) === targetKey);
+    if (!artist) {
+      console.log(`  [reroute] ${name}: not found in source pool for ${fromCountry} — dropped (likely name canonicalization mismatch)`);
+      skipped++;
+      continue;
+    }
 
     const destKey = makeCacheKey(["recommend", dest]);
     const destCache = await getCached(destKey);
@@ -6581,7 +6592,9 @@ async function routeMisattributedToCorrectCountry(misattributed, sourcePool, era
       skipped++;
       continue;
     }
-    const alreadyPresent = destCache.artist_pool.some(a => a?.name?.toLowerCase() === name.toLowerCase());
+    const alreadyPresent = destCache.artist_pool.some(a =>
+      a?.name?.toLowerCase() === name.toLowerCase() || fuzzyKey(a?.name) === targetKey
+    );
     if (alreadyPresent) {
       console.log(`  [reroute] ${name} already in ${dest} pool — dropped from ${fromCountry}`);
       skipped++;
