@@ -6285,9 +6285,12 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
     });
     const d = await res.json();
     if (!d.error) {
-      annotated = await applyArtistEvidence(
-        parseClaudeJson(d.content?.[0]?.text || "", `pool-grow ${country}`).artists || []
-      );
+      const rawAnnotated = parseClaudeJson(d.content?.[0]?.text || "", `pool-grow ${country}`).artists || [];
+      const filtered = rawAnnotated.filter(a => !isPlaceholderArtistName(a?.name));
+      if (filtered.length < rawAnnotated.length) {
+        console.log(`[pool-grow] ${country}: dropped ${rawAnnotated.length - filtered.length} placeholder name(s) from Haiku annotation`);
+      }
+      annotated = await applyArtistEvidence(filtered);
     }
   } catch (err) {
     console.error(`[pool-grow] ${country}: annotation failed —`, err.message);
@@ -6319,14 +6322,11 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
   annotated = annotated
     .filter(a => !annotatedToRemove.has(a.name.toLowerCase()))
     .map(a => {
-      const correctedEra = verifiedAnnotated.eraCorrections.get(a.name.toLowerCase());
-      if (correctedEra && correctedEra !== a.era) {
-        console.log(`  [pool-grow] era fix: ${a.name} ${a.era} → ${correctedEra}`);
-        const hcEra = verifiedAnnotated.highConfidenceEras.get(a.name.toLowerCase());
-        if (hcEra && hcEra === correctedEra) persistEraFix(a.name, hcEra); // only persist when evidence and AI agree
-        return { ...a, era: correctedEra };
-      }
-      return a;
+      const decision = decideEraApply(a, verifiedAnnotated.eraCorrections, verifiedAnnotated.highConfidenceEras);
+      if (!decision) return a;
+      console.log(`  [pool-grow] era fix: ${a.name} ${a.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
+      if (decision.evidenceBacked) persistEraFix(a.name, decision.era);
+      return { ...a, era: decision.era };
     });
   if (verifiedAnnotated.eraCorrections.size > 0) {
     console.log(`[pool-grow] ${country}: corrected ${verifiedAnnotated.eraCorrections.size} era tag(s) in candidate batch`);
@@ -6550,6 +6550,42 @@ Return JSON:
   return { misattributed: cleanMisattributed, eraCorrections, highConfidenceEras };
 }
 
+// Filters out placeholder strings that occasionally leak in when an LLM tries to fill a quota
+// it can't satisfy (e.g. "[unknown]", "Unknown Artist", "Various Artists"). These get cached as
+// real artist rows and reappear in subsequent runs, polluting the pool. Be conservative — bands
+// like "Unknown Mortal Orchestra" are real, so match precise placeholder shapes only.
+function isPlaceholderArtistName(name) {
+  if (!name || typeof name !== "string") return true;
+  const trimmed = name.trim();
+  if (!trimmed) return true;
+  if (/^\[.*\]$/.test(trimmed)) return true;                 // [unknown], [artist], [n/a]
+  if (/^unknown(\s+artist)?$/i.test(trimmed)) return true;   // "Unknown" / "Unknown Artist"
+  if (/^various\s+artists?$/i.test(trimmed)) return true;    // "Various Artists"
+  if (/^artist(\s*\d+)?$/i.test(trimmed)) return true;       // "Artist", "Artist 1"
+  if (/^n\/?a$/i.test(trimmed)) return true;                 // "N/A", "NA"
+  return false;
+}
+
+// Decides whether to apply a proposed era correction to an artist record. Returns
+// { era, evidenceBacked } when the change should land, or null when it should be skipped.
+//
+// Claude is non-deterministic about era guesses; if we accept its opinion every run the
+// stored era oscillates (1980s → 1970s → 1980s …) when there's no MB/Discogs ground truth.
+// Rule:
+//   - If high-confidence evidence (MB/Discogs) backs the change → apply (and `evidenceBacked: true`
+//     so the caller can persist `era_verified=true`).
+//   - If the artist has no era at all yet → apply Claude's guess so the field gets populated.
+//   - Otherwise (overwriting a non-empty era with a low-confidence Claude opinion) → skip.
+function decideEraApply(artist, eraCorrections, highConfidenceEras) {
+  const correctedEra = eraCorrections?.get?.(artist.name.toLowerCase());
+  if (!correctedEra || correctedEra === artist.era) return null;
+  const hcEra = highConfidenceEras?.get?.(artist.name.toLowerCase());
+  const evidenceBacked = !!(hcEra && hcEra === correctedEra);
+  const currentEraIsValid = !!normalizeDecade(artist.era);
+  if (evidenceBacked || !currentEraIsValid) return { era: correctedEra, evidenceBacked };
+  return null;
+}
+
 // Routes misattributed artists into the correct country's cached pool.
 // - Skips when the destination country is not enrichable.
 // - Skips when the destination has no cached pool (would orphan the artist).
@@ -6673,12 +6709,24 @@ Only include artists you are confident should be removed. Omit any you are uncer
 async function auditCountryPool(artistPool, country, apiKey) {
   if (!artistPool?.length) return { removedNames: [], correctedPool: artistPool, changed: false };
 
+  // Strip placeholder names from existing pools — historical entries like "[unknown]" or
+  // "Various Artists" leaked in before the boundary filter existed. The rotating cron audit
+  // sweeps every country over time, so this gradually cleans them all up.
+  const beforePlaceholderFilter = artistPool.length;
+  let poolToAudit = artistPool.filter(a => !isPlaceholderArtistName(a?.name));
+  const placeholdersDropped = beforePlaceholderFilter - poolToAudit.length;
+  if (placeholdersDropped > 0) {
+    console.log(`[pool-audit] ${country}: dropped ${placeholdersDropped} placeholder name(s) from existing pool`);
+  }
+  if (!poolToAudit.length) {
+    return { removedNames: [], correctedPool: poolToAudit, changed: placeholdersDropped > 0 };
+  }
+
   // Pre-apply any previously-verified eras so the audit starts from a clean baseline.
   // Verified artists won't have their eras re-corrected by the AI below.
-  const preVerifiedEras = await getVerifiedEras(artistPool.map(a => a.name));
-  let poolToAudit = artistPool;
+  const preVerifiedEras = await getVerifiedEras(poolToAudit.map(a => a.name));
   if (preVerifiedEras.size > 0) {
-    poolToAudit = artistPool.map(a => {
+    poolToAudit = poolToAudit.map(a => {
       const ve = preVerifiedEras.get(a.name.toLowerCase());
       return ve && ve !== a.era ? { ...a, era: ve } : a;
     });
@@ -6690,18 +6738,15 @@ async function auditCountryPool(artistPool, country, apiKey) {
   if (!misattributed.length) {
     if (eraCorrections.size === 0) {
       console.log(`[pool-audit] ${country}: artists and eras verified ✓`);
-      return { removedNames: [], correctedPool: poolToAudit, changed: preVerifiedEras.size > 0 };
+      return { removedNames: [], correctedPool: poolToAudit, changed: preVerifiedEras.size > 0 || placeholdersDropped > 0 };
     }
     const correctedPool = poolToAudit.map(artist => {
       if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
-      const correctedEra = eraCorrections.get(artist.name.toLowerCase());
-      if (correctedEra && correctedEra !== artist.era) {
-        console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${correctedEra}`);
-        const hcEra = highConfidenceEras.get(artist.name.toLowerCase());
-        if (hcEra && hcEra === correctedEra) persistEraFix(artist.name, hcEra); // only persist when evidence and AI agree
-        return { ...artist, era: correctedEra };
-      }
-      return artist;
+      const decision = decideEraApply(artist, eraCorrections, highConfidenceEras);
+      if (!decision) return artist;
+      console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
+      if (decision.evidenceBacked) persistEraFix(artist.name, decision.era);
+      return { ...artist, era: decision.era };
     });
     console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
     return { removedNames: [], correctedPool, changed: true };
@@ -6715,21 +6760,18 @@ async function auditCountryPool(artistPool, country, apiKey) {
     .filter(artist => !removedNames.includes(artist.name.toLowerCase()))
     .map(artist => {
       if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
-      const correctedEra = eraCorrections.get(artist.name.toLowerCase());
-      if (correctedEra && correctedEra !== artist.era) {
-        console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${correctedEra}`);
-        const hcEra = highConfidenceEras.get(artist.name.toLowerCase());
-        if (hcEra && hcEra === correctedEra) persistEraFix(artist.name, hcEra); // only persist when evidence and AI agree
-        return { ...artist, era: correctedEra };
-      }
-      return artist;
+      const decision = decideEraApply(artist, eraCorrections, highConfidenceEras);
+      if (!decision) return artist;
+      console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
+      if (decision.evidenceBacked) persistEraFix(artist.name, decision.era);
+      return { ...artist, era: decision.era };
     });
 
   if (eraCorrections.size > 0) {
     console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
   }
 
-  return { removedNames, correctedPool, changed: removedNames.length > 0 || eraCorrections.size > 0 };
+  return { removedNames, correctedPool, changed: removedNames.length > 0 || eraCorrections.size > 0 || placeholdersDropped > 0 };
 }
 
 // Picks the N least-recently-audited country pools and re-runs auditCountryPool on each.
@@ -6879,6 +6921,13 @@ Also include:
     console.error(`[country-enrich] JSON.parse failed for ${country}:`, parseErr.message, "\nRaw:", raw.slice(0, 200));
     throw parseErr;
   }
+  // Drop placeholder names ("[unknown]", "Various Artists", etc) before any further work —
+  // otherwise they get cached, treated as real artists, and reappear in subsequent runs.
+  const beforePlaceholderFilter = research.artists?.length || 0;
+  research.artists = (research.artists || []).filter(a => !isPlaceholderArtistName(a?.name));
+  if (research.artists.length < beforePlaceholderFilter) {
+    console.log(`[country-enrich] ${country}: dropped ${beforePlaceholderFilter - research.artists.length} placeholder name(s) from Claude research`);
+  }
   research.artists = await applyArtistEvidence(research.artists);
   const verifiedResearch = await verifyArtistMetadata(research.artists, country, apiKey);
   const researchRemovals = new Set(verifiedResearch.misattributed.map(a => a.name.toLowerCase()));
@@ -6890,14 +6939,11 @@ Also include:
   research.artists = research.artists
     .filter(a => !researchRemovals.has(a.name.toLowerCase()))
     .map(a => {
-      const correctedEra = verifiedResearch.eraCorrections.get(a.name.toLowerCase());
-      if (correctedEra && correctedEra !== a.era) {
-        console.log(`  [country-enrich] era fix: ${a.name} ${a.era} → ${correctedEra}`);
-        const hcEra = verifiedResearch.highConfidenceEras.get(a.name.toLowerCase());
-        if (hcEra && hcEra === correctedEra) persistEraFix(a.name, hcEra); // only persist when evidence and AI agree
-        return { ...a, era: correctedEra };
-      }
-      return a;
+      const decision = decideEraApply(a, verifiedResearch.eraCorrections, verifiedResearch.highConfidenceEras);
+      if (!decision) return a;
+      console.log(`  [country-enrich] era fix: ${a.name} ${a.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
+      if (decision.evidenceBacked) persistEraFix(a.name, decision.era);
+      return { ...a, era: decision.era };
     });
   if (verifiedResearch.misattributed.length > 0) {
     console.log(`[country-enrich] ${country}: removed ${verifiedResearch.misattributed.length} misattributed artist(s) from fresh research`);
