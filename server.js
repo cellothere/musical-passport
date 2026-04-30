@@ -6312,24 +6312,26 @@ era must be exactly one of: 1900s, 1910s, 1920s, 1930s, 1940s, 1950s, 1960s, 197
   if (!annotated.length) return [];
 
   const verifiedAnnotated = await verifyArtistMetadata(annotated, country, apiKey);
-  const annotatedToRemove = new Set(verifiedAnnotated.misattributed.map(a => a.name.toLowerCase()));
-  if (verifiedAnnotated.misattributed.length > 0) {
-    for (const m of verifiedAnnotated.misattributed) {
+  const { validFlags: validMisattributed, recordsToRemove } = validateMisattributionFlags(verifiedAnnotated.misattributed, annotated, '[pool-grow]');
+  if (validMisattributed.length > 0) {
+    for (const m of validMisattributed) {
       console.log(`  [pool-grow] removed candidate ${m.name} → actually from ${m.actualCountry}`);
     }
-    await routeMisattributedToCorrectCountry(verifiedAnnotated.misattributed, annotated, verifiedAnnotated.eraCorrections, country);
+    await routeMisattributedToCorrectCountry(validMisattributed, annotated, verifiedAnnotated.eraCorrections, country);
   }
+  let growEraApplied = 0;
   annotated = annotated
-    .filter(a => !annotatedToRemove.has(a.name.toLowerCase()))
+    .filter(a => !recordsToRemove.has(a.name.toLowerCase()))
     .map(a => {
       const decision = decideEraApply(a, verifiedAnnotated.eraCorrections, verifiedAnnotated.highConfidenceEras);
       if (!decision) return a;
       console.log(`  [pool-grow] era fix: ${a.name} ${a.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
       if (decision.evidenceBacked) persistEraFix(a.name, decision.era);
+      growEraApplied++;
       return { ...a, era: decision.era };
     });
-  if (verifiedAnnotated.eraCorrections.size > 0) {
-    console.log(`[pool-grow] ${country}: corrected ${verifiedAnnotated.eraCorrections.size} era tag(s) in candidate batch`);
+  if (growEraApplied > 0 || verifiedAnnotated.eraCorrections.size > 0) {
+    console.log(`[pool-grow] ${country}: applied ${growEraApplied}/${verifiedAnnotated.eraCorrections.size} era fix(es) in candidate batch`);
   }
   if (!annotated.length) {
     console.log(`[pool-grow] ${country}: no verified candidates remained after metadata check`);
@@ -6586,6 +6588,21 @@ function decideEraApply(artist, eraCorrections, highConfidenceEras) {
   return null;
 }
 
+// Locates an artist record in a pool, falling back to a fuzzy key (lowercase + stripped
+// of "The " prefix and non-alphanumerics) when exact match misses. Returns the record or null.
+// Use this whenever you want to act on a name that may have been canonicalized between the
+// pool's stored form and the form returned by `applyArtistEvidence`/Claude.
+function findArtistInPool(pool, name) {
+  if (!Array.isArray(pool) || !name) return null;
+  const lower = String(name).toLowerCase();
+  const exact = pool.find(a => a?.name?.toLowerCase() === lower);
+  if (exact) return exact;
+  const fuzzyKey = s => normalizeArtistKey(String(s || "").replace(/^the\s+/i, ""));
+  const target = fuzzyKey(name);
+  if (!target) return null;
+  return pool.find(a => fuzzyKey(a?.name) === target) || null;
+}
+
 // Routes misattributed artists into the correct country's cached pool.
 // - Skips when the destination country is not enrichable.
 // - Skips when the destination has no cached pool (would orphan the artist).
@@ -6593,11 +6610,6 @@ function decideEraApply(artist, eraCorrections, highConfidenceEras) {
 // Caller is still responsible for removing the artist from the source pool.
 async function routeMisattributedToCorrectCountry(misattributed, sourcePool, eraCorrections, fromCountry) {
   if (!misattributed?.length) return { moved: 0, skipped: 0 };
-  // Forgiving comparison — `verifyArtistMetadata` returns canonicalized names from
-  // `applyArtistEvidence`, but the source pool may hold the un-canonicalized form
-  // (e.g. cached as "E Street Band", returned as "The E Street Band"). Strip
-  // a leading "The " and all non-alphanumerics so the two forms still match.
-  const fuzzyKey = s => normalizeArtistKey(String(s || "").replace(/^the\s+/i, ""));
   let moved = 0;
   let skipped = 0;
   for (const { name, actualCountry } of misattributed) {
@@ -6612,9 +6624,7 @@ async function routeMisattributedToCorrectCountry(misattributed, sourcePool, era
       skipped++;
       continue;
     }
-    const targetKey = fuzzyKey(name);
-    const artist = sourcePool.find(a => a?.name?.toLowerCase() === name.toLowerCase())
-      || sourcePool.find(a => fuzzyKey(a?.name) === targetKey);
+    const artist = findArtistInPool(sourcePool, name);
     if (!artist) {
       console.log(`  [reroute] ${name}: not found in source pool for ${fromCountry} — dropped (likely name canonicalization mismatch)`);
       skipped++;
@@ -6628,10 +6638,7 @@ async function routeMisattributedToCorrectCountry(misattributed, sourcePool, era
       skipped++;
       continue;
     }
-    const alreadyPresent = destCache.artist_pool.some(a =>
-      a?.name?.toLowerCase() === name.toLowerCase() || fuzzyKey(a?.name) === targetKey
-    );
-    if (alreadyPresent) {
+    if (findArtistInPool(destCache.artist_pool, name)) {
       console.log(`  [reroute] ${name} already in ${dest} pool — dropped from ${fromCountry}`);
       skipped++;
       continue;
@@ -6643,6 +6650,28 @@ async function routeMisattributedToCorrectCountry(misattributed, sourcePool, era
     moved++;
   }
   return { moved, skipped };
+}
+
+// Filters a misattribution list to only flags whose target artist is actually present in the
+// pool. Returns { validFlags, recordsToRemove } where:
+//   - validFlags: the misattribution entries we can safely act on
+//   - recordsToRemove: a Set of lowercased artist *record* names suitable for use in a pool filter
+// The record-name set is what removes the *real* artist (e.g. "E Street Band") even when the
+// flag uses a canonicalized form ("The E Street Band"). Hallucinated flags (Claude saying
+// "Richard Thompson" when the pool only has "Thompson") are dropped with a debug log.
+function validateMisattributionFlags(misattributed, sourcePool, logPrefix) {
+  const validFlags = [];
+  const recordsToRemove = new Set();
+  for (const m of misattributed || []) {
+    const record = findArtistInPool(sourcePool, m?.name);
+    if (record) {
+      validFlags.push(m);
+      recordsToRemove.add(record.name.toLowerCase());
+    } else {
+      console.log(`  ${logPrefix} ignored misattribution flag for "${m?.name}" — not in source pool by exact or fuzzy match (likely Claude hallucination)`);
+    }
+  }
+  return { validFlags, recordsToRemove };
 }
 
 // Opus tiebreaker — for artists Claude flagged as misattributed but where MusicBrainz has no country
@@ -6734,44 +6763,50 @@ async function auditCountryPool(artistPool, country, apiKey) {
 
   console.log(`[pool-audit] ${country}: auditing ${poolToAudit.length} artists…`);
 
-  const { misattributed, eraCorrections, highConfidenceEras } = await verifyArtistMetadata(poolToAudit, country, apiKey);
+  const { misattributed: rawMisattributed, eraCorrections, highConfidenceEras } = await verifyArtistMetadata(poolToAudit, country, apiKey);
+  // Drop misattribution flags that don't actually point to anything in the pool — these are
+  // most often Claude hallucinating a longer/different canonical name from a short pool entry
+  // (e.g. flagging "Richard Thompson" when the pool only contains the Croatian band "Thompson").
+  const { validFlags: misattributed, recordsToRemove } = validateMisattributionFlags(rawMisattributed, poolToAudit, '[pool-audit]');
+  let eraApplied = 0;
+  const applyEra = (artist) => {
+    if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
+    const decision = decideEraApply(artist, eraCorrections, highConfidenceEras);
+    if (!decision) return artist;
+    console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
+    if (decision.evidenceBacked) persistEraFix(artist.name, decision.era);
+    eraApplied++;
+    return { ...artist, era: decision.era };
+  };
+
   if (!misattributed.length) {
     if (eraCorrections.size === 0) {
       console.log(`[pool-audit] ${country}: artists and eras verified ✓`);
       return { removedNames: [], correctedPool: poolToAudit, changed: preVerifiedEras.size > 0 || placeholdersDropped > 0 };
     }
-    const correctedPool = poolToAudit.map(artist => {
-      if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
-      const decision = decideEraApply(artist, eraCorrections, highConfidenceEras);
-      if (!decision) return artist;
-      console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
-      if (decision.evidenceBacked) persistEraFix(artist.name, decision.era);
-      return { ...artist, era: decision.era };
-    });
-    console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
-    return { removedNames: [], correctedPool, changed: true };
+    const correctedPool = poolToAudit.map(applyEra);
+    if (eraApplied > 0 || eraCorrections.size > 0) {
+      console.log(`[pool-audit] ${country}: applied ${eraApplied}/${eraCorrections.size} era fix(es)`);
+    }
+    return { removedNames: [], correctedPool, changed: eraApplied > 0 || placeholdersDropped > 0 };
   }
 
   console.log(`[pool-audit] ${country}: ${misattributed.length} misattributed — ${misattributed.map(m => `${m.name} → ${m.actualCountry}`).join(", ")}`);
-  await routeMisattributedToCorrectCountry(misattributed, artistPool, eraCorrections, country);
+  await routeMisattributedToCorrectCountry(misattributed, poolToAudit, eraCorrections, country);
 
-  const removedNames = misattributed.map(m => m.name.toLowerCase());
   const correctedPool = poolToAudit
-    .filter(artist => !removedNames.includes(artist.name.toLowerCase()))
-    .map(artist => {
-      if (preVerifiedEras.has(artist.name.toLowerCase())) return artist; // era already verified — never overwrite
-      const decision = decideEraApply(artist, eraCorrections, highConfidenceEras);
-      if (!decision) return artist;
-      console.log(`  [pool-audit] era fix: ${artist.name} ${artist.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
-      if (decision.evidenceBacked) persistEraFix(artist.name, decision.era);
-      return { ...artist, era: decision.era };
-    });
+    .filter(artist => !recordsToRemove.has(artist.name.toLowerCase()))
+    .map(applyEra);
 
-  if (eraCorrections.size > 0) {
-    console.log(`[pool-audit] ${country}: corrected ${eraCorrections.size} era tag(s)`);
+  const removedNames = [...recordsToRemove];
+  if (eraApplied > 0 || eraCorrections.size > 0) {
+    console.log(`[pool-audit] ${country}: applied ${eraApplied}/${eraCorrections.size} era fix(es)`);
+  }
+  if (removedNames.length > 0) {
+    console.log(`[pool-audit] ${country}: removed ${removedNames.length} artist(s) from pool`);
   }
 
-  return { removedNames, correctedPool, changed: removedNames.length > 0 || eraCorrections.size > 0 || placeholdersDropped > 0 };
+  return { removedNames, correctedPool, changed: removedNames.length > 0 || eraApplied > 0 || placeholdersDropped > 0 };
 }
 
 // Picks the N least-recently-audited country pools and re-runs auditCountryPool on each.
@@ -6856,9 +6891,6 @@ async function deepEnrichCountry(country, apiKey) {
     if (audit.changed) {
       await storeCache(cacheKey, "recommend", existingCache.result, audit.correctedPool);
       currentPool = audit.correctedPool;
-      if (audit.removedNames.length) {
-        console.log(`[pool-audit] ${country}: removed ${audit.removedNames.length} artist(s) from pool`);
-      }
     }
   }
 
@@ -6930,29 +6962,32 @@ Also include:
   }
   research.artists = await applyArtistEvidence(research.artists);
   const verifiedResearch = await verifyArtistMetadata(research.artists, country, apiKey);
-  const researchRemovals = new Set(verifiedResearch.misattributed.map(a => a.name.toLowerCase()));
+  const { validFlags: researchValidMisattributed, recordsToRemove: researchRecordsToRemove } =
+    validateMisattributionFlags(verifiedResearch.misattributed, research.artists, '[country-enrich]');
   // Reroute misattributed artists into the correct country's pool BEFORE we filter them out,
   // so the helper can still find their original records in research.artists.
-  if (verifiedResearch.misattributed.length > 0) {
-    await routeMisattributedToCorrectCountry(verifiedResearch.misattributed, research.artists, verifiedResearch.eraCorrections, country);
+  if (researchValidMisattributed.length > 0) {
+    await routeMisattributedToCorrectCountry(researchValidMisattributed, research.artists, verifiedResearch.eraCorrections, country);
   }
+  let researchEraApplied = 0;
   research.artists = research.artists
-    .filter(a => !researchRemovals.has(a.name.toLowerCase()))
+    .filter(a => !researchRecordsToRemove.has(a.name.toLowerCase()))
     .map(a => {
       const decision = decideEraApply(a, verifiedResearch.eraCorrections, verifiedResearch.highConfidenceEras);
       if (!decision) return a;
       console.log(`  [country-enrich] era fix: ${a.name} ${a.era} → ${decision.era}${decision.evidenceBacked ? ' (evidence-backed)' : ''}`);
       if (decision.evidenceBacked) persistEraFix(a.name, decision.era);
+      researchEraApplied++;
       return { ...a, era: decision.era };
     });
-  if (verifiedResearch.misattributed.length > 0) {
-    console.log(`[country-enrich] ${country}: removed ${verifiedResearch.misattributed.length} misattributed artist(s) from fresh research`);
-    for (const m of verifiedResearch.misattributed) {
+  if (researchValidMisattributed.length > 0) {
+    console.log(`[country-enrich] ${country}: removed ${researchValidMisattributed.length} misattributed artist(s) from fresh research`);
+    for (const m of researchValidMisattributed) {
       console.log(`  [country-enrich] removed ${m.name} → actually from ${m.actualCountry}`);
     }
   }
-  if (verifiedResearch.eraCorrections.size > 0) {
-    console.log(`[country-enrich] ${country}: corrected ${verifiedResearch.eraCorrections.size} era tag(s) from fresh research`);
+  if (researchEraApplied > 0 || verifiedResearch.eraCorrections.size > 0) {
+    console.log(`[country-enrich] ${country}: applied ${researchEraApplied}/${verifiedResearch.eraCorrections.size} era fix(es) from fresh research`);
   }
 
   console.log(`[country-enrich] ${country}: ${research.artists.length} artists from Claude`);
