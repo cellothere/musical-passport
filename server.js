@@ -3195,13 +3195,16 @@ app.post("/api/genre-spotlight", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
 
-  const { genre: rawGenre, country, service = "spotify", relatedArtistNames = [], seedArtist } = req.body;
-  if (!rawGenre || !country) return res.status(400).json({ error: "Missing genre or country." });
+  const { genre: rawGenre, country: rawCountry, service = "spotify", relatedArtistNames = [], seedArtist } = req.body;
+  if (!rawGenre) return res.status(400).json({ error: "Missing genre." });
+
+  const country = (rawCountry || "").trim();
+  const worldwide = !country;
 
   const genre = await resolveGenreCanonical(rawGenre);
   if (genre !== rawGenre) console.log(`[genre-spotlight] genre normalised: "${rawGenre}" → "${genre}"`);
 
-  const gsCacheKey = makeCacheKey(["genrespotlight", genre, country, service]);
+  const gsCacheKey = makeCacheKey(["genrespotlight", genre, worldwide ? "WORLDWIDE" : country, service]);
   let gsCached = await getCached(gsCacheKey);
 
   // If a seed artist is provided but absent from a sparse cached result, bust the cache so the
@@ -3257,12 +3260,37 @@ app.post("/api/genre-spotlight", async (req, res) => {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 1000,
-        system: `You are a world music expert. Return ONLY valid JSON — no markdown, no backticks, no preamble.`,
+        model: worldwide ? "claude-sonnet-4-20250514" : "claude-haiku-4-5-20251001",
+        max_tokens: worldwide ? 1800 : 1200,
+        system: `You are a world music expert with deep knowledge of niche regional genres across Asia, Africa, the Middle East, Latin America, the Caribbean, and Europe. Return ONLY valid JSON — no markdown, no backticks, no preamble.`,
         messages: [{
           role: "user",
-          content: `First assess whether "${genre}" is a NICHE genre (practiced in 1–4 countries with a strong cultural identity, e.g. Malouf, Ma'luf, Gnawa, Byzantine Chant, Gamelan, Morna, Mbube, Jùjú, Tuvan throat singing, Sega, Taarab, Chaabi) or a BROAD genre (practiced worldwide or easily found in many countries as local variants, e.g. Jazz, Rock, Hip-hop, Folk, Classical, Pop, R&B, Electronic, Reggae, Metal).
+          content: worldwide
+? `The user wants to explore "${genre}" worldwide. Provide globally representative artists and tracks across the countries where this genre is genuinely practiced.
+${seedArtist ? `\nCRITICAL: "${seedArtist}" is a confirmed real artist tied to this genre. You MUST include them in the artists array and include at least one of their actual, real tracks (with their country) in the tracks array. Do not invent track titles.\n` : ""}
+Return exactly this JSON:
+{
+  "explanation": "1 sentence on the genre's cultural roots and how/where it is practiced globally",
+  "tracks": [
+    { "title": "exact track title", "artist": "exact artist name", "artistCountry": "Country name", "artistCountryCode": "XX" }
+  ],
+  "artists": [
+    { "name": "Artist Name", "country": "Country name", "countryCode": "XX" }
+  ],
+  "suggestedGenres": ["Genre 1", "Genre 2", "Genre 3"]
+}
+Rules:
+- Return 6–8 tracks. Maximum 1 track per artist. Maximum 2 tracks from any single country.
+- Choose countries based on where the genre is genuinely practiced:
+  • Hyper-local genres (e.g. Shibuya-kei → Japan only, Mbalax → Senegal only): all tracks may be from the single home country.
+  • Multi-country genres (e.g. Fado → Portugal & Cabo Verde, Reggae → Jamaica & UK): spread across those origin countries.
+  • Worldwide genres (e.g. Jazz, Rock, Hip-hop, Electronic): include tracks from at least 4 different countries to showcase global diversity.
+- Only include tracks you are confident exist on Spotify, Apple Music, or YouTube under the latin-script artist name. Do not invent track titles.
+- "artists" MUST contain 6–8 real, globally recognizable artists for this genre, even if you are uncertain about specific track titles. Use the most commonly-used latin-script spelling of the artist name (e.g. "Sinn Sisamouth", not "ស៊ីន ស៊ីសាមុត"). The downstream system will resolve top tracks from these artists when track titles cannot be verified.
+- For genres tied to non-Latin scripts (Khmer, Thai, Arabic, Mandarin, Hindi, Japanese, etc), prefer the latin-transliterated artist names that are most likely to exist on Spotify.
+- artistCountry / artistCountryCode: ISO 3166-1 alpha-2 codes ("BR", "JP", "PT", "SN", "KH", "TH", etc).
+- "suggestedGenres": 3 closely related genres for further exploration.`
+: `First assess whether "${genre}" is a NICHE genre (practiced in 1–4 countries with a strong cultural identity, e.g. Malouf, Ma'luf, Gnawa, Byzantine Chant, Gamelan, Morna, Mbube, Jùjú, Tuvan throat singing, Sega, Taarab, Chaabi) or a BROAD genre (practiced worldwide or easily found in many countries as local variants, e.g. Jazz, Rock, Hip-hop, Folk, Classical, Pop, R&B, Electronic, Reggae, Metal).
 ${seedArtist ? `\nCRITICAL: "${seedArtist}" is a confirmed real artist in this genre. You MUST include them in the artists array and include at least one of their actual, real tracks in the tracks array. Do not invent track titles — only use tracks you are certain exist.\n` : ""}
 IF NICHE: the user tapped this genre from a ${country} artist card. Provide globally representative artists and tracks for "${genre}" from any of its home countries worldwide. Set isNicheWorldGenre: true, hasLocalScene: true.
 
@@ -3294,10 +3322,32 @@ Return exactly this JSON:
     const raw = (data.content[0].text || "").replace(/```json|```/g, "").trim();
     let spotlight;
     try { spotlight = JSON.parse(raw); } catch (parseErr) {
-      console.error(`[genre-spotlight] JSON.parse failed (${genre}/${country}):`, parseErr.message, "\nRaw:", raw.slice(0, 200));
+      console.error(`[genre-spotlight] JSON.parse failed (${genre}/${country || "WORLDWIDE"}):`, parseErr.message, "\nRaw:", raw.slice(0, 200));
       return res.status(500).json({ error: "Failed to parse Claude response" });
     }
-    const suggestedArtists = spotlight.artists || [];
+    // Worldwide mode returns artists as [{name, country, countryCode}]; country mode returns [name].
+    const suggestedArtistsRaw = spotlight.artists || [];
+    const suggestedArtists = suggestedArtistsRaw.map(a => (typeof a === "string" ? { name: a } : a));
+    const artistCountryByName = new Map();
+    if (worldwide) {
+      for (const a of suggestedArtists) {
+        if (a?.name && a?.country) {
+          artistCountryByName.set(a.name.toLowerCase(), { country: a.country, countryCode: a.countryCode });
+        }
+      }
+      // Also seed from Claude's tracks (they already carry artistCountry in worldwide mode)
+      for (const t of spotlight.tracks || []) {
+        if (t?.artist && t?.artistCountry && !artistCountryByName.has(t.artist.toLowerCase())) {
+          artistCountryByName.set(t.artist.toLowerCase(), { country: t.artistCountry, countryCode: t.artistCountryCode });
+        }
+      }
+    }
+    const tagWorldwideTrack = (t) => {
+      if (!worldwide || !t?.artist) return t;
+      if (t.artistCountry && t.artistCountryCode) return t;
+      const meta = artistCountryByName.get(t.artist.toLowerCase());
+      return meta ? { ...t, artistCountry: t.artistCountry || meta.country, artistCountryCode: t.artistCountryCode || meta.countryCode } : t;
+    };
 
     // Search streaming catalog for each track
     let tracks;
@@ -3306,7 +3356,7 @@ Return exactly this JSON:
       const appleToken = generateAppleMusicToken();
       const tracksWithIds = await Promise.all(
         (spotlight.tracks || []).map(async (track) => {
-          if (!appleToken) return { ...track, appleId: null };
+          if (!appleToken) return tagWorldwideTrack({ ...track, appleId: null });
           try {
             const q = `${track.title} ${track.artist}`;
             const r = await fetch(
@@ -3315,7 +3365,7 @@ Return exactly this JSON:
             );
             const d = await r.json();
             const s = (d.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
-            if (s) return { ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null };
+            if (s) return tagWorldwideTrack({ ...track, appleId: s.id, previewUrl: s.attributes.previews?.[0]?.url || null });
 
             // Pass 2: title only, validate artist
             const r2 = await fetch(
@@ -3325,9 +3375,9 @@ Return exactly this JSON:
             const d2 = await r2.json();
             const s2 = (d2.results?.songs?.data || []).find(s => artistNamesMatch(track.artist, s.attributes?.artistName || ""));
             return s2
-              ? { ...track, appleId: s2.id, previewUrl: s2.attributes.previews?.[0]?.url || null }
-              : { ...track, appleId: null, previewUrl: null };
-          } catch { return { ...track, appleId: null }; }
+              ? tagWorldwideTrack({ ...track, appleId: s2.id, previewUrl: s2.attributes.previews?.[0]?.url || null })
+              : tagWorldwideTrack({ ...track, appleId: null, previewUrl: null });
+          } catch { return tagWorldwideTrack({ ...track, appleId: null }); }
         })
       );
       tracks = tracksWithIds.filter(t => t.appleId).slice(0, 5);
@@ -3337,7 +3387,7 @@ Return exactly this JSON:
       // Phase 1: search for each Claude-suggested track directly
       const tracksWithIds = await Promise.all(
         (spotlight.tracks || []).map(async (track) => {
-          if (!accessToken) return { ...track, spotifyId: null };
+          if (!accessToken) return tagWorldwideTrack({ ...track, spotifyId: null });
           try {
             const q1 = `track:${track.title} artist:${track.artist}`;
             const r1 = await fetch(
@@ -3347,7 +3397,7 @@ Return exactly this JSON:
             const d1 = await r1.json();
             const found1 = d1.tracks?.items?.[0];
             if (found1 && artistNamesMatch(track.artist, found1.artists?.[0]?.name || "")) {
-              return { ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` };
+              return tagWorldwideTrack({ ...track, spotifyId: found1.id, previewUrl: found1.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found1.id}` });
             }
 
             const r2 = await fetch(
@@ -3357,9 +3407,9 @@ Return exactly this JSON:
             const d2 = await r2.json();
             const found2 = (d2.tracks?.items || []).find(t => artistNamesMatch(track.artist, t.artists?.[0]?.name || ""));
             return found2
-              ? { ...track, spotifyId: found2.id, previewUrl: found2.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found2.id}` }
-              : { ...track, spotifyId: null };
-          } catch { return { ...track, spotifyId: null }; }
+              ? tagWorldwideTrack({ ...track, spotifyId: found2.id, previewUrl: found2.preview_url || null, spotifyUrl: `https://open.spotify.com/track/${found2.id}` })
+              : tagWorldwideTrack({ ...track, spotifyId: null });
+          } catch { return tagWorldwideTrack({ ...track, spotifyId: null }); }
         })
       );
       tracks = tracksWithIds.filter(t => t.spotifyId);
@@ -3370,7 +3420,9 @@ Return exactly this JSON:
         const seenIds = new Set(tracks.map(t => t.spotifyId));
 
         const artistFallbackTracks = await Promise.all(
-          suggestedArtists.map(async (artistName) => {
+          suggestedArtists.map(async (artistObj) => {
+            const artistName = artistObj.name;
+            if (!artistName) return [];
             try {
               // Find the artist on Spotify
               const ar = await fetch(
@@ -3387,12 +3439,13 @@ Return exactly this JSON:
                 { headers: { Authorization: "Bearer " + accessToken } }
               );
               const td = await tr.json();
-              return (td.tracks || []).slice(0, 3).map(t => ({
+              return (td.tracks || []).slice(0, 3).map(t => tagWorldwideTrack({
                 title: t.name,
                 artist: t.artists?.[0]?.name || artistName,
                 spotifyId: t.id,
                 previewUrl: t.preview_url || null,
                 spotifyUrl: `https://open.spotify.com/track/${t.id}`,
+                ...(worldwide && artistObj.country ? { artistCountry: artistObj.country, artistCountryCode: artistObj.countryCode } : {}),
               }));
             } catch { return []; }
           })
@@ -3443,13 +3496,13 @@ Return exactly this JSON:
                   const sd = await sr.json();
                   const found = (sd.tracks?.items || []).find(t => artistNamesMatch(artist, t.artists?.[0]?.name || ""));
                   if (!found) return null;
-                  return {
+                  return tagWorldwideTrack({
                     title: found.name,
                     artist: found.artists?.[0]?.name || artist,
                     spotifyId: found.id,
                     previewUrl: found.preview_url || null,
                     spotifyUrl: `https://open.spotify.com/track/${found.id}`,
-                  };
+                  });
                 } catch { return null; }
               })
             );
@@ -3502,13 +3555,13 @@ Return exactly this JSON:
                   const sd = await sr.json();
                   const found = (sd.tracks?.items || []).find(t => artistNamesMatch(recArtist, t.artists?.[0]?.name || ""));
                   if (!found) return null;
-                  return {
+                  return tagWorldwideTrack({
                     title: found.name,
                     artist: found.artists?.[0]?.name || recArtist,
                     spotifyId: found.id,
                     previewUrl: found.preview_url || null,
                     spotifyUrl: `https://open.spotify.com/track/${found.id}`,
-                  };
+                  });
                 } catch { return null; }
               })
             );
@@ -3536,15 +3589,27 @@ Return exactly this JSON:
     }
 
     // If Claude says there's no local scene (broad genre only), discard any hallucinated tracks
-    if (spotlight.hasLocalScene === false && !spotlight.isNicheWorldGenre) tracks = [];
-    const isNicheWorldGenre = spotlight.isNicheWorldGenre === true;
-    let gsResult = { genre, country, explanation: spotlight.explanation, tracks, suggestedGenres: spotlight.suggestedGenres || [], hasLocalScene: spotlight.hasLocalScene !== false, isNicheWorldGenre };
+    if (!worldwide && spotlight.hasLocalScene === false && !spotlight.isNicheWorldGenre) tracks = [];
+    if (worldwide && tracks.length === 0) {
+      console.warn(`[genre-spotlight] WORLDWIDE empty result: genre="${genre}" — claude returned ${(spotlight.tracks || []).length} tracks, ${suggestedArtists.length} artists. First artist: ${suggestedArtists[0]?.name ?? "(none)"}`);
+    }
+    const isNicheWorldGenre = worldwide ? true : spotlight.isNicheWorldGenre === true;
+    let gsResult = {
+      genre,
+      country,
+      worldwide,
+      explanation: spotlight.explanation,
+      tracks,
+      suggestedGenres: spotlight.suggestedGenres || [],
+      hasLocalScene: worldwide ? true : spotlight.hasLocalScene !== false,
+      isNicheWorldGenre,
+    };
 
     // Supplement with related artist tracks from the recommendation page (runs on fresh responses too)
     gsResult = await supplementFromRelatedArtists(gsResult);
 
     await storeCache(gsCacheKey, "genre-spotlight", gsResult);
-    console.log(`[genre-spotlight] Claude → ${genre} / ${country} (${gsResult.tracks.length} tracks)`);
+    console.log(`[genre-spotlight] Claude → ${genre} / ${country || "WORLDWIDE"} (${gsResult.tracks.length} tracks)`);
     res.json(stripPreviewUrls(gsResult));
   } catch (err) {
     console.error("Genre spotlight error:", err);
@@ -3557,13 +3622,21 @@ app.post("/api/genre-deeper", async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "ANTHROPIC_API_KEY is not set." });
 
-  const { genre, country, service = "spotify", visited = [] } = req.body;
-  if (!genre || !country) return res.status(400).json({ error: "Missing genre or country." });
+  const { genre, country: rawCountry, service = "spotify", visited = [] } = req.body;
+  if (!genre) return res.status(400).json({ error: "Missing genre." });
 
-  const cacheKey = makeCacheKey(["genre-deeper", genre, country, ...(visited.length ? [visited.slice().sort().join(",")] : [])]);
+  const country = (rawCountry || "").trim();
+  const worldwide = !country;
+
+  const cacheKey = makeCacheKey([
+    "genre-deeper",
+    genre,
+    worldwide ? "WORLDWIDE" : country,
+    ...(visited.length ? [visited.slice().sort().join(",")] : []),
+  ]);
   const cached = await getCached(cacheKey);
   if (cached) {
-    console.log(`[genre-deeper] cache hit → ${genre} / ${country}`);
+    console.log(`[genre-deeper] cache hit → ${genre} / ${country || "WORLDWIDE"}`);
     return res.json(cached.result);
   }
 
@@ -3581,7 +3654,26 @@ app.post("/api/genre-deeper", async (req, res) => {
         system: "You are a world music expert. Return ONLY valid JSON — no markdown, no backticks.",
         messages: [{
           role: "user",
-          content: `A listener just explored "${genre}" from ${country} and wants to discover something new.
+          content: worldwide
+? `A listener just explored "${genre}" worldwide and wants to discover a closely related genre to dig into next.
+${visited.length > 0 ? `\nGenres already visited (DO NOT suggest any of these or anything that is essentially the same under a different name): ${visited.map(g => `"${g}"`).join(", ")}\n` : ""}
+
+Suggest ONE related genre to explore next. Good moves include:
+- A more specific subgenre (e.g. Rock → Shoegaze, Soul → Southern Soul)
+- A sibling genre that shares roots, era, or audience (e.g. Reggae → Dub, Highlife → Jùjú)
+- A regional/diaspora variant of the same parent tradition (e.g. Rumba → Soukous)
+
+Rules:
+- The suggestion must be MEANINGFULLY DIFFERENT from "${genre}" — not the same genre under a different name.
+- Must be a real genre with a genuine scene and real recordings — not a made-up label.
+- Prefer genres with tracks available on Spotify, Apple Music, or YouTube.
+- If "${genre}" is already extremely niche with no meaningful subgenres, suggest a related sibling or parent genre.
+
+Return exactly:
+{
+  "genre": "specific genre name"
+}`
+: `A listener just explored "${genre}" from ${country} and wants to discover something new.
 ${visited.length > 0 ? `\nGenres already visited in this session (DO NOT suggest any of these or anything that is essentially the same genre under a different name): ${visited.map(g => `"${g}"`).join(", ")}\n` : ""}
 
 Suggest ONE genre for them to explore next. Good moves include:
@@ -3616,8 +3708,9 @@ Return exactly:
     }
 
     result.genre = await resolveGenreCanonical(result.genre);
+    if (worldwide) result.country = "";
     await storeCache(cacheKey, "genre-deeper", result);
-    console.log(`[genre-deeper] Claude → "${result.genre}" / ${result.country} (from ${genre} / ${country})`);
+    console.log(`[genre-deeper] Claude → "${result.genre}" / ${result.country || "WORLDWIDE"} (from ${genre} / ${country || "WORLDWIDE"})`);
     res.json(result);
   } catch (err) {
     console.error("[genre-deeper] error:", err.message);
@@ -4330,15 +4423,21 @@ app.get("/api/find-artist", async (req, res) => {
 
 const SIMILAR_ARTISTS_SYSTEM_PROMPT = `You are a world music expert. Given a seed artist, return similar artists as JSON.
 
-PRIMARY GOAL — sonic similarity, no stretches:
-- Every recommendation MUST plausibly sound similar to the seed artist in genre, instrumentation, vocal style, or era. Musical fit is the only non-negotiable requirement.
-- Do NOT reach for an artist from a different region if they don't actually share the sonic profile. A mediocre sonic match from the same country is always better than a weak match from a "missing" region.
-- For narrow Western genres (e.g. American classic rock, country, grime, adult contemporary pop), it is expected and correct to return multiple artists from the same region/continent.
-- If you truly know of fewer real sonic matches than asked for, return fewer — never invent filler or stretch to a "world music" artist the seed's listener would find jarring.
+PRIMARY GOAL — sonic similarity, no fabrication:
+- Every recommendation MUST plausibly sound similar to the seed artist in genre, instrumentation, vocal style, or era. Sonic fit is non-negotiable.
+- NEVER invent artists. NEVER fabricate a country to satisfy a quota. If you truly know of fewer real sonic matches than asked for, return fewer.
 
-SECONDARY — light country dedup only:
-- Each returned artist should come from a different country than any already-listed artists in the prompt. That is the ONLY diversity rule.
-- Do NOT try to hit continent quotas, geographic coverage, or representation targets. Ignore any inner urge to include an African or Asian artist "for diversity". Sonic fit is the only filter.
+SECONDARY GOAL — global discovery:
+- This app is called "Musical Passport". Its purpose is helping listeners find genuine sonic peers from AROUND THE WORLD, not just the Anglosphere.
+- Within the bar of real sonic similarity, ACTIVELY SEEK genuine non-Anglosphere peers. The Anglosphere here means US, UK, Canada, Australia, New Zealand, Ireland.
+- Almost every broad genre has real, well-known non-Anglosphere practitioners:
+  • Indie pop / bedroom pop → Aurora (NO), Sigrid (NO), Christine and the Queens (FR), Stella Donnelly (AU), Mitski (JP-US), Yuck (UK→JP), Hatchie (AU), No Vacation (PH-US), Beach Bunny (US), Cuco (MX-US), Yaeji (KR-US), Soccer Mommy (US), Mamiko Watanabe variants, Yumi Zouma (NZ), Faye Webster (US)... (mix anglo + non-anglo)
+  • Hip-hop → Stormzy (UK), Aya Nakamura (FR/ML), Bad Bunny (PR), MC Solaar (FR), Skepta (UK/NG), Niska (FR), Tiakola (FR), Dadju (FR/CD), Beny Jr (ES), Jorja Smith (UK)
+  • Electronic → Caribou (CA), Floating Points (UK), Nicola Cruz (EC), Dixon (DE), Kornel Kovacs (SE), Octo Octa (US), Peggy Gou (KR/DE), Honey Dijon (US)
+  • Rock / shoegaze → Fishmans (JP), My Bloody Valentine (IE), Slowdive (UK), Lush (UK), Pinegrove (US), Black Country New Road (UK), DIIV (US)
+  • R&B / soul → Sault (UK), Cleo Sol (UK), Joy Crookes (UK/BD), Greentea Peng (UK/NG), Kali Uchis (US/CO), Lous and the Yakuza (BE/CD), Téchnine (FR), Tems (NG)
+- HARD RULE: If your initial 10 candidates contain 6+ Anglosphere artists, you have failed the secondary goal. Replace some of them with equally-strong real non-Anglosphere peers.
+- Aim for at least 4 different countries across the result, and at least 3 of them outside the Anglosphere when real matches exist.
 
 Other rules:
 - "From" means country of origin: where a solo artist was born/raised or where a band formed. Do NOT use ancestry, a parent's country, residence, fanbase, label market, or cultural influence.
@@ -4359,8 +4458,8 @@ Return ONLY valid JSON — no markdown, no backticks, no preamble. Schema:
       "romanizedName": "romanized/English name ONLY if name uses non-Latin script — omit otherwise",
       "country": "full country name",
       "countryCode": "2-letter ISO code",
-      "genre": "their primary genre",
-      "era": "decade string (1900s–2020s)"
+      "genre": "ONE primary genre, 1–3 words, no commas, no slashes (e.g. \\"indie pop\\", \\"shoegaze\\", \\"afrobeats\\")",
+      "era": "EXACTLY ONE decade in the form NNNNs (e.g. \\"1980s\\", \\"2010s\\"). Never a range, never two decades. Pick the single decade the artist is most associated with."
     }
   ]
 }`;
@@ -4401,6 +4500,23 @@ function genreTokens(s) {
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length >= 3 && !GENERIC_GENRE_TOKENS.has(w));
+}
+
+// Take only the primary genre when Claude returns a comma/slash-joined list
+// (e.g. "indie pop, bedroom pop, singer-songwriter" → "indie pop").
+function normalizePrimaryGenre(g) {
+  if (!g || typeof g !== 'string') return g;
+  const first = g.split(/[,/|;]| and |&| · /i)[0].trim();
+  return first || g;
+}
+
+// Coerce ranges like "2010s-2020s" / "2010s–2020s" / "2010s & 2020s"
+// into a single decade (the latest — that's the artist's current era).
+function normalizeEra(e) {
+  if (!e || typeof e !== 'string') return e;
+  const decades = e.match(/(?:19|20)\d0s/g);
+  if (!decades || decades.length === 0) return e.trim();
+  return decades[decades.length - 1];
 }
 
 // Store reverse-index entries so pool members can find each other's pools
@@ -4786,7 +4902,10 @@ app.post("/api/similar-artists", async (req, res) => {
     const selected = pickDiverseProgressive(filtered, SIMILAR_TARGET_COUNT);
     const withImages = await ensureImages(selected);
     withImages.forEach(a => bumpRecentlyServed(a.name));
-    return withImages;
+    // Normalize legacy/cached genre & era so the client always gets a single
+    // primary genre and a single decade, even if Claude or older code paths
+    // produced "indie pop, bedroom pop" or "2010s–2020s".
+    return withImages.map(a => ({ ...a, genre: normalizePrimaryGenre(a.genre), era: normalizeEra(a.era) }));
   }
 
   // ── 1. Direct cache hit — rerank on every serve ───────────────────────
@@ -4983,11 +5102,19 @@ app.post("/api/similar-artists", async (req, res) => {
     console.log(`[similar-artists] directPool: ${pool.length} MB-verified of ${allCandidates.length}`);
 
     // ── Stage 2: Claude gap-fill ───────────────────────────────────────
-    // Only runs when we're short of the target response size — Claude has
-    // historically been the biggest source of bad country codes and sonic
-    // stretches, so we want to minimize its involvement when Last.fm + Deezer
-    // already provide enough solid matches.
-    if (pool.length < SIMILAR_TARGET_COUNT) {
+    // Runs when the pool is either short of the target OR insufficiently
+    // diverse. Last.fm + Deezer skew heavily Anglosphere by listener volume;
+    // for an app called "Musical Passport" we want at least a few genuine
+    // non-Anglosphere peers in every result set.
+    const ANGLOSPHERE_CODES = new Set(["US", "GB", "CA", "AU", "NZ", "IE"]);
+    const nonAngloCountriesInPool = new Set(
+      pool.filter(a => a.countryCode && !ANGLOSPHERE_CODES.has(a.countryCode)).map(a => a.countryCode)
+    );
+    const needsDiversityFill = nonAngloCountriesInPool.size < 3;
+    if (needsDiversityFill && pool.length >= SIMILAR_TARGET_COUNT) {
+      console.log(`[similar-artists] diversity-fill triggered: pool has ${pool.length} but only ${nonAngloCountriesInPool.size} non-Anglo countries`);
+    }
+    if (pool.length < SIMILAR_TARGET_COUNT || needsDiversityFill) {
       // Ask for enough to buffer past filtering + dedup + sonic-fit rejection.
       const needCount = Math.max((SIMILAR_TARGET_COUNT + 4) - pool.length, 5);
       const alreadyLines = pool.length > 0
@@ -4998,16 +5125,20 @@ app.post("/api/similar-artists", async (req, res) => {
         ? `\nLast.fm similar artists (sonic reference, already ranked):\n${lastfmSimilar.slice(0, 15).map(a => `- ${a.name} (${(a.match * 100).toFixed(0)}%)`).join('\n')}`
         : '';
 
+      const diversityNote = needsDiversityFill && pool.length >= SIMILAR_TARGET_COUNT
+        ? `\nThe already-sourced pool above is heavy on Anglosphere artists — focus this fill ENTIRELY on real non-Anglosphere sonic peers (continental Europe, Latin America, Asia, Africa, Middle East, Oceania).`
+        : '';
       const prompt = `Find up to ${needCount} artists who sound genuinely similar to ${foundName}.
 
 Their profile:
-${tagLines}${lfLines}${alreadyLines}
+${tagLines}${lfLines}${alreadyLines}${diversityNote}
 
 Rules:
-- Sort by sonic similarity. Country of origin is secondary.
-- Prefer avoiding duplicate countries when you have equally-strong options, but it's completely fine to return multiple artists from the same country when that country is where the genre actually lives (e.g. multiple British rock bands, multiple American country artists, multiple French house producers).
-- NEVER fabricate an artist's country of origin to satisfy a diversity constraint. Report each artist's REAL country where they were born/raised or where the band formed — ancestry, parents' origin, or fanbase do not count. If you're not sure of a real country, omit the artist.
-- When you have 5+ equally-strong Anglosphere matches (US/UK/Canada/Australia/New Zealand/Ireland), include 2–3 artists from OUTSIDE the Anglosphere (continental Europe, Latin America, Asia, Africa, Middle East, Oceania) who genuinely share the sonic profile. Scandinavian pop, French chanson, Belgian/German/Spanish pop, Latin pop singer-songwriters, J-pop/K-pop indie, and African/Middle Eastern equivalents all count. NEVER invent stretches to fill regions — but do reach for real peers before defaulting to yet another US indie artist.
+- Sonic fit is the bar. Never fabricate.
+- Within that bar, ACTIVELY include real non-Anglosphere peers (Anglosphere = US/UK/Canada/Australia/NZ/Ireland). For broad genres like indie pop, hip-hop, electronic, R&B, rock — well-known non-Anglo peers exist; find them. Examples: Aurora (NO) and Christine and the Queens (FR) for indie pop; Aya Nakamura (FR) for R&B; Peggy Gou (KR/DE) for house; Bad Bunny (PR) for reggaeton/Latin trap; Fishmans (JP) for shoegaze; Stormzy (UK) for grime.
+- Of the ${needCount} you return, NO MORE THAN HALF may be from the Anglosphere. If you cannot find enough real non-Anglo peers to satisfy that, return fewer artists — never invent filler.
+- NEVER fabricate an artist's country. Report each artist's REAL country where they were born/raised or where the band formed — ancestry, parents' origin, residence, or fanbase do NOT count.
+- Spread across at least 3–4 different countries when real options exist.
 - Return fewer than ${needCount} if you don't know enough real sonic matches — NEVER invent filler.`;
 
       try {
@@ -5080,8 +5211,8 @@ Rules:
             romanizedName: a.romanizedName,
             country: a.country,
             countryCode: a.countryCode,
-            genre: a.genre || tags[0] || seedTags[0] || '',
-            era: a.era,
+            genre: normalizePrimaryGenre(a.genre || tags[0] || seedTags[0] || ''),
+            era: normalizeEra(a.era),
             match: baseMatch,
             source: 'claude',
             tags,
@@ -5164,6 +5295,8 @@ Rules:
     ));
     const responseWithImages = selected.map((a, i) => ({
       ...a,
+      genre: normalizePrimaryGenre(a.genre),
+      era: normalizeEra(a.era),
       imageUrl: responseImageUrls[i] || a.imageUrl || null,
     }));
     responseWithImages.forEach(a => bumpRecentlyServed(a.name));
