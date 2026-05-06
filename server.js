@@ -7474,12 +7474,22 @@ app.get("/api/country-of-day", async (req, res) => {
 
 // Returns the next N days of country-of-day entries, creating any that don't exist yet.
 // Used by the mobile app to pre-schedule accurate push notifications.
+//
+// Accepts an optional ?startDate=YYYY-MM-DD so the client can pin the rotation
+// to its local "today" instead of letting the server fall back to UTC. Without
+// this, users east of UTC see the country roll a few hours before midnight.
 app.get("/api/country-of-day/upcoming", async (req, res) => {
   const days = Math.min(parseInt(req.query.days || "7", 10), 30);
+  const startDate = (req.query.startDate || "").match(/^\d{4}-\d{2}-\d{2}$/)
+    ? req.query.startDate
+    : new Date().toISOString().slice(0, 10);
+  const [sy, sm, sd] = startDate.split("-").map(Number);
   const results = [];
   for (let i = 0; i < days; i++) {
-    const d = new Date();
-    d.setDate(d.getDate() + i);
+    // Use a UTC-anchored Date so adding days never crosses a DST boundary
+    // and produces a duplicate or skipped date.
+    const d = new Date(Date.UTC(sy, sm - 1, sd));
+    d.setUTCDate(d.getUTCDate() + i);
     const dateStr = d.toISOString().slice(0, 10);
     const country = await getOrCreateCountryOfDay(dateStr);
     results.push({ date: dateStr, country });
